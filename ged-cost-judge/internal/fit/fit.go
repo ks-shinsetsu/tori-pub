@@ -1,17 +1,24 @@
-// Package fit estimates GED costs from 3-way judgments on triplets (plan §6).
+// Package fit estimates GED costs from 3-way judgments on triplets (plan §6, decisions-stats §2, §11, §12b–c).
 //
 // Model (Rao–Kupper-style paired comparison with ties; the same form as an ordered logit):
 //
 //	Δ_t(θ) = GED_θ(S, B) − GED_θ(S, A)                     (positive means A is closer)
-//	z_k    = β_j·(Δ_t(θ) + θ_neg·Δneg_t) + π_j·o_k
+//	z_k    = β_j·(Δ_t(θ) + θ_neg·Δneg_t) + π_j·o_k + γ·Δcoh_t
 //	P(A) = σ(z_k − τ_j),  P(B) = σ(−z_k − τ_j),  P(same) = the rest
 //
-// GED is a minimum over proposition matchings, so it has points where it is not differentiable in θ.
-// With the matching fixed it is linear in θ, so "solve the matching → fix it and fit with L-BFGS" is
-// repeated until the matching stops changing (plan §6.3).
+// Two likelihoods are implemented on the same code path (decisions §2 #12, Appendix A.6):
 //
-// Differences from the plan (PoC): the fit solves (θ, θ_neg, β, τ, π) jointly with L-BFGS rather than alternating.
-// Constraints θ ≥ 0, τ > 0, β > 0 are imposed via softplus / exp reparameterization. The naturalness covariate γ is not included.
+//   - working independence (Fit): the judgments are treated as independent;
+//   - random intercept (FitMixed): the judgments of one triplet share u_t ~ N(0, σ²) added to every z_k,
+//     integrated out by Gauss–Hermite quadrature.
+//
+// GED is a minimum over proposition matchings, so it has points where it is not differentiable in θ.
+// With the matching fixed it is linear in θ, so "solve the matching → fix it and fit" is repeated until the
+// matching stops changing or the true objective stops moving (decisions §11.2).
+//
+// θ ≥ 0 is imposed by a bound-constrained quasi-Newton method on θ directly (decisions §11.1, review B1);
+// β and τ keep the log map. Optional pieces: a column-sum tie for the type costs (§12b), triplet/judgment
+// filters (§12c, #15), per-triplet weights (§12c), the coherence covariate γ (§10), and multi-start (§11.3).
 package fit
 
 import (
@@ -20,9 +27,12 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 
-	"gonum.org/v1/gonum/optimize"
+	"gonum.org/v1/gonum/integrate/quad"
 
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
 )
@@ -41,6 +51,9 @@ func (a Answer) String() string {
 }
 
 // Triplet is a triplet (S, A, B).
+//
+// The descriptive fields (Type, Flags, Generator, …) are optional. Empty values behave as before:
+// no stratification, no filtering, weight 1.
 type Triplet struct {
 	// Source is the source argument index. The unit for cluster bootstrap and cross-validation.
 	Source int
@@ -50,7 +63,39 @@ type Triplet struct {
 	SimB   ged.Sim
 	// NegDiff is the difference in the number of polarity flips (B − A). GED cannot observe it.
 	NegDiff float64
+
+	// Type is the triplet type ("T1".."T4").
+	Type string
+	// Flags are dataset flags; values among "x_spk", "diag_ca_type", "qt30", "del_add_cooccur", "t3_ident", "t1_gate".
+	Flags []string
+	// Generator is the model that wrote the source and variants (bootstrap / CV stratum).
+	Generator string
+	// VerifierFamily is the model family that verified the variants (family-coupling filter, §12c).
+	VerifierFamily string
+	// ExemplarPair and Domain are recorded for the ICC checks of §6; not used by the fit.
+	ExemplarPair string
+	Domain       string
+	// Weight is the importance weight for the reweighted fit of §12c (0 means 1); used only with Options.Weighted.
+	Weight float64
+	// CohA, CohB are the verifier's coherence ratings of A and B; Δcoh = CohA − CohB (§10).
+	CohA, CohB float64
+	// T1Delta0 is Δ(θ₀) of a T1 triplet (the judge QC gate stratum of §9.1).
+	T1Delta0 float64
 }
+
+// HasFlag reports whether the triplet carries flag f.
+func (t Triplet) HasFlag(f string) bool { return slices.Contains(t.Flags, f) }
+
+// weight returns the effective importance weight.
+func (t Triplet) weight() float64 {
+	if t.Weight <= 0 {
+		return 1
+	}
+	return t.Weight
+}
+
+// DeltaCoh is coh(A) − coh(B).
+func (t Triplet) DeltaCoh() float64 { return t.CohA - t.CohB }
 
 // Judgment is a single judgment.
 type Judgment struct {
@@ -59,6 +104,8 @@ type Judgment struct {
 	// Order is +1 if A was shown first, −1 if second.
 	Order  float64
 	Answer Answer
+	// Family is the judge's model family (family-coupling filter, §12c). Empty disables the filter for this judgment.
+	Family string
 }
 
 // Params are the parameters to estimate.
@@ -68,14 +115,39 @@ type Params struct {
 	Beta     []float64
 	Tau      []float64
 	Pi       []float64
+	// Gamma is the coefficient of Δcoh (0 unless Options.Gamma is on).
+	Gamma float64
+	// Sigma is the random-intercept SD (0 for the working-independence fit).
+	Sigma float64
 }
+
+// GammaMode selects how the coherence covariate enters (§10).
+type GammaMode int
+
+const (
+	// GammaOff leaves Δcoh out of the model (primary).
+	GammaOff GammaMode = iota
+	// GammaFree estimates γ (sensitivity a′).
+	GammaFree
+	// GammaFixed enters Options.GammaValue·Δcoh as a fixed offset (sensitivity a; γ from the negative control).
+	GammaFixed
+)
+
+// DefaultExclude is the default triplet-flag exclusion list (decisions #15, §12b).
+var DefaultExclude = []string{"x_spk", "diag_ca_type"}
+
+// ThetaMax is the upper bound of every cost (decisions §6: θ_p > 10 counts as divergent).
+const ThetaMax = 10.0
+
+// BoundaryEps is the threshold below which a cost counts as "at the boundary" (decisions §6).
+const BoundaryEps = 1e-3
 
 // Options configures estimation.
 type Options struct {
 	Judges int
-	// Theta0 is the center of L2 regularization (the current values).
+	// Theta0 is the center of L2 regularization and the default start.
 	Theta0 ged.Theta
-	// Lambda is the coefficient of λ‖θ − θ₀‖².
+	// Lambda is the coefficient of λ‖θ − θ₀‖² (0 for every inferential fit, decisions §5).
 	Lambda float64
 	// If FitNeg is false, θ_neg is fixed at 0.
 	FitNeg bool
@@ -88,45 +160,178 @@ type Options struct {
 	AuxRidge float64
 	// Fixed holds θ indices and values to fix (for drawing profile likelihoods).
 	Fixed map[int]float64
+
+	// Tie maps a cost index to the index whose value it shares; the tied column of Δφ is added to the
+	// master column (decisions §12b). TypeTie() gives the pre-registered type tie (9 free costs).
+	Tie map[int]int
+
+	// Exclude lists triplet flags that remove the triplet from the fit. nil means DefaultExclude;
+	// an empty non-nil slice (or IncludeAll) excludes nothing.
+	Exclude    []string
+	IncludeAll bool
+	// ExcludeSameFamily drops judgments whose judge family equals the triplet's verifier family (§12c).
+	ExcludeSameFamily bool
+	// CohZeroOnly restricts the fit to triplets with Δcoh = 0 (§10 sensitivity b).
+	CohZeroOnly bool
+
+	// Weighted uses Triplet.Weight (and Weights, if set) as a multiplier of each triplet's log-likelihood (§12c).
+	Weighted bool
+	// Weights, if non-nil, overrides Triplet.Weight by position (len(Weights) must equal len(trips)).
+	Weights []float64
+
+	// Gamma selects the coherence covariate mode; GammaValue is the fixed offset coefficient for GammaFixed.
+	Gamma      GammaMode
+	GammaValue float64
+
+	// Starts, if non-empty, makes Fit run from each listed θ (plus the explicit init, if any) and keep the best
+	// true objective (decisions §11.3). DefaultStarts gives θ₀, R1 and all-0.5.
+	Starts []ged.Theta
+	// StartNames labels Starts in Result.Starts (optional).
+	StartNames []string
+
+	// Quadrature is the number of Gauss–Hermite nodes for FitMixed (0 → 20).
+	Quadrature int
+	// Sigma0 is the initial random-intercept SD for FitMixed (0 → 1).
+	Sigma0 float64
+}
+
+// TypeTie is the pre-registered tie of the three type-mismatch costs to the RA↔MA cost (decisions §12b).
+func TypeTie() map[int]int {
+	return map[int]int{ged.PTypeRACA: ged.PTypeRAMA, ged.PTypeCAMA: ged.PTypeRAMA}
+}
+
+// R1 is the naive uniform table (plan §7.2): substitution 1 − cos, type and direction mismatch = delete + insert = 2.
+func R1() ged.Theta {
+	t := ged.Current()
+	t[ged.PTypeRACA], t[ged.PTypeRAMA], t[ged.PTypeCAMA], t[ged.PDirection] = 2, 2, 2, 2
+	return t
+}
+
+// DefaultStarts are the three pre-registered starts of the full-data fit: θ₀, R1, all-0.5 (decisions §11.3).
+func DefaultStarts(theta0 ged.Theta) ([]ged.Theta, []string) {
+	var half ged.Theta
+	for i := range half {
+		half[i] = 0.5
+	}
+	return []ged.Theta{theta0, R1(), half}, []string{"θ₀", "R1", "all-0.5"}
+}
+
+// FreeTheta reports which cost coordinates are free under opts (not fixed, not tied).
+func FreeTheta(opts Options) [ged.NumParams]bool {
+	var free [ged.NumParams]bool
+	for p := range ged.NumParams {
+		_, fixed := opts.Fixed[p]
+		_, tied := opts.Tie[p]
+		free[p] = !opts.FixTheta && !fixed && !tied
+	}
+	return free
+}
+
+// NumFree is the number of free cost parameters.
+func NumFree(opts Options) int {
+	n := 0
+	for _, f := range FreeTheta(opts) {
+		if f {
+			n++
+		}
+	}
+	return n
+}
+
+// StartResult records one start of a multi-start fit.
+type StartResult struct {
+	Name      string
+	Theta     ged.Theta
+	Objective float64
+	NegLogLik float64
+	Converged bool
+	Cycled    bool
 }
 
 // Result is the estimation result.
 type Result struct {
 	Params Params
-	// NegLogLik is the negative log-likelihood excluding penalties.
+	// NegLogLik is the (weighted) negative log-likelihood excluding penalties, at the final matching.
 	NegLogLik float64
+	// Objective is NegLogLik plus the penalties (the quantity compared across starts and rounds).
+	Objective float64
 	Outer     int
 	Converged bool
 	// Cycled indicates the matching returned to an earlier state (the alternating optimization cycled).
 	// In that case, the round with the smallest true objective, re-solving the matching at each round's θ, is returned.
 	Cycled bool
+	// Capped indicates the outer loop hit MaxOuter without converging or cycling.
+	Capped bool
+	// Boundary[p] is true if the free cost p ended below BoundaryEps; Divergent[p] if it ended at ThetaMax (clipped).
+	Boundary  [ged.NumParams]bool
+	Divergent [ged.NumParams]bool
+	// Free marks the cost coordinates that were estimated.
+	Free [ged.NumParams]bool
+	// Mixed is true for a random-intercept fit.
+	Mixed bool
+	// Starts lists the multi-start runs (empty for a single start); StartSpread is the largest |Δθ_p| between
+	// the best start and any other start (decisions §11.3 asks to report disagreement > 0.05).
+	Starts      []StartResult
+	StartSpread float64
+	// Triplets and Judgments are the counts after filtering.
+	Triplets, Judgments int
 }
 
-// diff is Δ_t = dphi·θ + c with the matching fixed.
+// AnyBoundary reports whether any free cost is at the lower boundary.
+func (r Result) AnyBoundary() bool {
+	for p, b := range r.Boundary {
+		if b && r.Free[p] {
+			return true
+		}
+	}
+	return false
+}
+
+// diff is Δ_t = dphi·θ + c with the matching fixed (dphi is the unfolded 11-column difference).
 type diff struct {
 	dphi [ged.NumParams]float64
 	c    float64
 	sig  string
 }
 
-// Features re-solves the matching of every triplet at θ and returns the linearization of Δ.
+// canon returns a copy of g with propositions sorted by ID and edges sorted by (From, To, Kind), so the
+// assignment solver sees the same input order regardless of how the graph was built (decisions §11.5:
+// deterministic tie-breaking, reproducible signatures).
+func canon(g ged.Graph) ged.Graph {
+	c := g.Clone()
+	sort.SliceStable(c.Props, func(i, j int) bool { return c.Props[i].ID < c.Props[j].ID })
+	sort.SliceStable(c.Edges, func(i, j int) bool {
+		a, b := c.Edges[i], c.Edges[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.To != b.To {
+			return a.To < b.To
+		}
+		return a.Kind < b.Kind
+	})
+	return c
+}
+
+// features re-solves the matching of every triplet at θ and returns the linearization of Δ.
 func features(trips []Triplet, th ged.Theta) ([]diff, error) {
 	out := make([]diff, len(trips))
 	errs := make([]error, len(trips))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU())
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 	for i := range trips {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int) {
 			defer func() { <-sem; wg.Done() }()
 			t := trips[i]
-			fa, err := ged.Compute(t.Ref, t.A, t.SimA, th)
+			ref := canon(t.Ref)
+			fa, err := ged.Compute(ref, canon(t.A), t.SimA, th)
 			if err != nil {
 				errs[i] = err
 				return
 			}
-			fb, err := ged.Compute(t.Ref, t.B, t.SimB, th)
+			fb, err := ged.Compute(ref, canon(t.B), t.SimB, th)
 			if err != nil {
 				errs[i] = err
 				return
@@ -170,6 +375,48 @@ func Delta(trips []Triplet, th ged.Theta) ([]float64, error) {
 	return out, nil
 }
 
+// DeltaPhi returns, per triplet, the 12-vector (Δφ_0..Δφ_10, Δ edge-extra) at θ, i.e. the columns whose
+// non-zero entries make the triplet informative for a cost (decisions §15.3).
+func DeltaPhi(trips []Triplet, th ged.Theta) ([][ged.NumParams + 1]float64, error) {
+	ds, err := features(trips, th)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][ged.NumParams + 1]float64, len(ds))
+	for i, d := range ds {
+		copy(out[i][:ged.NumParams], d.dphi[:])
+		out[i][ged.NumParams] = d.c / ged.EdgeExtraCost
+	}
+	return out, nil
+}
+
+// Informative counts, per cost (index NumParams = edge-extra), the triplets with a non-zero Δφ column at θ.
+// With tie non-nil the tied columns are folded into their master before counting.
+func Informative(trips []Triplet, th ged.Theta, tie map[int]int) ([ged.NumParams + 1]int, error) {
+	var n [ged.NumParams + 1]int
+	dp, err := DeltaPhi(trips, th)
+	if err != nil {
+		return n, err
+	}
+	for _, d := range dp {
+		var f [ged.NumParams + 1]float64
+		for p := range ged.NumParams {
+			q := p
+			if m, ok := tie[p]; ok {
+				q = m
+			}
+			f[q] += d[p]
+		}
+		f[ged.NumParams] = d[ged.NumParams]
+		for p, v := range f {
+			if math.Abs(v) > 1e-12 {
+				n[p]++
+			}
+		}
+	}
+	return n, nil
+}
+
 func (d diff) value(th ged.Theta) float64 {
 	v := d.c
 	for p := range ged.NumParams {
@@ -178,29 +425,16 @@ func (d diff) value(th ged.Theta) float64 {
 	return v
 }
 
-// Variable vector layout: u[11] (θ = softplus(u)), neg, b[J] (β = exp), s[J] (τ = exp), p[J] (π).
+// Variable vector layout: θ[11] (direct, bounded), neg, log β[J], log τ[J], π[J], γ, log σ.
 type layout struct{ j int }
 
-func (l layout) size() int      { return ged.NumParams + 1 + 3*l.j }
+func (l layout) size() int      { return ged.NumParams + 1 + 3*l.j + 2 }
 func (l layout) neg() int       { return ged.NumParams }
 func (l layout) beta(j int) int { return ged.NumParams + 1 + j }
 func (l layout) tau(j int) int  { return ged.NumParams + 1 + l.j + j }
 func (l layout) pi(j int) int   { return ged.NumParams + 1 + 2*l.j + j }
-
-func softplus(u float64) float64 {
-	if u > 30 {
-		return u
-	}
-	return math.Log1p(math.Exp(u))
-}
-
-func invSoftplus(t float64) float64 {
-	t = math.Max(t, 1e-4)
-	if t > 30 {
-		return t
-	}
-	return math.Log(math.Expm1(t))
-}
+func (l layout) gamma() int     { return ged.NumParams + 1 + 3*l.j }
+func (l layout) logSigma() int  { return ged.NumParams + 1 + 3*l.j + 1 }
 
 func sigmoid(x float64) float64 { return 1 / (1 + math.Exp(-x)) }
 
@@ -212,24 +446,40 @@ func logSigmoid(x float64) float64 {
 	return -math.Log1p(math.Exp(-x))
 }
 
-func (l layout) pack(p Params) []float64 {
+const (
+	logBetaMin, logBetaMax   = -7.0, 7.0
+	logTauMin, logTauMax     = -7.0, 5.0
+	piBound                  = 20.0
+	negBound                 = 20.0
+	gammaBound               = 20.0
+	logSigmaMin, logSigmaMax = -6.0, 3.0
+)
+
+func (l layout) pack(p Params, mixed bool) []float64 {
 	x := make([]float64, l.size())
 	for i := range ged.NumParams {
-		x[i] = invSoftplus(p.Theta[i])
+		x[i] = clampTo(p.Theta[i], 0, ThetaMax)
 	}
 	x[l.neg()] = p.ThetaNeg
 	for j := range l.j {
-		x[l.beta(j)] = math.Log(p.Beta[j])
-		x[l.tau(j)] = math.Log(p.Tau[j])
+		x[l.beta(j)] = math.Log(math.Max(p.Beta[j], 1e-3))
+		x[l.tau(j)] = math.Log(math.Max(p.Tau[j], 1e-3))
 		x[l.pi(j)] = p.Pi[j]
+	}
+	x[l.gamma()] = p.Gamma
+	if mixed {
+		x[l.logSigma()] = math.Log(math.Max(p.Sigma, 1e-3))
 	}
 	return x
 }
 
-func (l layout) unpack(x []float64) Params {
+func (l layout) unpack(x []float64, tie map[int]int, mixed bool) Params {
 	p := Params{Beta: make([]float64, l.j), Tau: make([]float64, l.j), Pi: make([]float64, l.j)}
 	for i := range ged.NumParams {
-		p.Theta[i] = softplus(x[i])
+		p.Theta[i] = x[i]
+	}
+	for i, m := range tie {
+		p.Theta[i] = x[m]
 	}
 	p.ThetaNeg = x[l.neg()]
 	for j := range l.j {
@@ -237,7 +487,53 @@ func (l layout) unpack(x []float64) Params {
 		p.Tau[j] = math.Exp(x[l.tau(j)])
 		p.Pi[j] = x[l.pi(j)]
 	}
+	p.Gamma = x[l.gamma()]
+	if mixed {
+		p.Sigma = math.Exp(x[l.logSigma()])
+	}
 	return p
+}
+
+// bounds builds the box for the variable vector under opts; a fixed coordinate has lo = hi.
+func (l layout) bounds(opts Options, p Params, mixed bool) (lo, hi []float64) {
+	n := l.size()
+	lo, hi = make([]float64, n), make([]float64, n)
+	free := FreeTheta(opts)
+	for i := range ged.NumParams {
+		if free[i] {
+			lo[i], hi[i] = 0, ThetaMax
+		} else {
+			v := clampTo(p.Theta[i], 0, ThetaMax)
+			if _, tied := opts.Tie[i]; tied {
+				v = 0 // unused coordinate; the value comes from the master
+			}
+			lo[i], hi[i] = v, v
+		}
+	}
+	if opts.FitNeg {
+		lo[l.neg()], hi[l.neg()] = -negBound, negBound
+	} else {
+		lo[l.neg()], hi[l.neg()] = 0, 0
+	}
+	for j := range l.j {
+		lo[l.beta(j)], hi[l.beta(j)] = logBetaMin, logBetaMax
+		lo[l.tau(j)], hi[l.tau(j)] = logTauMin, logTauMax
+		lo[l.pi(j)], hi[l.pi(j)] = -piBound, piBound
+	}
+	switch opts.Gamma {
+	case GammaFree:
+		lo[l.gamma()], hi[l.gamma()] = -gammaBound, gammaBound
+	case GammaFixed:
+		lo[l.gamma()], hi[l.gamma()] = opts.GammaValue, opts.GammaValue
+	default:
+		lo[l.gamma()], hi[l.gamma()] = 0, 0
+	}
+	if mixed {
+		lo[l.logSigma()], hi[l.logSigma()] = logSigmaMin, logSigmaMax
+	} else {
+		lo[l.logSigma()], hi[l.logSigma()] = 0, 0
+	}
+	return lo, hi
 }
 
 // answerLogLik returns the log-likelihood of one judgment and its derivatives with respect to z and τ.
@@ -257,100 +553,350 @@ func answerLogLik(y Answer, z, tau float64) (ll, dz, dtau float64) {
 	}
 }
 
-// objective is the penalized negative log-likelihood and its gradient.
+// Probs returns (P(A), P(B), P(same)) at z, τ.
+func Probs(z, tau float64) (pa, pb, pt float64) {
+	pa, pb = sigmoid(z-tau), sigmoid(-z-tau)
+	return pa, pb, math.Max(1-pa-pb, 1e-12)
+}
+
+// ghRule returns the n-point Gauss–Hermite nodes and weights (weight function e^{−x²}).
+func ghRule(n int) (x, w []float64) {
+	x, w = make([]float64, n), make([]float64, n)
+	quad.Hermite{}.FixedLocations(x, w, math.Inf(-1), math.Inf(1))
+	return x, w
+}
+
+// objective is the penalized negative log-likelihood and its gradient (independence or random intercept).
 type objective struct {
 	l      layout
 	ds     []diff
-	neg    []float64
+	fold   [][ged.NumParams]float64 // Δφ with tied columns folded into their master
+	trips  []Triplet
 	js     []Judgment
+	byTrip [][]int // judgments per triplet (mixed mode)
 	opts   Options
-	ridge  float64 // a very weak penalty on auxiliary parameters for numerical stability
+	ridge  float64
+	mixed  bool
+	ghX    []float64
+	ghLogW []float64
 	nllRaw float64
+}
+
+func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Options, ridge float64, mixed bool) *objective {
+	o := &objective{l: l, ds: ds, trips: trips, js: js, opts: opts, ridge: ridge, mixed: mixed}
+	o.fold = make([][ged.NumParams]float64, len(ds))
+	for i, d := range ds {
+		for p := range ged.NumParams {
+			q := p
+			if m, ok := opts.Tie[p]; ok {
+				q = m
+			}
+			o.fold[i][q] += d.dphi[p]
+		}
+	}
+	if mixed {
+		o.byTrip = make([][]int, len(trips))
+		for k, j := range js {
+			o.byTrip[j.Triplet] = append(o.byTrip[j.Triplet], k)
+		}
+		nq := opts.Quadrature
+		if nq <= 0 {
+			nq = 20
+		}
+		x, w := ghRule(nq)
+		o.ghX = x
+		o.ghLogW = make([]float64, nq)
+		for q := range w {
+			o.ghLogW[q] = math.Log(w[q]) - 0.5*math.Log(math.Pi)
+		}
+	}
+	return o
+}
+
+func (o *objective) weight(t int) float64 {
+	if !o.opts.Weighted {
+		return 1
+	}
+	return o.trips[t].weight()
+}
+
+// delta returns D_t = Δ_t(θ) + θ_neg·Δneg_t at the folded features.
+func (o *objective) delta(t int, p Params) float64 {
+	v := o.ds[t].c
+	for q := range ged.NumParams {
+		v += o.fold[t][q] * p.Theta[q]
+	}
+	return v + p.ThetaNeg*o.trips[t].NegDiff
+}
+
+// accum adds the gradient contribution of one judgment given dz, dtau (derivatives of its log-likelihood), scaled by w.
+func (o *objective) accum(g []float64, k Judgment, p Params, D, dz, dtau, w float64) {
+	l := o.l
+	j := k.Judge
+	t := k.Triplet
+	for q := range ged.NumParams {
+		g[q] -= w * dz * p.Beta[j] * o.fold[t][q]
+	}
+	g[l.neg()] -= w * dz * p.Beta[j] * o.trips[t].NegDiff
+	g[l.beta(j)] -= w * dz * D * p.Beta[j] // d/d log β
+	g[l.tau(j)] -= w * dtau * p.Tau[j]     // d/d log τ
+	g[l.pi(j)] -= w * dz * k.Order
+	g[l.gamma()] -= w * dz * o.trips[t].DeltaCoh()
 }
 
 func (o *objective) eval(x, grad []float64) float64 {
 	l := o.l
-	p := l.unpack(x)
+	p := l.unpack(x, o.opts.Tie, o.mixed)
 	if grad != nil {
 		clear(grad)
 	}
-	var gTheta [ged.NumParams]float64
-	var gNeg float64
-	gBeta := make([]float64, l.j)
-	gTau := make([]float64, l.j)
-	gPi := make([]float64, l.j)
-
 	nll := 0.0
-	for _, k := range o.js {
-		d := o.ds[k.Triplet]
-		D := d.value(p.Theta) + p.ThetaNeg*o.neg[k.Triplet]
-		j := k.Judge
-		z := p.Beta[j]*D + p.Pi[j]*k.Order
-		ll, dz, dtau := answerLogLik(k.Answer, z, p.Tau[j])
-		nll -= ll
-		if grad == nil {
-			continue
+	if !o.mixed {
+		for _, k := range o.js {
+			t := k.Triplet
+			w := o.weight(t)
+			D := o.delta(t, p)
+			j := k.Judge
+			z := p.Beta[j]*D + p.Pi[j]*k.Order + p.Gamma*o.trips[t].DeltaCoh()
+			ll, dz, dtau := answerLogLik(k.Answer, z, p.Tau[j])
+			nll -= w * ll
+			if grad != nil {
+				o.accum(grad, k, p, D, dz, dtau, w)
+			}
 		}
-		for i := range ged.NumParams {
-			gTheta[i] -= dz * p.Beta[j] * d.dphi[i]
+	} else {
+		nq := len(o.ghX)
+		llq := make([]float64, nq)
+		dzq := make([][]float64, nq)
+		dtq := make([][]float64, nq)
+		for t, ks := range o.byTrip {
+			if len(ks) == 0 {
+				continue
+			}
+			w := o.weight(t)
+			D := o.delta(t, p)
+			for q := range nq {
+				u := p.Sigma * math.Sqrt2 * o.ghX[q]
+				s := o.ghLogW[q]
+				if grad != nil {
+					dzq[q] = make([]float64, len(ks))
+					dtq[q] = make([]float64, len(ks))
+				}
+				for i, ki := range ks {
+					k := o.js[ki]
+					j := k.Judge
+					z := p.Beta[j]*D + p.Pi[j]*k.Order + p.Gamma*o.trips[t].DeltaCoh() + u
+					ll, dz, dtau := answerLogLik(k.Answer, z, p.Tau[j])
+					s += ll
+					if grad != nil {
+						dzq[q][i], dtq[q][i] = dz, dtau
+					}
+				}
+				llq[q] = s
+			}
+			lse := logSumExp(llq)
+			nll -= w * lse
+			if grad == nil {
+				continue
+			}
+			for q := range nq {
+				r := math.Exp(llq[q] - lse)
+				if r < 1e-300 {
+					continue
+				}
+				u := p.Sigma * math.Sqrt2 * o.ghX[q]
+				for i, ki := range ks {
+					k := o.js[ki]
+					o.accum(grad, k, p, D, dzq[q][i], dtq[q][i], w*r)
+					grad[l.logSigma()] -= w * r * dzq[q][i] * u
+				}
+			}
 		}
-		gNeg -= dz * p.Beta[j] * o.neg[k.Triplet]
-		gBeta[j] -= dz * D
-		gTau[j] -= dtau
-		gPi[j] -= dz * k.Order
 	}
 	o.nllRaw = nll
 
 	f := nll
+	free := FreeTheta(o.opts)
 	for i := range ged.NumParams {
+		if !free[i] {
+			continue
+		}
 		dev := p.Theta[i] - o.opts.Theta0[i]
 		f += o.opts.Lambda * dev * dev
-		gTheta[i] += 2 * o.opts.Lambda * dev
+		if grad != nil {
+			grad[i] += 2 * o.opts.Lambda * dev
+		}
 	}
 	f += o.ridge * p.ThetaNeg * p.ThetaNeg
-	gNeg += 2 * o.ridge * p.ThetaNeg
+	if grad != nil {
+		grad[l.neg()] += 2 * o.ridge * p.ThetaNeg
+	}
 	for j := range l.j {
-		lb, lt := math.Log(p.Beta[j]), math.Log(p.Tau[j])
+		lb, lt := x[l.beta(j)], x[l.tau(j)]
 		f += o.ridge * (lb*lb + lt*lt + p.Pi[j]*p.Pi[j])
 		if grad != nil {
-			grad[l.beta(j)] = gBeta[j]*p.Beta[j] + 2*o.ridge*lb
-			grad[l.tau(j)] = gTau[j]*p.Tau[j] + 2*o.ridge*lt
-			grad[l.pi(j)] = gPi[j] + 2*o.ridge*p.Pi[j]
+			grad[l.beta(j)] += 2 * o.ridge * lb
+			grad[l.tau(j)] += 2 * o.ridge * lt
+			grad[l.pi(j)] += 2 * o.ridge * p.Pi[j]
 		}
 	}
 	if grad != nil {
 		for i := range ged.NumParams {
-			if _, fixed := o.opts.Fixed[i]; !o.opts.FixTheta && !fixed {
-				grad[i] = gTheta[i] * sigmoid(x[i])
+			if !free[i] {
+				grad[i] = 0
 			}
 		}
-		if o.opts.FitNeg {
-			grad[l.neg()] = gNeg
+		if !o.opts.FitNeg {
+			grad[l.neg()] = 0
+		}
+		if o.opts.Gamma != GammaFree {
+			grad[l.gamma()] = 0
+		}
+		if !o.mixed {
+			grad[l.logSigma()] = 0
 		}
 	}
 	return f
 }
 
-// Init returns the initial values (θ = Theta0, β = 1, τ = 0.5, π = 0).
+func logSumExp(v []float64) float64 {
+	m := math.Inf(-1)
+	for _, x := range v {
+		if x > m {
+			m = x
+		}
+	}
+	if math.IsInf(m, 0) {
+		return m
+	}
+	s := 0.0
+	for _, x := range v {
+		s += math.Exp(x - m)
+	}
+	return m + math.Log(s)
+}
+
+// Init returns the initial values (θ = Theta0, β = 1, τ = 0.5, π = 0, γ = GammaValue if fixed, σ = Sigma0).
 func Init(opts Options) Params {
 	p := Params{Theta: opts.Theta0, Beta: make([]float64, opts.Judges), Tau: make([]float64, opts.Judges), Pi: make([]float64, opts.Judges)}
 	for j := range opts.Judges {
 		p.Beta[j], p.Tau[j] = 1, 0.5
 	}
+	if opts.Gamma == GammaFixed {
+		p.Gamma = opts.GammaValue
+	}
+	p.Sigma = opts.Sigma0
+	if p.Sigma <= 0 {
+		p.Sigma = 1
+	}
 	return p
 }
 
-// Fit estimates by alternating optimization. If init is nil, it starts from Init(opts).
+// Fit estimates by alternating optimization under working independence. If init is nil, it starts from Init(opts).
+// With opts.Starts set it runs every start and keeps the best true objective.
 func Fit(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, error) {
+	return fitMulti(trips, js, opts, init, false)
+}
+
+// FitMixed is the random-intercept fit (Appendix A.6): one Gaussian offset per triplet shared by its judgments,
+// integrated by Gauss–Hermite quadrature; parameters (θ, θ_neg, β, τ, π, γ, log σ).
+func FitMixed(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, error) {
+	return fitMulti(trips, js, opts, init, true)
+}
+
+// FitMulti runs Fit from the three pre-registered starts (θ₀, R1, all-0.5) plus init, keeping the best (decisions §11.3).
+func FitMulti(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, error) {
+	if len(opts.Starts) == 0 {
+		opts.Starts, opts.StartNames = DefaultStarts(opts.Theta0)
+	}
+	return fitMulti(trips, js, opts, init, false)
+}
+
+// FitMixedMulti is FitMixed with the pre-registered multi-start.
+func FitMixedMulti(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, error) {
+	if len(opts.Starts) == 0 {
+		opts.Starts, opts.StartNames = DefaultStarts(opts.Theta0)
+	}
+	return fitMulti(trips, js, opts, init, true)
+}
+
+func fitMulti(trips []Triplet, js []Judgment, opts Options, init *Params, mixed bool) (Result, error) {
 	if opts.Judges <= 0 {
 		return Result{}, errors.New("fit: Judges must be positive")
 	}
+	if opts.Weights != nil && len(opts.Weights) != len(trips) {
+		return Result{}, fmt.Errorf("fit: len(Weights) = %d, want %d", len(opts.Weights), len(trips))
+	}
+	trips, js, _ = Filter(trips, js, opts)
+	opts.Weights = nil // materialised into Triplet.Weight by Filter
+	if len(js) == 0 {
+		return Result{}, errors.New("fit: no judgments after filtering")
+	}
+	if len(opts.Starts) == 0 {
+		return fitOnce(trips, js, opts, init, mixed)
+	}
+	type start struct {
+		name string
+		p    Params
+	}
+	var starts []start
+	if init != nil {
+		starts = append(starts, start{"init", clone(*init)})
+	}
+	for i, th := range opts.Starts {
+		p := Init(opts)
+		if init != nil {
+			p = clone(*init)
+		}
+		p.Theta = th
+		name := fmt.Sprintf("start %d", i+1)
+		if i < len(opts.StartNames) {
+			name = opts.StartNames[i]
+		}
+		starts = append(starts, start{name, p})
+	}
+	var best Result
+	bestI := -1
+	var errs []error
+	results := make([]Result, len(starts))
+	for i, s := range starts {
+		r, err := fitOnce(trips, js, opts, &s.p, mixed)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", s.name, err))
+			continue
+		}
+		results[i] = r
+		if bestI < 0 || r.Objective < best.Objective {
+			best, bestI = r, i
+		}
+	}
+	if bestI < 0 {
+		return Result{}, errors.Join(errs...)
+	}
+	for i, s := range starts {
+		r := results[i]
+		if r.Params.Beta == nil {
+			continue
+		}
+		best.Starts = append(best.Starts, StartResult{Name: s.name, Theta: r.Params.Theta, Objective: r.Objective, NegLogLik: r.NegLogLik, Converged: r.Converged, Cycled: r.Cycled})
+		for p := range ged.NumParams {
+			best.StartSpread = math.Max(best.StartSpread, math.Abs(r.Params.Theta[p]-best.Params.Theta[p]))
+		}
+	}
+	return best, nil
+}
+
+// fitOnce is the alternating optimization from one start (filters already applied).
+func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed bool) (Result, error) {
 	if opts.MaxOuter <= 0 {
 		opts.MaxOuter = 20
 	}
 	p := Init(opts)
 	if init != nil {
 		p = clone(*init)
+		if len(p.Beta) != opts.Judges {
+			return Result{}, fmt.Errorf("fit: init has %d judges, want %d", len(p.Beta), opts.Judges)
+		}
 	}
 	if opts.FixTheta {
 		p.Theta = opts.Theta0
@@ -361,11 +907,26 @@ func Fit(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, er
 	for i, v := range opts.Fixed {
 		p.Theta[i] = v
 	}
-	neg := make([]float64, len(trips))
-	for i, t := range trips {
-		neg[i] = t.NegDiff
+	for i, m := range opts.Tie {
+		p.Theta[i] = p.Theta[m]
+	}
+	switch opts.Gamma {
+	case GammaOff:
+		p.Gamma = 0
+	case GammaFixed:
+		p.Gamma = opts.GammaValue
+	}
+	if mixed && p.Sigma <= 0 {
+		p.Sigma = opts.Sigma0
+		if p.Sigma <= 0 {
+			p.Sigma = 1
+		}
+	}
+	for i := range ged.NumParams {
+		p.Theta[i] = clampTo(p.Theta[i], 0, ThetaMax)
 	}
 	l := layout{j: opts.Judges}
+	lo, hi := l.bounds(opts, p, mixed)
 
 	ds, err := features(trips, p.Theta)
 	if err != nil {
@@ -377,46 +938,64 @@ func Fit(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, er
 	}
 	seen := map[string]bool{sigOf(ds): true}
 	best, bestF := Result{}, math.Inf(1)
+	prevTrue := math.Inf(1)
+	finish := func(r Result) Result {
+		r.Free = FreeTheta(opts)
+		r.Mixed = mixed
+		r.Triplets, r.Judgments = len(trips), len(js)
+		for q := range ged.NumParams {
+			if !r.Free[q] {
+				continue
+			}
+			r.Boundary[q] = r.Params.Theta[q] < BoundaryEps
+			r.Divergent[q] = r.Params.Theta[q] >= ThetaMax-1e-9
+		}
+		if !mixed {
+			r.Params.Sigma = 0
+		}
+		return r
+	}
 	for outer := 1; outer <= opts.MaxOuter; outer++ {
-		obj := &objective{l: l, ds: ds, neg: neg, js: js, opts: opts, ridge: ridge}
-		prob := optimize.Problem{
-			Func: func(x []float64) float64 { return obj.eval(x, nil) },
-			Grad: func(g, x []float64) { obj.eval(x, g) },
+		obj := newObjective(l, ds, trips, js, opts, ridge, mixed)
+		br := projLBFGS(obj.eval, l.pack(p, mixed), lo, hi, boxOptions{})
+		if math.IsNaN(br.F) || math.IsInf(br.F, 0) {
+			return best, errors.New("fit: objective is not finite")
 		}
-		r, err := optimize.Minimize(prob, l.pack(p), &optimize.Settings{
-			GradientThreshold: 1e-6,
-			MajorIterations:   5000,
-		}, &optimize.LBFGS{})
-		if err != nil && r == nil {
-			return best, fmt.Errorf("fit: L-BFGS: %w", err)
-		}
-		p = l.unpack(r.X)
+		p = l.unpack(br.X, opts.Tie, mixed)
 
 		// Re-solve the matching at this θ and measure the objective under real GED (GED is a minimum over matchings).
 		next, err := features(trips, p.Theta)
 		if err != nil {
 			return best, err
 		}
-		trueObj := &objective{l: l, ds: next, neg: neg, js: js, opts: opts, ridge: ridge}
-		f := trueObj.eval(r.X, nil)
-		cur := Result{Params: p, NegLogLik: trueObj.nllRaw, Outer: outer}
+		trueObj := newObjective(l, next, trips, js, opts, ridge, mixed)
+		f := trueObj.eval(br.X, nil)
+		cur := Result{Params: p, NegLogLik: trueObj.nllRaw, Objective: f, Outer: outer}
 		if f < bestF {
 			best, bestF = cur, f
 		}
 		sig := sigOf(next)
 		if sig == sigOf(ds) {
 			cur.Converged = true
-			return cur, nil
+			return finish(cur), nil
+		}
+		if math.Abs(f-prevTrue) < 1e-6*math.Max(1, math.Abs(f)) {
+			// Objective-based stopping (decisions §11.2): the matching moved but the true objective did not.
+			best.Converged = true
+			best.Outer = outer
+			return finish(best), nil
 		}
 		if seen[sig] {
 			best.Cycled, best.Outer = true, outer
-			return best, nil
+			return finish(best), nil
 		}
 		seen[sig] = true
 		ds = next
+		prevTrue = f
 	}
 	best.Outer = opts.MaxOuter
-	return best, nil
+	best.Capped = true
+	return finish(best), nil
 }
 
 func sigOf(ds []diff) string {
@@ -436,18 +1015,103 @@ func clone(p Params) Params {
 	return q
 }
 
-// NegLogLik is the negative log-likelihood at the given parameters (no penalty; matching solved at p.Theta).
+// Clone returns a deep copy of p.
+func (p Params) Clone() Params { return clone(p) }
+
+// NegLogLik is the negative log-likelihood at the given parameters (no penalty; matching solved at p.Theta;
+// working independence; no filters or weights).
 func NegLogLik(trips []Triplet, js []Judgment, p Params) (float64, error) {
+	ll, err := LogLik(trips, js, p)
+	if err != nil {
+		return 0, err
+	}
+	s := 0.0
+	for _, v := range ll {
+		s -= v
+	}
+	return s, nil
+}
+
+// LogLik returns the per-judgment log-likelihood at p (working independence; matching solved at p.Theta).
+func LogLik(trips []Triplet, js []Judgment, p Params) ([]float64, error) {
+	ds, err := features(trips, p.Theta)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float64, len(js))
+	for i, k := range js {
+		D := ds[k.Triplet].value(p.Theta) + p.ThetaNeg*trips[k.Triplet].NegDiff
+		z := p.Beta[k.Judge]*D + p.Pi[k.Judge]*k.Order + p.Gamma*trips[k.Triplet].DeltaCoh()
+		ll, _, _ := answerLogLik(k.Answer, z, p.Tau[k.Judge])
+		out[i] = ll
+	}
+	return out, nil
+}
+
+// NegLogLikMixed is the marginal negative log-likelihood of the random-intercept model at p (no penalty).
+func NegLogLikMixed(trips []Triplet, js []Judgment, p Params, nodes int) (float64, error) {
 	ds, err := features(trips, p.Theta)
 	if err != nil {
 		return 0, err
 	}
-	nll := 0.0
-	for _, k := range js {
-		D := ds[k.Triplet].value(p.Theta) + p.ThetaNeg*trips[k.Triplet].NegDiff
-		z := p.Beta[k.Judge]*D + p.Pi[k.Judge]*k.Order
-		ll, _, _ := answerLogLik(k.Answer, z, p.Tau[k.Judge])
-		nll -= ll
+	opts := Options{Judges: len(p.Beta), Quadrature: nodes, FitNeg: true, Gamma: GammaFree}
+	l := layout{j: opts.Judges}
+	o := newObjective(l, ds, trips, js, opts, 0, true)
+	o.eval(l.pack(p, true), nil)
+	return o.nllRaw, nil
+}
+
+func equalFold(a, b string) bool { return strings.EqualFold(a, b) }
+
+// Filter applies the triplet and judgment filters of opts and materialises Options.Weights into Triplet.Weight.
+// It returns the kept triplets (renumbered), their judgments, and the original index of every kept triplet.
+// With no flags, families or weights set, it is the identity.
+func Filter(trips []Triplet, js []Judgment, opts Options) ([]Triplet, []Judgment, []int) {
+	excl := opts.Exclude
+	if excl == nil && !opts.IncludeAll {
+		excl = DefaultExclude
 	}
-	return nll, nil
+	if opts.IncludeAll {
+		excl = nil
+	}
+	keep := make([]bool, len(trips))
+	kept := make([]int, 0, len(trips))
+	pos := make([]int, len(trips))
+	out := make([]Triplet, 0, len(trips))
+	for i, t := range trips {
+		ok := true
+		for _, f := range excl {
+			if t.HasFlag(f) {
+				ok = false
+				break
+			}
+		}
+		if opts.CohZeroOnly && math.Abs(t.DeltaCoh()) > 1e-12 {
+			ok = false
+		}
+		keep[i] = ok
+		if !ok {
+			pos[i] = -1
+			continue
+		}
+		if opts.Weights != nil {
+			t.Weight = opts.Weights[i]
+		}
+		pos[i] = len(out)
+		out = append(out, t)
+		kept = append(kept, i)
+	}
+	oj := make([]Judgment, 0, len(js))
+	for _, k := range js {
+		if k.Triplet < 0 || k.Triplet >= len(trips) || !keep[k.Triplet] {
+			continue
+		}
+		if opts.ExcludeSameFamily && k.Family != "" && trips[k.Triplet].VerifierFamily != "" &&
+			strings.EqualFold(k.Family, trips[k.Triplet].VerifierFamily) {
+			continue
+		}
+		k.Triplet = pos[k.Triplet]
+		oj = append(oj, k)
+	}
+	return out, oj, kept
 }

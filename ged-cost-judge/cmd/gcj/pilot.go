@@ -623,47 +623,6 @@ func writeTypeBreakdown(b *bytes.Buffer, kept []*pilotTriplet, js []fit.Judgment
 	}
 }
 
-// writeProfiles writes the log-likelihood as each price is varied one at a time.
-// slice fixes the other parameters at their estimates; profile refits the others (profile likelihood).
-// Both re-solve the proposition matching at each point (values under the real GED).
-func writeProfiles(path string, ft []fit.Triplet, js []fit.Judgment, opts fit.Options, est fit.Params) error {
-	var b bytes.Buffer
-	b.WriteString("param,value,slice_loglik,profile_loglik,assign_changes\n")
-	for p := range ged.NumParams {
-		var prevSig []string
-		for k := 0; k <= 60; k++ {
-			v := float64(k) * 0.05
-			sp := est
-			sp.Theta[p] = v
-			nll, err := fit.NegLogLik(ft, js, sp)
-			if err != nil {
-				return err
-			}
-			po := opts
-			po.Fixed = map[int]float64{p: v}
-			pr, err := fit.Fit(ft, js, po, &est)
-			if err != nil {
-				return err
-			}
-			sigs, err := fit.Signatures(ft, sp.Theta)
-			if err != nil {
-				return err
-			}
-			changes := 0
-			if prevSig != nil {
-				for i := range sigs {
-					if sigs[i] != prevSig[i] {
-						changes++
-					}
-				}
-			}
-			prevSig = sigs
-			fmt.Fprintf(&b, "%s,%.2f,%.4f,%.4f,%d\n", ged.ParamNames[p], v, -nll, -pr.NegLogLik, changes)
-		}
-	}
-	return os.WriteFile(path, b.Bytes(), 0o644)
-}
-
 func changesGraph(es []perturb.Edit) bool {
 	for _, e := range es {
 		if e.Kind != perturb.XSpk && e.Kind != perturb.XSurf {
