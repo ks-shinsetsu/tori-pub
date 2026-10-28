@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -25,13 +26,27 @@ type fakeAnthropic struct {
 	messageBodies []map[string]any
 	errStatus     int    // when non-zero, POST /v1/messages fails with this status
 	errType       string // error.type of that failure
+	messageStop   string // stop_reason of POST /v1/messages (default end_turn)
 	// Message Batches API
 	batches         map[string][]fakeBatchItem
+	createdAt       map[string]time.Time
 	batchCreates    int
 	polls           map[string]int
 	pollsUntilEnded int
-	failCustomIDs   map[string]bool // items that come back errored
+	failCustomIDs   map[string]bool   // items that come back errored
+	itemTypes       map[string]string // custom_id → "expired" / "canceled"
+	resultsFail     map[string]int    // batch id → how many /results requests fail with 500
+	pollDrops       map[string]int    // batch id → how many polls lose the connection
+	dropSubmits     int               // how many accepted submissions lose their response
 	nextID          int
+}
+
+// dropConnection closes the connection without a response (a transport error for the client).
+func dropConnection(w http.ResponseWriter) {
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err == nil {
+		_ = conn.Close()
+	}
 }
 
 type fakeBatchItem struct {
@@ -43,9 +58,13 @@ func newFakeAnthropic(t *testing.T) (*fakeAnthropic, *httptest.Server) {
 	f := &fakeAnthropic{
 		t:               t,
 		batches:         map[string][]fakeBatchItem{},
+		createdAt:       map[string]time.Time{},
 		polls:           map[string]int{},
 		pollsUntilEnded: 2,
 		failCustomIDs:   map[string]bool{},
+		itemTypes:       map[string]string{},
+		resultsFail:     map[string]int{},
+		pollDrops:       map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
@@ -69,7 +88,11 @@ func (f *fakeAnthropic) serve(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `{"type":"error","error":{"type":%q,"message":"fake %d"},"request_id":"req_1"}`, f.errType, f.errStatus)
 			return
 		}
-		writeJSON(w, fakeMessage("msg_1", body["model"].(string), `{"verdict":"A"}`, 1000, 200, 300))
+		stop := f.messageStop
+		if stop == "" {
+			stop = "end_turn"
+		}
+		writeJSON(w, fakeMessage("msg_1", body["model"].(string), `{"verdict":"A"}`, stop, 1000, 200, 300))
 
 	case r.Method == http.MethodPost && path == "/v1/messages/batches":
 		var body struct {
@@ -82,7 +105,21 @@ func (f *fakeAnthropic) serve(w http.ResponseWriter, r *http.Request) {
 		f.nextID++
 		id := fmt.Sprintf("msgbatch_%d", f.nextID)
 		f.batches[id] = body.Requests
-		writeJSON(w, fakeBatch(id, "in_progress"))
+		f.createdAt[id] = time.Now().UTC()
+		if f.dropSubmits > 0 {
+			f.dropSubmits-- // accepted, but the response is lost
+			dropConnection(w)
+			return
+		}
+		writeJSON(w, f.batchJSON(id, "in_progress"))
+
+	case r.Method == http.MethodGet && path == "/v1/messages/batches":
+		var data []json.RawMessage
+		for id := range f.batches {
+			data = append(data, json.RawMessage(f.batchJSON(id, "in_progress")))
+		}
+		b, _ := json.Marshal(map[string]any{"data": data, "has_more": false, "first_id": nil, "last_id": nil})
+		writeJSON(w, string(b))
 
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/v1/messages/batches/") && strings.HasSuffix(path, "/results"):
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/v1/messages/batches/"), "/results")
@@ -91,15 +128,25 @@ func (f *fakeAnthropic) serve(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if f.resultsFail[id] > 0 {
+			f.resultsFail[id]--
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"type":"error","error":{"type":"api_error","message":"fake results failure"}}`)
+			return
+		}
 		w.Header().Set("Content-Type", "application/x-jsonl")
 		// Reverse order: results are not guaranteed to follow request order.
 		for i := len(items) - 1; i >= 0; i-- {
 			it := items[i]
 			var line string
-			if f.failCustomIDs[it.CustomID] {
+			switch {
+			case f.failCustomIDs[it.CustomID]:
 				line = fmt.Sprintf(`{"custom_id":%q,"result":{"type":"errored","error":{"type":"error","error":{"type":"invalid_request_error","message":"bad item"},"request_id":"req_x"}}}`, it.CustomID)
-			} else {
-				msg := fakeMessage("msg_"+it.CustomID[:8], it.Params["model"].(string), echoText(it.Params), 100, 0, 10)
+			case f.itemTypes[it.CustomID] != "":
+				line = fmt.Sprintf(`{"custom_id":%q,"result":{"type":%q}}`, it.CustomID, f.itemTypes[it.CustomID])
+			default:
+				msg := fakeMessage("msg_"+it.CustomID[:8], it.Params["model"].(string), echoText(it.Params), "end_turn", 100, 0, 10)
 				line = fmt.Sprintf(`{"custom_id":%q,"result":{"type":"succeeded","message":%s}}`, it.CustomID, msg)
 			}
 			fmt.Fprintln(w, line)
@@ -108,7 +155,14 @@ func (f *fakeAnthropic) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/v1/messages/batches/"):
 		id := strings.TrimPrefix(path, "/v1/messages/batches/")
 		if _, ok := f.batches[id]; !ok {
-			http.NotFound(w, r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"type":"error","error":{"type":"not_found_error","message":"no such batch"}}`)
+			return
+		}
+		if f.pollDrops[id] > 0 {
+			f.pollDrops[id]--
+			dropConnection(w)
 			return
 		}
 		f.polls[id]++
@@ -116,7 +170,7 @@ func (f *fakeAnthropic) serve(w http.ResponseWriter, r *http.Request) {
 		if f.polls[id] >= f.pollsUntilEnded {
 			status = "ended"
 		}
-		writeJSON(w, fakeBatch(id, status))
+		writeJSON(w, f.batchJSON(id, status))
 
 	default:
 		f.t.Errorf("unexpected request %s %s", r.Method, path)
@@ -134,27 +188,35 @@ func echoText(params map[string]any) string {
 	return string(b)
 }
 
-func fakeMessage(id, model, text string, in, cacheRead, out int) string {
-	b, _ := json.Marshal(map[string]any{
+func fakeMessage(id, model, text, stop string, in, cacheRead, out int) string {
+	msg := map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": model,
 		"content": []any{
 			map[string]any{"type": "thinking", "thinking": "", "signature": "sig"},
 			map[string]any{"type": "text", "text": text},
 		},
-		"stop_reason": "end_turn", "stop_sequence": nil,
+		"stop_reason": stop, "stop_sequence": nil,
 		"usage": map[string]any{
 			"input_tokens": in, "cache_read_input_tokens": cacheRead,
 			"cache_creation_input_tokens": 0, "output_tokens": out,
 		},
-	})
+	}
+	if stop == "refusal" {
+		msg["stop_details"] = map[string]any{"type": "refusal", "category": "cyber", "explanation": "declined"}
+	}
+	b, _ := json.Marshal(msg)
 	return string(b)
 }
 
-func fakeBatch(id, status string) string {
+func (f *fakeAnthropic) batchJSON(id, status string) string {
+	created, ok := f.createdAt[id]
+	if !ok {
+		created = time.Now().UTC()
+	}
 	b, _ := json.Marshal(map[string]any{
 		"id": id, "type": "message_batch", "processing_status": status,
 		"request_counts": map[string]int{"processing": 0, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0},
-		"created_at":     "2026-10-28T00:00:00Z", "expires_at": "2026-10-29T00:00:00Z",
+		"created_at":     created.Format(time.RFC3339Nano), "expires_at": created.Add(24 * time.Hour).Format(time.RFC3339Nano),
 		"ended_at": nil, "archived_at": nil, "cancel_initiated_at": nil, "results_url": nil,
 	})
 	return string(b)
@@ -391,9 +453,23 @@ func TestAnthropicBatchMapsResultsAndFailures(t *testing.T) {
 		t.Errorf("failed item: retryable=%v response=%v", IsRetryable(res[1].Err), res[1].Response)
 	}
 
+	// Without a store the batch stays recorded (results are not persisted anywhere yet), with the
+	// tags of every request so a later run can store them.
 	st := readState(t, filepath.Join(stateDir, "msgbatch_1.json"))
-	if st.Status != batchCollected || st.Succeeded != 2 || st.Failed != 1 || len(st.CustomIDs) != 3 {
+	if st.Status != batchSubmitted || len(st.Items) != 3 {
 		t.Errorf("state = %+v", st)
+	}
+	keyA := CacheKey(c.ApplyDefaults(a))
+	for _, ref := range st.Items {
+		if ref.CustomID == keyA && !slices.Equal(ref.Tags, []string{"judge", "other"}) {
+			t.Errorf("tags of a = %v, want [judge other]", ref.Tags)
+		}
+	}
+	if err := c.MarkCollected("msgbatch_1"); err != nil {
+		t.Fatal(err)
+	}
+	if st := readState(t, filepath.Join(stateDir, "msgbatch_1.json")); st.Status != batchCollected {
+		t.Errorf("after MarkCollected: %q", st.Status)
 	}
 }
 
@@ -422,30 +498,7 @@ func TestAnthropicBatchResumesFromStateFile(t *testing.T) {
 	reqs := []Request{judgeReq("claude-haiku-5-5", "one"), judgeReq("claude-haiku-5-5", "two")}
 
 	// An earlier run submitted these requests and died while polling.
-	var ids []string
-	for _, r := range reqs {
-		r = c.ApplyDefaults(r)
-		p, err := c.buildParams(r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		raw, err := json.Marshal(p.batchItem())
-		if err != nil {
-			t.Fatal(err)
-		}
-		var params map[string]any
-		if err := json.Unmarshal(raw, &params); err != nil {
-			t.Fatal(err)
-		}
-		k := CacheKey(r)
-		ids = append(ids, k)
-		f.batches["msgbatch_old"] = append(f.batches["msgbatch_old"], fakeBatchItem{CustomID: k, Params: params})
-	}
-	old := batchState{ID: "msgbatch_old", CreatedAt: time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC), Status: batchSubmitted, CustomIDs: ids}
-	b, _ := json.Marshal(old)
-	if err := os.WriteFile(filepath.Join(stateDir, "msgbatch_old.json"), b, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	ids := plantBatch(t, f, c, stateDir, "msgbatch_old", reqs)
 
 	res, err := c.CompleteBatch(context.Background(), reqs)
 	if err != nil {
@@ -457,16 +510,26 @@ func TestAnthropicBatchResumesFromStateFile(t *testing.T) {
 	if res[0].Err != nil || res[0].Response.Text != `{"echo":"one"}` || res[1].Err != nil || res[1].Response.Text != `{"echo":"two"}` {
 		t.Errorf("results = %+v / %+v", res[0], res[1])
 	}
-	if st := readState(t, filepath.Join(stateDir, "msgbatch_old.json")); st.Status != batchCollected {
-		t.Errorf("state status = %q, want collected", st.Status)
+	// Nothing was persisted (no store), so the batch stays recorded and a rerun resumes it again.
+	if st := readState(t, filepath.Join(stateDir, "msgbatch_old.json")); st.Status != batchSubmitted {
+		t.Errorf("state status = %q, want submitted", st.Status)
+	}
+	if _, err := c.CompleteBatch(context.Background(), reqs); err != nil {
+		t.Fatal(err)
+	}
+	if f.batchCreates != 0 {
+		t.Errorf("rerun submitted %d batches, want 0 (resume)", f.batchCreates)
 	}
 
-	// A collected batch is not resumed again: an uncached rerun submits a new batch.
+	// Once the caller declares the results persisted, an (uncached) rerun submits anew.
+	if err := c.MarkCollected("msgbatch_old"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := c.CompleteBatch(context.Background(), reqs); err != nil {
 		t.Fatal(err)
 	}
 	if f.batchCreates != 1 {
-		t.Errorf("batch creates after collection = %d, want 1", f.batchCreates)
+		t.Errorf("batch creates after MarkCollected = %d, want 1", f.batchCreates)
 	}
 
 	// ResumeBatch works on an id directly.

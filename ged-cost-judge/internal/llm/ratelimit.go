@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"time"
@@ -74,13 +75,42 @@ func (c *ThrottledClient) Complete(ctx context.Context, req Request) (*Response,
 // ApplyDefaults forwards to the inner client (see RequestDefaulter).
 func (c *ThrottledClient) ApplyDefaults(req Request) Request { return applyDefaults(c.inner, req) }
 
-var _ BatchClient = (*ThrottledClient)(nil)
+var _ StoringBatchClient = (*ThrottledClient)(nil)
+
+// CompleteBatchStore forwards to the inner StoringBatchClient with one limiter token and no retry:
+// the retry belongs above the store (CachingClient.CompleteBatch re-reads the cache first). For any
+// other inner client it runs CompleteBatch and stores the successful results itself.
+func (c *ThrottledClient) CompleteBatchStore(ctx context.Context, reqs []Request, store BatchStore) ([]BatchResult, error) {
+	sc, ok := c.inner.(StoringBatchClient)
+	if !ok {
+		out, err := c.CompleteBatch(ctx, reqs)
+		for i, r := range out {
+			if r.Err != nil || r.Response == nil || i >= len(reqs) {
+				continue
+			}
+			req := c.ApplyDefaults(reqs[i])
+			if perr := store.StoreBatchResult(req.Tag, CacheKey(req), r.Response); perr != nil {
+				out[i].Err = perr
+			}
+		}
+		return out, err
+	}
+	if c.limiter != nil {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("llm: rate limiter wait: %w", err)
+		}
+	}
+	return sc.CompleteBatchStore(ctx, reqs, store)
+}
 
 // CompleteBatch forwards to the inner BatchClient, taking one limiter token per call and retrying
-// the whole call on a retryable error (e.g. 429/529 on submission). Retrying is safe: the
-// Anthropic client persists a batch only after it was accepted and resumes it instead of
-// resubmitting. Per-item errors are not retried here. If the inner client is not a BatchClient,
-// the requests are completed one by one through Complete (with its rate limit and retries).
+// the whole call on a retryable error. Without a store, the Anthropic client never forgets a
+// batch, so a retry resumes the batches already submitted instead of resubmitting them. A
+// submission whose outcome is unknown (lost response) is reconciled by the Anthropic client before
+// it reports a retryable error. Per-item errors are not retried here. If the inner client is not a
+// BatchClient, the requests are completed one by one through Complete (with its rate limit and retries).
+//
+// Note: wrapped in a CachingClient, the storing path (CompleteBatchStore) is used instead.
 func (c *ThrottledClient) CompleteBatch(ctx context.Context, reqs []Request) ([]BatchResult, error) {
 	bc, ok := c.inner.(BatchClient)
 	if !ok {
@@ -107,10 +137,10 @@ func (c *ThrottledClient) CompleteBatch(ctx context.Context, reqs []Request) ([]
 		}
 		lastErr = err
 		if !IsRetryable(err) || attempt == c.retry.MaxAttempts-1 {
-			return nil, err
+			return out, err // partial results (see BatchClient)
 		}
-		if err := sleepBackoff(ctx, c.retry, attempt); err != nil {
-			return nil, err
+		if serr := sleepBackoff(ctx, c.retry, attempt); serr != nil {
+			return out, errors.Join(err, serr)
 		}
 	}
 	return nil, lastErr

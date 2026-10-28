@@ -22,15 +22,30 @@ type OpenAIConfig struct {
 	Timeout    time.Duration
 	// Pricing is the cost estimation table. nil means DefaultPricing.
 	Pricing *PriceTable
+	// Effort is used when Request.Effort is empty (filled in by ApplyDefaults, so it is part of the
+	// cache key). Empty leaves requests untouched, which keeps existing cache keys valid.
+	Effort string
 }
 
 // OpenAIClient is the OpenAI implementation of Client.
 type OpenAIClient struct {
 	api     openai.Client
 	pricing *PriceTable
+	effort  string
 }
 
-var _ Client = (*OpenAIClient)(nil)
+var (
+	_ Client           = (*OpenAIClient)(nil)
+	_ RequestDefaulter = (*OpenAIClient)(nil)
+)
+
+// ApplyDefaults fills Effort from the config when the Request leaves it empty.
+func (c *OpenAIClient) ApplyDefaults(req Request) Request {
+	if req.Effort == "" {
+		req.Effort = c.effort
+	}
+	return req
+}
 
 // NewOpenAI creates an OpenAI client.
 func NewOpenAI(cfg OpenAIConfig) (*OpenAIClient, error) {
@@ -42,7 +57,10 @@ func NewOpenAI(cfg OpenAIConfig) (*OpenAIClient, error) {
 	if pricing == nil {
 		pricing = DefaultPricing()
 	}
-	return &OpenAIClient{api: api, pricing: pricing}, nil
+	if !validEfforts[cfg.Effort] {
+		return nil, fmt.Errorf("llm: openai config: unknown effort %q", cfg.Effort)
+	}
+	return &OpenAIClient{api: api, pricing: pricing, effort: cfg.Effort}, nil
 }
 
 // newAPI creates the SDK client. An empty APIKey is an error
@@ -65,6 +83,7 @@ func (cfg OpenAIConfig) newAPI() (openai.Client, error) {
 }
 
 func (c *OpenAIClient) Complete(ctx context.Context, req Request) (*Response, error) {
+	req = c.ApplyDefaults(req)
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}
@@ -126,8 +145,11 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (*Response, er
 		return nil, errors.New("llm: response has no choices")
 	}
 	choice := completion.Choices[0]
+	text, finish := choice.Message.Content, choice.FinishReason
 	if choice.Message.Refusal != "" {
-		return nil, fmt.Errorf("llm: model refused to answer: %s", choice.Message.Refusal)
+		// Billed like an answer: return it (so it is cached); the refusal text stays in Raw and
+		// CompleteJSON reports ErrRefusal.
+		text, finish = "", FinishRefusal
 	}
 	usage := Usage{
 		InputTokens:       completion.Usage.PromptTokens,
@@ -137,9 +159,9 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (*Response, er
 	usage.CostUSD = c.pricing.ChatCost(completion.Model, usage)
 
 	return &Response{
-		Text:         choice.Message.Content,
+		Text:         text,
 		Model:        completion.Model,
-		FinishReason: choice.FinishReason,
+		FinishReason: finish,
 		Usage:        usage,
 		Raw:          json.RawMessage(completion.RawJSON()),
 		LatencyMS:    latency.Milliseconds(),

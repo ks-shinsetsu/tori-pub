@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,50 +13,92 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
+	"github.com/anthropics/anthropic-sdk-go/v2/option"
 )
+
+// Money-safety rules of the batch path (each one closes a way to pay for the same requests twice):
+//
+//  1. A batch is recorded (state file, status "submitted") as soon as the API accepts it, and stays
+//     "submitted" until every successful result has been handed to the BatchStore. Without a store
+//     it is never forgotten automatically (MarkCollected does it). Resuming an ended batch only
+//     downloads results again, which is free for 29 days.
+//  2. A recorded batch that covers a request is always resumed before anything is submitted; if it
+//     cannot be read, nothing is submitted in that call.
+//  3. Results of a resumed batch for requests outside the current call are stored too (the state
+//     file keeps the cache tags per custom_id), so nothing that was paid for is dropped.
+//  4. Submissions are never retried by the SDK (no idempotency key). After a failure whose outcome
+//     is unknown, the batches created since the upload started are listed and recorded as
+//     "ambiguous", so the next attempt resumes them instead of submitting again.
 
 const (
 	// anthropicBatchRequestLimit is the Message Batches limit on requests per batch
 	// (the other limit is 256 MB per batch; see defaultBatchBytes).
 	anthropicBatchRequestLimit = 100_000
-	defaultBatchBytes          = 200 << 20
-	// maxPollFailures is how many consecutive transient errors polling tolerates.
-	maxPollFailures = 10
+	defaultBatchBytes          = 32 << 20
+	// batchResultsRetention is how long the API keeps batch results.
+	batchResultsRetention = 29 * 24 * time.Hour
+	// reconcileWindow is how far before the start of a failed upload a listed batch may have been
+	// created (clock skew) to count as possibly ours.
+	reconcileWindow = 10 * time.Minute
 )
 
 // Values of batchState.Status.
 const (
-	batchSubmitted = "submitted" // accepted by the API; results not collected yet
-	batchCollected = "collected" // results fetched and returned to the caller
+	batchSubmitted = "submitted" // accepted by the API; results not persisted yet
+	batchCollected = "collected" // every successful result was stored (or MarkCollected was called)
+	batchGone      = "gone"      // results are no longer available (404 or past retention)
 )
 
-// batchState is the on-disk record of a submitted batch (<BatchStateDir>/<id>.json).
-// custom_id is the CacheKey of the request, so a rerun can tell which requests a pending batch covers.
-type batchState struct {
-	ID          string     `json:"id"`
-	CreatedAt   time.Time  `json:"created_at"`
-	Status      string     `json:"status"`
-	CustomIDs   []string   `json:"custom_ids"`
-	CollectedAt *time.Time `json:"collected_at,omitempty"`
-	Succeeded   int        `json:"succeeded,omitempty"`
-	Failed      int        `json:"failed,omitempty"`
+// batchItemRef is one request of a recorded batch: its custom_id (the CacheKey) and the cache tags
+// it was requested under, so a result can be stored even when a later call does not ask for it.
+type batchItemRef struct {
+	CustomID string   `json:"custom_id"`
+	Tags     []string `json:"tags,omitempty"`
 }
 
-// CompleteBatch sends reqs as Message Batches (50% of the list price) and waits for the results.
+// batchState is the on-disk record of a submitted batch (<BatchStateDir>/<id>.json).
+type batchState struct {
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	Status    string    `json:"status"`
+	// Ambiguous marks a batch found after a submission whose outcome was unknown. Its items are
+	// unknown until its results are read, so every call resumes it until then.
+	Ambiguous   bool           `json:"ambiguous,omitempty"`
+	Items       []batchItemRef `json:"items"`
+	CollectedAt *time.Time     `json:"collected_at,omitempty"`
+	Succeeded   int            `json:"succeeded,omitempty"`
+	Failed      int            `json:"failed,omitempty"`
+}
+
+// batchItem is one distinct request of a CompleteBatch call.
+type batchItem struct {
+	params anthropic.MessageBatchNewParamsRequestParams
+	tags   []string
+}
+
+// CompleteBatch is CompleteBatchStore without a store: results are returned but no batch is ever
+// marked collected (call MarkCollected after persisting them, or use CachingClient).
+func (c *AnthropicClient) CompleteBatch(ctx context.Context, reqs []Request) ([]BatchResult, error) {
+	return c.CompleteBatchStore(ctx, reqs, nil)
+}
+
+// CompleteBatchStore sends reqs as Message Batches (50% of the list price) and waits for the results.
 //
 // custom_id is CacheKey(request after ApplyDefaults); identical requests are sent once and the
-// result is copied to each. Before submitting, batches recorded as still pending (in BatchStateDir
-// or by this process) that cover any of the requests are resumed by re-polling, so an interrupted
-// run does not pay twice. The remaining requests are split by MaxBatchRequests / MaxBatchBytes,
-// all chunks are submitted first, then polled. Per-item failures (errored, expired, canceled,
-// refusal, invalid request) are returned in BatchResult.Err; LatencyMS is 0 for batch items.
+// result is copied to each. Recorded batches that cover any of the requests are resumed first
+// (successful results are reused; items that failed there are submitted again). The remaining
+// requests are split by MaxBatchRequests / MaxBatchBytes; all chunks are submitted, then all are
+// polled, even if a later submission or poll fails. Every successful result of every batch read is
+// passed to store (when non-nil) before the batch is marked collected.
 //
-// Note: once results are collected the batch is marked collected, so if the process dies before
-// the caller stores them (CachingClient does so right away), a rerun submits those requests again.
-func (c *AnthropicClient) CompleteBatch(ctx context.Context, reqs []Request) ([]BatchResult, error) {
+// Per-item failures (errored, expired, canceled, invalid request) are returned in BatchResult.Err;
+// refusals and truncations are Responses (see Response.FinishError); LatencyMS is 0. On a
+// whole-call error the returned slice still holds every result obtained, and the error is
+// retryable (IsRetryable) when retrying cannot pay twice.
+func (c *AnthropicClient) CompleteBatchStore(ctx context.Context, reqs []Request, store BatchStore) ([]BatchResult, error) {
 	out := make([]BatchResult, len(reqs))
 	keys := make([]string, len(reqs))
-	items := map[string]anthropic.MessageBatchNewParamsRequestParams{}
+	items := map[string]*batchItem{}
 	var order []string
 	for i, req := range reqs {
 		req = c.ApplyDefaults(req)
@@ -66,9 +109,14 @@ func (c *AnthropicClient) CompleteBatch(ctx context.Context, reqs []Request) ([]
 		}
 		k := CacheKey(req)
 		keys[i] = k
-		if _, dup := items[k]; !dup {
-			items[k] = p.batchItem()
+		it, ok := items[k]
+		if !ok {
+			it = &batchItem{params: p.batchItem()}
+			items[k] = it
 			order = append(order, k)
+		}
+		if !slices.Contains(it.tags, req.Tag) {
+			it.tags = append(it.tags, req.Tag)
 		}
 	}
 	if len(order) == 0 {
@@ -76,66 +124,92 @@ func (c *AnthropicClient) CompleteBatch(ctx context.Context, reqs []Request) ([]
 	}
 
 	results := map[string]BatchResult{}
-	merge := func(got map[string]BatchResult) {
+	var (
+		polled []string
+		errs   []error
+	)
+	take := func(got map[string]BatchResult, keepFailures bool) {
 		for k, r := range got {
-			if _, want := items[k]; want {
+			if _, want := items[k]; want && (keepFailures || r.Err == nil) {
 				results[k] = r
 			}
 		}
 	}
 
-	// 1. Resume batches that an interrupted run left behind.
+	// 1. Resume recorded batches that cover any of these requests.
 	pending, err := c.pendingStates()
 	if err != nil {
-		return nil, err
+		return c.finishBatch(out, keys, results, polled, err)
 	}
 	for _, st := range pending {
-		if !coversAny(st.CustomIDs, items) {
+		if !st.Ambiguous && !coversAny(st.Items, items) {
 			continue
 		}
-		got, err := c.ResumeBatch(ctx, st.ID)
+		polled = append(polled, st.ID)
+		got, err := c.collect(ctx, st, items, store)
+		take(got, false) // failures of an earlier run are submitted again
 		if err != nil {
-			return nil, err
+			errs = append(errs, err)
+			if ctx.Err() != nil {
+				break
+			}
 		}
-		merge(got)
+	}
+	if len(errs) > 0 {
+		// A recorded batch that could not be read may hold results for these requests:
+		// submitting them now could pay twice. Let the caller retry.
+		return c.finishBatch(out, keys, results, polled, errors.Join(errs...))
 	}
 
-	// 2. Submit what is left, then wait for every new batch.
+	// 2. Submit what is left.
 	var todo []anthropic.MessageBatchNewParamsRequest
 	for _, k := range order {
 		if _, done := results[k]; !done {
-			todo = append(todo, anthropic.MessageBatchNewParamsRequest{CustomID: k, Params: items[k]})
+			todo = append(todo, anthropic.MessageBatchNewParamsRequest{CustomID: k, Params: items[k].params})
 		}
 	}
 	chunks, err := c.chunkBatch(todo)
 	if err != nil {
-		return nil, err
+		return c.finishBatch(out, keys, results, polled, err)
 	}
-	var ids []string
+	var submitted []*batchState
 	for _, chunk := range chunks {
-		// On failure, earlier chunks are already recorded and are resumed by the next call.
-		id, err := c.submitBatch(ctx, chunk)
+		st, err := c.submitBatch(ctx, chunk, items)
 		if err != nil {
-			return nil, err
+			errs = append(errs, err)
+			break
 		}
-		ids = append(ids, id)
-	}
-	for _, id := range ids {
-		got, err := c.ResumeBatch(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		merge(got)
+		submitted = append(submitted, st)
 	}
 
-	for i := range reqs {
+	// 3. Wait for every batch that was accepted, even after a failed submission.
+	for _, st := range submitted {
+		polled = append(polled, st.ID)
+		got, err := c.collect(ctx, st, items, store)
+		take(got, true)
+		if err != nil {
+			errs = append(errs, err)
+			if ctx.Err() != nil {
+				break
+			}
+		}
+	}
+	return c.finishBatch(out, keys, results, polled, errors.Join(errs...))
+}
+
+// finishBatch maps results back to the request order. Requests without a result get an error that
+// names the batches involved (for a manual ResumeBatch).
+func (c *AnthropicClient) finishBatch(out []BatchResult, keys []string, results map[string]BatchResult, polled []string, err error) ([]BatchResult, error) {
+	for i := range out {
 		if out[i].Err != nil {
-			continue
+			continue // invalid request, never sent
 		}
 		r, ok := results[keys[i]]
 		switch {
+		case !ok && err != nil:
+			out[i].Err = fmt.Errorf("llm: anthropic batch: no result for request %d (batches %v): %w", i, polled, err)
 		case !ok:
-			out[i].Err = fmt.Errorf("llm: anthropic batch returned no result for request %d (custom_id %s)", i, keys[i])
+			out[i].Err = fmt.Errorf("llm: anthropic batch: no result for request %d (custom_id %s, batches %v)", i, keys[i], polled)
 		case r.Response != nil:
 			cp := *r.Response // duplicates must not share one Response
 			out[i] = BatchResult{Response: &cp}
@@ -143,61 +217,208 @@ func (c *AnthropicClient) CompleteBatch(ctx context.Context, reqs []Request) ([]
 			out[i] = r
 		}
 	}
-	return out, nil
+	return out, err
 }
 
-// ResumeBatch polls batch id until it has ended and returns its results keyed by custom_id.
-// It works for any batch of this API key (the state file is optional); when the batch is recorded,
-// the record is marked collected.
+// collect waits for a recorded batch, reads all of its results and, with a store, stores every
+// successful one under all of its tags (recorded ones and those of the current call). The batch is
+// marked collected only when every item was delivered and every success was stored. The returned
+// map holds whatever was read, also when an error is returned.
+func (c *AnthropicClient) collect(ctx context.Context, st *batchState, items map[string]*batchItem, store BatchStore) (map[string]BatchResult, error) {
+	got, err := c.fetchResults(ctx, st.ID)
+	if err != nil {
+		if isNotFound(err) || time.Since(st.CreatedAt) > batchResultsRetention {
+			// The results are gone: forget the batch so its requests can be submitted again.
+			gone := *st
+			gone.Status = batchGone
+			return map[string]BatchResult{}, c.saveState(&gone)
+		}
+		return nil, err
+	}
+
+	updated := *st
+	tagsOf := map[string][]string{}
+	for _, ref := range st.Items {
+		tagsOf[ref.CustomID] = ref.Tags
+	}
+	if st.Ambiguous {
+		// Now the items are known: record them (with tags where this call knows them).
+		updated.Ambiguous = false
+		updated.Items = nil
+		for k := range got {
+			var tags []string
+			if it, ok := items[k]; ok {
+				tags = slices.Clone(it.tags)
+			}
+			updated.Items = append(updated.Items, batchItemRef{CustomID: k, Tags: tags})
+		}
+		slices.SortFunc(updated.Items, func(a, b batchItemRef) int { return strings.Compare(a.CustomID, b.CustomID) })
+	}
+	if store == nil {
+		if st.Ambiguous {
+			return got, c.saveState(&updated)
+		}
+		return got, nil
+	}
+
+	complete := true
+	for _, ref := range updated.Items {
+		if _, ok := got[ref.CustomID]; !ok {
+			complete = false // should not happen; keep the batch to read it again
+		}
+	}
+	var storeErrs []error
+	succeeded, failed := 0, 0
+	for k, r := range got {
+		if r.Err != nil || r.Response == nil {
+			failed++
+			continue
+		}
+		succeeded++
+		tags := slices.Clone(tagsOf[k])
+		if it, ok := items[k]; ok {
+			for _, t := range it.tags {
+				if !slices.Contains(tags, t) {
+					tags = append(tags, t)
+				}
+			}
+		}
+		if len(tags) == 0 {
+			// A result of an ambiguous batch that no recorded request asked for (another
+			// process's batch, or ours from a call we cannot reconstruct): it cannot be stored.
+			continue
+		}
+		for _, tag := range tags {
+			if err := store.StoreBatchResult(tag, k, r.Response); err != nil {
+				storeErrs = append(storeErrs, err)
+			}
+		}
+	}
+	if len(storeErrs) > 0 {
+		// Keep the batch "submitted": a rerun reads it again instead of paying again.
+		if err := c.saveState(&updated); err != nil {
+			storeErrs = append(storeErrs, err)
+		}
+		return got, fmt.Errorf("llm: anthropic batch %s: storing results: %w", st.ID, errors.Join(storeErrs...))
+	}
+	if !complete {
+		return got, c.saveState(&updated)
+	}
+	now := time.Now().UTC()
+	updated.Status = batchCollected
+	updated.CollectedAt = &now
+	updated.Succeeded = succeeded
+	updated.Failed = failed
+	return got, c.saveState(&updated)
+}
+
+// ResumeBatch polls batch id until it has ended and returns its results keyed by custom_id. It
+// works for any batch of this API key and does not change its record (see MarkCollected).
 func (c *AnthropicClient) ResumeBatch(ctx context.Context, id string) (map[string]BatchResult, error) {
+	return c.fetchResults(ctx, id)
+}
+
+// MarkCollected marks recorded batches as collected, i.e. their results are persisted and they
+// need not be resumed again. Only needed when CompleteBatch is used without a store.
+func (c *AnthropicClient) MarkCollected(ids ...string) error {
+	for _, id := range ids {
+		st, err := c.stateByID(id)
+		if err != nil {
+			return err
+		}
+		if st == nil {
+			continue
+		}
+		updated := *st
+		now := time.Now().UTC()
+		updated.Status = batchCollected
+		updated.CollectedAt = &now
+		if err := c.saveState(&updated); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fetchResults waits for the batch to end and reads its results file.
+func (c *AnthropicClient) fetchResults(ctx context.Context, id string) (map[string]BatchResult, error) {
 	if err := c.waitBatch(ctx, id); err != nil {
 		return nil, err
 	}
 	stream := c.api.Messages.Batches.ResultsStreaming(ctx, id, anthropic.MessageBatchResultsParams{})
 	defer func() { _ = stream.Close() }()
 	results := map[string]BatchResult{}
-	succeeded := 0
 	for stream.Next() {
 		item := stream.Current()
-		r := c.batchItemResult(item.Result)
-		if r.Err == nil {
-			succeeded++
-		}
-		results[item.CustomID] = r
+		results[item.CustomID] = c.batchItemResult(item.Result)
 	}
 	if err := stream.Err(); err != nil {
-		return nil, fmt.Errorf("llm: anthropic batch %s results: %w", id, wrapAnthropicError(err))
-	}
-	if err := c.markCollected(id, succeeded, len(results)-succeeded); err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, batchInterrupted(id, ctx.Err())
+		}
+		return nil, fmt.Errorf("llm: anthropic batch %s results: %w", id, transient(wrapAnthropicError(err)))
 	}
 	return results, nil
 }
 
 // waitBatch polls until processing_status is "ended", backing off ×1.5 up to MaxPollInterval.
-// Transient errors (429/5xx) are tolerated up to maxPollFailures in a row.
+// Transient failures (network errors, 408/409/429, 5xx) are retried until they have lasted
+// PollFailureTimeout; a definitive API error (other 4xx) or ctx cancellation ends the wait.
+// The batch stays recorded in every case.
 func (c *AnthropicClient) waitBatch(ctx context.Context, id string) error {
 	interval := c.cfg.PollInterval
-	failures := 0
+	var failingSince time.Time
 	for {
 		b, err := c.api.Messages.Batches.Get(ctx, id, anthropic.MessageBatchGetParams{})
 		switch {
 		case err != nil:
+			if ctx.Err() != nil {
+				return batchInterrupted(id, ctx.Err())
+			}
 			werr := wrapAnthropicError(err)
-			if ctx.Err() != nil || !IsRetryable(werr) || failures >= maxPollFailures {
+			if isDefinitive(werr) {
 				return fmt.Errorf("llm: anthropic batch %s poll: %w", id, werr)
 			}
-			failures++
+			if failingSince.IsZero() {
+				failingSince = time.Now()
+			}
+			if d := time.Since(failingSince); d >= c.cfg.PollFailureTimeout {
+				return fmt.Errorf("llm: anthropic batch %s: polling failed for %s (the batch is recorded and resumes on the next call): %w",
+					id, d.Round(time.Second), transient(werr))
+			}
 		case b.ProcessingStatus == anthropic.MessageBatchProcessingStatusEnded:
 			return nil
 		default:
-			failures = 0
+			failingSince = time.Time{}
 		}
 		if err := sleepCtx(ctx, interval); err != nil {
-			return err
+			return batchInterrupted(id, err)
 		}
 		interval = min(interval*3/2, c.cfg.MaxPollInterval)
 	}
+}
+
+func batchInterrupted(id string, err error) error {
+	return fmt.Errorf("llm: anthropic batch %s: wait interrupted; the batch is recorded and resumes on the next call (or ResumeBatch(%q)): %w", id, id, err)
+}
+
+// isDefinitive reports an API error that retrying cannot fix (4xx other than 408/409/429).
+func isDefinitive(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && !apiErr.Retryable()
+}
+
+func isNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+}
+
+// transient marks err as retryable unless it is a definitive API error.
+func transient(err error) error {
+	if isDefinitive(err) || IsRetryable(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrTransient, err)
 }
 
 // batchItemResult converts one line of the results file.
@@ -223,7 +444,7 @@ func (c *AnthropicClient) batchItemResult(u anthropic.MessageBatchResultUnion) B
 }
 
 // chunkBatch splits requests by MaxBatchRequests and MaxBatchBytes (JSON size).
-// A single request larger than MaxBatchBytes gets a chunk of its own (and is rejected by the API).
+// A single request larger than MaxBatchBytes gets a chunk of its own.
 func (c *AnthropicClient) chunkBatch(reqs []anthropic.MessageBatchNewParamsRequest) ([][]anthropic.MessageBatchNewParamsRequest, error) {
 	var (
 		chunks [][]anthropic.MessageBatchNewParamsRequest
@@ -249,24 +470,71 @@ func (c *AnthropicClient) chunkBatch(reqs []anthropic.MessageBatchNewParamsReque
 	return chunks, nil
 }
 
-// submitBatch creates one batch and records it before returning its id.
-func (c *AnthropicClient) submitBatch(ctx context.Context, reqs []anthropic.MessageBatchNewParamsRequest) (string, error) {
-	b, err := c.api.Messages.Batches.New(ctx, anthropic.MessageBatchNewParams{Requests: reqs})
+// submitBatch creates one batch and records it before returning.
+//
+// The upload is never retried by the SDK: the Batches API has no idempotency key, so a retry after
+// a lost response would create a second billed batch. A clean rejection (4xx) means nothing was
+// created. Any other failure (network error, timeout, 5xx) leaves the outcome unknown: the batches
+// created since the upload started are listed and recorded as ambiguous, and a retryable error is
+// returned, so the next attempt resumes them instead of uploading again.
+func (c *AnthropicClient) submitBatch(ctx context.Context, reqs []anthropic.MessageBatchNewParamsRequest, items map[string]*batchItem) (*batchState, error) {
+	start := time.Now()
+	b, err := c.api.Messages.Batches.New(ctx, anthropic.MessageBatchNewParams{Requests: reqs},
+		option.WithMaxRetries(0), option.WithRequestTimeout(c.cfg.BatchSubmitTimeout))
 	if err != nil {
-		return "", wrapAnthropicError(err)
+		werr := wrapAnthropicError(err)
+		var apiErr *APIError
+		if errors.As(werr, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			return nil, fmt.Errorf("llm: anthropic batch submit rejected: %w", werr)
+		}
+		n, rerr := c.reconcileSubmit(ctx, start)
+		if rerr != nil {
+			// Not retryable: retrying blindly could create a second batch.
+			return nil, fmt.Errorf("llm: anthropic batch submit failed with an unknown outcome (%v) and the batch list could not be read (%v); check the Console for an untracked batch before rerunning", werr, rerr)
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("llm: anthropic batch submit interrupted; %d batch(es) created since the upload started are recorded and resume on the next call: %w", n, ctx.Err())
+		}
+		return nil, fmt.Errorf("llm: anthropic batch submit failed with an unknown outcome; %d batch(es) created since the upload started are recorded and resume on the next call: %w", n, transient(werr))
 	}
-	st := &batchState{ID: b.ID, CreatedAt: b.CreatedAt, Status: batchSubmitted, CustomIDs: make([]string, len(reqs))}
+	st := &batchState{ID: b.ID, CreatedAt: b.CreatedAt, Status: batchSubmitted, Items: make([]batchItemRef, len(reqs))}
 	if st.CreatedAt.IsZero() {
 		st.CreatedAt = time.Now().UTC()
 	}
 	for i, r := range reqs {
-		st.CustomIDs[i] = r.CustomID
+		st.Items[i] = batchItemRef{CustomID: r.CustomID, Tags: slices.Clone(items[r.CustomID].tags)}
 	}
 	if err := c.saveState(st); err != nil {
-		// The batch runs (and is billed) regardless; surface the id so it can be resumed by hand.
-		return "", fmt.Errorf("llm: anthropic batch %s submitted but not recorded (resume with ResumeBatch): %w", b.ID, err)
+		// The batch runs (and is billed) regardless; it is in memory for this process.
+		return nil, fmt.Errorf("llm: anthropic batch %s submitted but its state file could not be written (resume with ResumeBatch): %w", b.ID, err)
 	}
-	return b.ID, nil
+	return st, nil
+}
+
+// reconcileSubmit records the batches created since start (minus clock-skew slack) that are not
+// recorded yet as ambiguous, and returns how many it recorded. It runs even if ctx is canceled.
+func (c *AnthropicClient) reconcileSubmit(ctx context.Context, start time.Time) (int, error) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	page, err := c.api.Messages.Batches.List(rctx, anthropic.MessageBatchListParams{Limit: anthropic.Int(100)})
+	if err != nil {
+		return 0, wrapAnthropicError(err)
+	}
+	known, err := c.knownIDs()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, b := range page.Data {
+		if known[b.ID] || b.CreatedAt.Before(start.Add(-reconcileWindow)) {
+			continue
+		}
+		if err := c.saveState(&batchState{ID: b.ID, CreatedAt: b.CreatedAt, Status: batchSubmitted, Ambiguous: true}); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }
 
 func (c *AnthropicClient) statePath(id string) string {
@@ -287,29 +555,15 @@ func (c *AnthropicClient) saveState(st *batchState) error {
 	return writeFileAtomic(c.statePath(st.ID), b)
 }
 
-// markCollected marks a recorded batch as collected. Unknown ids (batches not submitted through
-// this client or its state dir) are ignored.
-func (c *AnthropicClient) markCollected(id string, succeeded, failed int) error {
+// stateByID returns the record of a batch (memory first, then disk); nil when unknown.
+func (c *AnthropicClient) stateByID(id string) (*batchState, error) {
 	c.mu.Lock()
 	st, ok := c.states[id]
 	c.mu.Unlock()
-	if !ok {
-		loaded, err := c.loadState(id)
-		if err != nil {
-			return err
-		}
-		if loaded == nil {
-			return nil
-		}
-		st = loaded
+	if ok {
+		return st, nil
 	}
-	now := time.Now().UTC()
-	updated := *st
-	updated.Status = batchCollected
-	updated.CollectedAt = &now
-	updated.Succeeded = succeeded
-	updated.Failed = failed
-	return c.saveState(&updated)
+	return c.loadState(id)
 }
 
 // loadState reads one state file; (nil, nil) when there is none.
@@ -331,9 +585,8 @@ func (c *AnthropicClient) loadState(id string) (*batchState, error) {
 	return &st, nil
 }
 
-// pendingStates returns the recorded batches whose results were not collected yet
-// (from this process and from BatchStateDir), oldest first.
-func (c *AnthropicClient) pendingStates() ([]*batchState, error) {
+// allStates returns every recorded batch (state dir and this process; memory wins).
+func (c *AnthropicClient) allStates() (map[string]*batchState, error) {
 	byID := map[string]*batchState{}
 	if c.cfg.BatchStateDir != "" {
 		entries, err := os.ReadDir(c.cfg.BatchStateDir)
@@ -356,11 +609,32 @@ func (c *AnthropicClient) pendingStates() ([]*batchState, error) {
 	}
 	c.mu.Lock()
 	for id, st := range c.states {
-		byID[id] = st // the in-memory record is the newest
+		byID[id] = st
 	}
 	c.mu.Unlock()
+	return byID, nil
+}
+
+func (c *AnthropicClient) knownIDs() (map[string]bool, error) {
+	all, err := c.allStates()
+	if err != nil {
+		return nil, err
+	}
+	known := make(map[string]bool, len(all))
+	for id := range all {
+		known[id] = true
+	}
+	return known, nil
+}
+
+// pendingStates returns the recorded batches whose results were not persisted yet, oldest first.
+func (c *AnthropicClient) pendingStates() ([]*batchState, error) {
+	all, err := c.allStates()
+	if err != nil {
+		return nil, err
+	}
 	var out []*batchState
-	for _, st := range byID {
+	for _, st := range all {
 		if st.Status == batchSubmitted {
 			out = append(out, st)
 		}
@@ -375,9 +649,9 @@ func (c *AnthropicClient) pendingStates() ([]*batchState, error) {
 	return out, nil
 }
 
-func coversAny[V any](ids []string, want map[string]V) bool {
-	for _, id := range ids {
-		if _, ok := want[id]; ok {
+func coversAny(refs []batchItemRef, want map[string]*batchItem) bool {
+	for _, r := range refs {
+		if _, ok := want[r.CustomID]; ok {
 			return true
 		}
 	}

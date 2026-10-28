@@ -94,6 +94,8 @@ func (r Request) Validate() error {
 
 // Usage is token usage and estimated cost.
 type Usage struct {
+	// InputTokens is the total prompt size, including cache reads and writes, for both providers
+	// (OpenAI prompt_tokens; Anthropic input_tokens + cache_read + cache_creation).
 	InputTokens int64 `json:"input_tokens"`
 	// CachedInputTokens are input tokens read from the provider's prompt cache
 	// (OpenAI cached_tokens, Anthropic cache_read_input_tokens). Included in InputTokens.
@@ -127,6 +129,37 @@ type Response struct {
 	LatencyMS int64 `json:"latency_ms"`
 }
 
+// FinishRefusal is Response.FinishReason when the model declined to answer (Anthropic stop_reason
+// "refusal", OpenAI message.refusal). Such a response is billed, so it is returned (and cached)
+// like any other; CompleteJSON turns it into ErrRefusal.
+const FinishRefusal = "refusal"
+
+var (
+	// ErrRefusal is reported (by FinishError / CompleteJSON) when the model declined to answer.
+	ErrRefusal = errors.New("llm: model refused to answer")
+	// ErrTruncated is reported when the output stopped at max_tokens.
+	ErrTruncated = errors.New("llm: output truncated at max_tokens")
+)
+
+// Truncated reports whether generation stopped at the token limit
+// (Anthropic "max_tokens", OpenAI "length"). Truncated responses are never cached.
+func (r *Response) Truncated() bool {
+	return r.FinishReason == "max_tokens" || r.FinishReason == "length"
+}
+
+// FinishError returns ErrRefusal or ErrTruncated (wrapped with the model name) when the response
+// cannot hold a complete answer, and nil otherwise. Neither is retryable as such: a refusal is
+// deterministic enough to keep, and a truncation needs a larger MaxTokens.
+func (r *Response) FinishError() error {
+	switch {
+	case r.FinishReason == FinishRefusal:
+		return fmt.Errorf("%w (model %s; details in Response.Raw)", ErrRefusal, r.Model)
+	case r.Truncated():
+		return fmt.Errorf("%w (model %s, finish_reason %s; raise MaxTokens)", ErrTruncated, r.Model, r.FinishReason)
+	}
+	return nil
+}
+
 // Client abstracts LLM completion. Implementations are OpenAI and Anthropic plus caching and
 // rate-control decorators.
 type Client interface {
@@ -147,9 +180,26 @@ type BatchClient interface {
 	Client
 	// CompleteBatch returns one BatchResult per request, in the order of reqs.
 	// A failure of a single item is reported in its BatchResult.Err (an *APIError when it came
-	// from the API), so a partially failed batch is still usable. The returned error is reserved
-	// for failures of the whole call (submission failed, context canceled, ...).
+	// from the API), so a partially failed batch is still usable. A non-nil error reports a
+	// failure of the whole call (submission failed, context canceled, ...); the returned slice
+	// still holds every response obtained before the failure (the other entries carry an Err).
 	CompleteBatch(ctx context.Context, reqs []Request) ([]BatchResult, error)
+}
+
+// BatchStore persists results of batches. CachingClient implements it on top of FileCache.
+type BatchStore interface {
+	// StoreBatchResult persists a response for (tag, key). It may decline to store a response
+	// (e.g. a truncated one) by returning nil without storing it.
+	StoreBatchResult(tag, key string, resp *Response) error
+}
+
+// StoringBatchClient is a BatchClient that hands every successful result of every batch it reads
+// (including results of a resumed batch for requests outside the current call) to a BatchStore,
+// and forgets a batch only after all of its results were stored. That makes "collected" mean
+// "persisted", so no failure between fetching and storing can lead to paying for a batch twice.
+type StoringBatchClient interface {
+	BatchClient
+	CompleteBatchStore(ctx context.Context, reqs []Request, store BatchStore) ([]BatchResult, error)
 }
 
 // RequestDefaulter is implemented by clients that fill provider defaults (model, max_tokens,
@@ -216,8 +266,15 @@ func (e *APIError) Retryable() bool {
 	return e.StatusCode >= 500
 }
 
-// IsRetryable reports whether a retryable APIError appears anywhere in the error chain.
+// ErrTransient marks failures that are safe and sensible to retry although they are not an
+// *APIError (e.g. network errors while polling a batch that is recorded and will be resumed).
+var ErrTransient = errors.New("llm: transient failure")
+
+// IsRetryable reports whether the error chain contains ErrTransient or a retryable APIError.
 func IsRetryable(err error) bool {
+	if errors.Is(err, ErrTransient) {
+		return true
+	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.Retryable()

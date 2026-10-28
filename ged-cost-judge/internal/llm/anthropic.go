@@ -45,14 +45,22 @@ type AnthropicConfig struct {
 	Pricing *PriceTable
 
 	// BatchStateDir is where submitted Message Batches are recorded (<dir>/<batch-id>.json), so an
-	// interrupted run resumes them instead of resubmitting. Empty keeps the record in memory only.
+	// interrupted run resumes them instead of resubmitting. Empty keeps the record in memory only
+	// (safe within one process, lost on exit). Use a directory that is not a cache tag.
 	BatchStateDir string
 	// PollInterval is the first wait between batch status polls (default 30s); it grows ×1.5 per
 	// poll up to MaxPollInterval (default 5m).
 	PollInterval    time.Duration
 	MaxPollInterval time.Duration
-	// MaxBatchRequests / MaxBatchBytes split large submissions. Defaults are the API limits
-	// (100,000 requests) and 200 MB (the API limit is 256 MB per batch; the margin covers the envelope).
+	// PollFailureTimeout is how long polling keeps retrying through consecutive transient failures
+	// (network errors, 429, 5xx) before giving up (default 30m). The batch stays recorded either way.
+	PollFailureTimeout time.Duration
+	// BatchSubmitTimeout bounds one batch upload (default 30m). Submissions are never retried by
+	// the SDK (the Batches API has no idempotency key); see submitBatch.
+	BatchSubmitTimeout time.Duration
+	// MaxBatchRequests / MaxBatchBytes split large submissions. Defaults are the API limit on
+	// requests (100,000) and 32 MB per upload (the API allows 256 MB; small uploads make a lost
+	// response, the only case that can create an untracked batch, cheap and rare).
 	MaxBatchRequests int
 	MaxBatchBytes    int
 }
@@ -72,13 +80,10 @@ type AnthropicClient struct {
 }
 
 var (
-	_ Client           = (*AnthropicClient)(nil)
-	_ BatchClient      = (*AnthropicClient)(nil)
-	_ RequestDefaulter = (*AnthropicClient)(nil)
+	_ Client             = (*AnthropicClient)(nil)
+	_ StoringBatchClient = (*AnthropicClient)(nil)
+	_ RequestDefaulter   = (*AnthropicClient)(nil)
 )
-
-// ErrRefusal is wrapped by the error returned when the model declines (stop_reason "refusal").
-var ErrRefusal = errors.New("llm: model refused to answer")
 
 // NewAnthropic creates an Anthropic client. An empty APIKey is an error
 // (relying on implicit credential discovery means a missing key is noticed only late in a run).
@@ -125,6 +130,12 @@ func NewAnthropic(cfg AnthropicConfig) (*AnthropicClient, error) {
 	}
 	if cfg.MaxBatchBytes <= 0 {
 		cfg.MaxBatchBytes = defaultBatchBytes
+	}
+	if cfg.PollFailureTimeout <= 0 {
+		cfg.PollFailureTimeout = 30 * time.Minute
+	}
+	if cfg.BatchSubmitTimeout <= 0 {
+		cfg.BatchSubmitTimeout = 30 * time.Minute
 	}
 	return &AnthropicClient{
 		api:     anthropic.NewClient(opts...),
@@ -299,17 +310,19 @@ func thinkingParam(model, thinking, effort string) (anthropic.ThinkingConfigPara
 }
 
 // toResponse converts an API message. batch selects batch pricing (BatchDiscount).
+//
+// A refusal (stop_reason "refusal", billed) is returned as a Response with FinishReason
+// FinishRefusal and empty Text, so it is cached and recorded like any other judgment; the category
+// and explanation are in Raw (stop_details). CompleteJSON reports it as ErrRefusal.
 func (c *AnthropicClient) toResponse(msg *anthropic.Message, batch bool) (*Response, error) {
-	if msg.StopReason == anthropic.StopReasonRefusal {
-		return nil, fmt.Errorf("%w (model %s, category %q): %s",
-			ErrRefusal, msg.Model, msg.StopDetails.Category, msg.StopDetails.Explanation)
-	}
 	// Thinking blocks are kept only in Raw; Text is the concatenated visible text
 	// (one block with the JSON document when structured output is used).
 	var text strings.Builder
-	for _, block := range msg.Content {
-		if block.Type == "text" {
-			text.WriteString(block.Text)
+	if msg.StopReason != anthropic.StopReasonRefusal {
+		for _, block := range msg.Content {
+			if block.Type == "text" {
+				text.WriteString(block.Text)
+			}
 		}
 	}
 	u := msg.Usage
