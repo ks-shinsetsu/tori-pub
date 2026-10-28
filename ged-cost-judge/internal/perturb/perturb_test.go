@@ -1,0 +1,381 @@
+package perturb
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"slices"
+	"testing"
+
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
+)
+
+// testSource draws a QT30-like source: n propositions (one per utterance), a forest over the non-isolated ones
+// with RA / MA / CA edges from later to earlier propositions, and ≥ 2 isolated propositions.
+func testSource(rng *rand.Rand, n int) ged.Graph {
+	var g ged.Graph
+	for i := range n {
+		g.Props = append(g.Props, ged.Prop{ID: fmt.Sprintf("p%d", i)})
+	}
+	iso := map[int]bool{}
+	for _, i := range rng.Perm(n)[:2+rng.IntN(2)] {
+		iso[i] = true
+	}
+	var conn []int
+	for i := range n {
+		if !iso[i] {
+			conn = append(conn, i)
+		}
+	}
+	for k := 1; k < len(conn); k++ {
+		if rng.Float64() < 0.2 {
+			continue
+		}
+		j := conn[max(0, k-1-rng.IntN(3))]
+		kind := []string{ged.RA, ged.RA, ged.MA, ged.CA}[rng.IntN(4)]
+		g.Edges = append(g.Edges, ged.Edge{From: g.Props[conn[k]].ID, To: g.Props[j].ID, Kind: kind})
+	}
+	return g
+}
+
+func pairCos(a, b string) float64 {
+	// deterministic pseudo-cos in [0.1, 0.6]
+	if a > b {
+		a, b = b, a
+	}
+	h := 0
+	for _, c := range a + "|" + b {
+		h = h*31 + int(c)
+	}
+	return 0.1 + 0.5*float64(uint(h)%1000)/1000
+}
+
+func TestWeightsSumToOne(t *testing.T) {
+	sum := 0.0
+	for _, x := range KindWeights() {
+		sum += x.W
+		if x.Kind == XSpk {
+			t.Errorf("X-spk must not be in the T3 weights")
+		}
+	}
+	if math.Abs(sum-1) > 1e-12 {
+		t.Fatalf("weights sum to %v", sum)
+	}
+	want := map[Kind]float64{RDel: .13, RAdd: .11, RType: .10, RTypeCA: .03, RRev: .09, PPara: .09, PShift: .11,
+		PNeg: .04, PAdd: .12, PDel: .06, PDelR: .10, XSurf: .02}
+	for _, x := range KindWeights() {
+		if want[x.Kind] != x.W {
+			t.Errorf("%s: weight %v, dataset-spec §2.2 says %v", x.Kind, x.W, want[x.Kind])
+		}
+	}
+}
+
+// drawMany applies a single edit of kind on many random sources.
+func drawMany(t *testing.T, kind Kind, n int, check func(src ged.Graph, e Edit, v Variant)) {
+	t.Helper()
+	rng := rand.New(rand.NewPCG(7, 1))
+	got := 0
+	for range n {
+		src := testSource(rng, 10+rng.IntN(10))
+		steps := BuildWith(rng, src, []Kind{kind}, BuildOptions{Cos: pairCos})
+		v := steps[len(steps)-1]
+		if len(v.Edits) == 0 {
+			continue
+		}
+		got++
+		check(src, v.Edits[0], v)
+	}
+	if got < n/2 {
+		t.Fatalf("%s applied only %d of %d times", kind, got, n)
+	}
+}
+
+func TestRTypeNeverCA(t *testing.T) {
+	drawMany(t, RType, 2000, func(_ ged.Graph, e Edit, _ Variant) {
+		if e.Edge.Kind == ged.CA || e.NewKind == ged.CA || e.Edge.Kind == e.NewKind {
+			t.Fatalf("R-type %s → %s", e.Edge.Kind, e.NewKind)
+		}
+		if e.Direction != DirectionLabel(e.Edge.Kind, e.NewKind) {
+			t.Fatalf("direction %q", e.Direction)
+		}
+	})
+}
+
+func TestRTypeCAInvolvesCA(t *testing.T) {
+	dirs := map[string]int{}
+	drawMany(t, RTypeCA, 4000, func(_ ged.Graph, e Edit, _ Variant) {
+		if e.Edge.Kind != ged.CA && e.NewKind != ged.CA || e.Edge.Kind == e.NewKind {
+			t.Fatalf("R-type-CA %s → %s", e.Edge.Kind, e.NewKind)
+		}
+		dirs[e.Direction]++
+	})
+	if len(dirs) != 4 {
+		t.Fatalf("directions %v, want all four CA-involving ones", dirs)
+	}
+}
+
+func TestRRevOnlyRA(t *testing.T) {
+	drawMany(t, RRev, 2000, func(_ ged.Graph, e Edit, v Variant) {
+		if e.Edge.Kind != ged.RA {
+			t.Fatalf("R-rev of a %s edge", e.Edge.Kind)
+		}
+		if !slices.Contains(v.Graph.Edges, ged.Edge{From: e.Edge.To, To: e.Edge.From, Kind: ged.RA}) {
+			t.Fatalf("reversed edge missing")
+		}
+	})
+}
+
+func TestRAdd(t *testing.T) {
+	var strata [3]int
+	drawMany(t, RAdd, 6000, func(src ged.Graph, e Edit, _ Variant) {
+		a, b := e.Edge.From, e.Edge.To
+		nb := map[string]map[string]bool{}
+		for _, x := range src.Edges {
+			if nb[x.From] == nil {
+				nb[x.From] = map[string]bool{}
+			}
+			if nb[x.To] == nil {
+				nb[x.To] = map[string]bool{}
+			}
+			nb[x.From][x.To], nb[x.To][x.From] = true, true
+		}
+		if nb[a][b] {
+			t.Fatalf("R-add duplicates an edge %s–%s", a, b)
+		}
+		for c := range nb[a] {
+			if nb[b][c] {
+				t.Fatalf("R-add closes a 2-step path %s–%s–%s", a, c, b)
+			}
+		}
+		if pairCos(a, b) < 0.35 {
+			t.Fatalf("R-add pair cos %.2f < 0.35", pairCos(a, b))
+		}
+		if e.Distance == nil || AddDistStratum(*e.Distance) < 0 {
+			t.Fatalf("R-add distance %v", e.Distance)
+		}
+		strata[AddDistStratum(*e.Distance)]++
+		if e.Edge.Kind != ged.RA && propIndex(src, e.Edge.From) < propIndex(src, e.Edge.To) {
+			t.Fatalf("R-add %s must run from the later to the earlier utterance", e.Edge.Kind)
+		}
+	})
+	tot := float64(strata[0] + strata[1] + strata[2])
+	for k, want := range []float64{0.45, 0.45, 0.10} {
+		if got := float64(strata[k]) / tot; math.Abs(got-want) > 0.03 {
+			t.Errorf("stratum %d share %.3f, want %.2f ± 0.03 (%v)", k, got, want, strata)
+		}
+	}
+}
+
+func propIndex(g ged.Graph, id string) int {
+	return slices.IndexFunc(g.Props, func(p ged.Prop) bool { return p.ID == id })
+}
+
+func drawPlans(seed uint64, n int, typ TripletType) []TripletPlan {
+	ps, _ := drawPlansSrc(seed, n, typ)
+	return ps
+}
+
+func drawPlansSrc(seed uint64, n int, typ TripletType) ([]TripletPlan, []ged.Graph) {
+	rng := rand.New(rand.NewPCG(seed, 2))
+	var out []TripletPlan
+	var srcs []ged.Graph
+	for range n {
+		src := testSource(rng, 10+rng.IntN(10))
+		ty := typ
+		if ty == "" {
+			ty = DrawType(rng)
+		}
+		out = append(out, DrawTriplet(rng, src, ty, BuildOptions{Cos: pairCos}))
+		srcs = append(srcs, src)
+	}
+	return out, srcs
+}
+
+func kindsOf(es []Edit) []Kind {
+	var ks []Kind
+	for _, e := range es {
+		ks = append(ks, e.Kind)
+	}
+	return ks
+}
+
+func TestNoDelAddCooccur(t *testing.T) {
+	for _, p := range drawPlans(3, 10000, "") {
+		if DelAddCooccur(p.A.Edits) || DelAddCooccur(p.B.Edits) || p.DelAddCooccur {
+			t.Fatalf("%s: P-add with P-del in one side: %v | %v", p.Type, kindsOf(p.A.Edits), kindsOf(p.B.Edits))
+		}
+	}
+}
+
+func TestT3(t *testing.T) {
+	ps := drawPlans(4, 10000, T3Contrast)
+	ident := 0
+	for _, p := range ps {
+		for _, n := range []int{p.EditsA, p.EditsB} {
+			if n < 1 || n > 4 {
+				t.Fatalf("T3 side with %d edits", n)
+			}
+		}
+		if p.EditsA != len(p.A.Edits) || p.EditsB != len(p.B.Edits) {
+			t.Fatalf("edit counts out of sync")
+		}
+		for _, e := range append(slices.Clone(p.A.Edits), p.B.Edits...) {
+			if e.Kind == XSpk {
+				t.Fatalf("X-spk in T3")
+			}
+		}
+		if !p.T3Ident {
+			continue
+		}
+		ident++
+		node, edge := p.A, p.B
+		if p.Swapped {
+			node, edge = edge, node
+		}
+		nk, ek := kindsOf(node.Edits), kindsOf(edge.Edits)
+		if !slices.Contains(nk, PDel) || !slices.Contains(ek, RDel) {
+			t.Fatalf("t3_ident without P-del / R-del: %v | %v", nk, ek)
+		}
+		for _, k := range nk {
+			if !slices.Contains([]Kind{PDel, PAdd, PPara, XSurf}, k) {
+				t.Fatalf("t3_ident node side has %s", k)
+			}
+		}
+		for _, k := range ek {
+			if !slices.Contains([]Kind{RDel, RAdd, RRev, RType}, k) {
+				t.Fatalf("t3_ident edge side has %s", k)
+			}
+		}
+	}
+	if share := float64(ident) / float64(len(ps)); math.Abs(share-0.10) > 0.02 {
+		t.Fatalf("t3_ident share %.3f, want 0.10 ± 0.02", share)
+	}
+}
+
+func TestT1Incremental(t *testing.T) {
+	allowed := []Kind{RDel, RAdd, RRev, RType, PDel, PAdd, PDelR, PShift}
+	strata := map[string]int{}
+	ps, srcs := drawPlansSrc(5, 1500, T1Monotone)
+	for i, p := range ps {
+		na := len(p.A.Edits)
+		if na < 1 || len(p.B.Edits) <= na {
+			t.Fatalf("T1: |A| = %d, |B| = %d", na, len(p.B.Edits))
+		}
+		a, _ := json.Marshal(p.A.Edits)
+		b, _ := json.Marshal(p.B.Edits[:na])
+		if string(a) != string(b) {
+			t.Fatalf("T1: A is not a prefix of B")
+		}
+		extra := p.B.Edits[na:]
+		if len(extra) != p.T1Extra || len(extra) > 3 {
+			t.Fatalf("T1: %d extra edits (recorded %d)", len(extra), p.T1Extra)
+		}
+		for _, e := range extra {
+			if !slices.Contains(allowed, e.Kind) {
+				t.Fatalf("T1 extra edit of kind %s", e.Kind)
+			}
+			if e.Kind == PShift && e.Strength == "small" {
+				t.Fatalf("T1 extra P-shift small")
+			}
+		}
+		d, err := Delta0(srcs[i], p.A, p.B, ged.Current(), nil)
+		if err != nil || math.Abs(d-p.T1Delta0) > 1e-9 {
+			t.Fatalf("T1Delta0 %v, recomputed %v", p.T1Delta0, d)
+		}
+		if p.T1Stratum != T1StratumOf(p.T1Delta0) {
+			t.Fatalf("stratum %s for Δ %v", p.T1Stratum, p.T1Delta0)
+		}
+		strata[p.T1Stratum]++
+	}
+	for k, want := range map[string]float64{T1Low: 95. / 300, T1Mid: 95. / 300, T1High: 110. / 300} {
+		if got := float64(strata[k]) / float64(len(ps)); math.Abs(got-want) > 0.05 {
+			t.Errorf("T1 stratum %s share %.3f, want %.3f (%v)", k, got, want, strata)
+		}
+	}
+}
+
+func TestT4Mix(t *testing.T) {
+	rng := rand.New(rand.NewPCG(6, 3))
+	cells := map[T4Cell]int{}
+	swapped := 0
+	const n = 10000
+	for range n {
+		src := testSource(rng, 10+rng.IntN(10))
+		p := DrawTriplet(rng, src, T4Invariant, BuildOptions{Cos: pairCos})
+		cells[p.T4Cell]++
+		if p.Swapped {
+			swapped++
+		}
+		if len(p.A.Edits) != 1 || len(p.B.Edits) != 1 {
+			t.Fatalf("T4 with %d / %d edits", len(p.A.Edits), len(p.B.Edits))
+		}
+		ea, eb := p.A.Edits[0], p.B.Edits[0]
+		hasSpk := ea.Kind == XSpk || eb.Kind == XSpk
+		if hasSpk != p.XSpk || hasSpk != (p.T4Cell == T4SurfSpk || p.T4Cell == T4SpkSpk) {
+			t.Fatalf("x_spk flag %v for cell %s", p.XSpk, p.T4Cell)
+		}
+		if p.T4Cell == T4SameKind {
+			if ea.Kind != eb.Kind || ea.Kind == XSurf || ea.Kind == XSpk || ea.Kind == RTypeCA {
+				t.Fatalf("same-kind cell with %s / %s", ea.Kind, eb.Kind)
+			}
+			if ea.Kind != PAdd && targetKey(ea) == targetKey(eb) {
+				t.Fatalf("same-kind cell at the same target %s", targetKey(ea))
+			}
+			if ea.Strength != eb.Strength || ea.Direction != eb.Direction && ea.Kind == RType {
+				t.Fatalf("same-kind cell with different strength / direction")
+			}
+		}
+	}
+	for c, want := range map[T4Cell]float64{T4SurfSurf: .4, T4SameKind: .4, T4SurfSpk: .1, T4SpkSpk: .1} {
+		if got := float64(cells[c]) / n; math.Abs(got-want) > 0.02 {
+			t.Errorf("T4 cell %s share %.3f, want %.2f", c, got, want)
+		}
+	}
+	if s := float64(swapped) / n; math.Abs(s-0.5) > 0.03 {
+		t.Errorf("T4 side swapped in %.3f", s)
+	}
+}
+
+func TestDeterminism(t *testing.T) {
+	a, _ := json.Marshal(drawPlans(11, 400, ""))
+	b, _ := json.Marshal(drawPlans(11, 400, ""))
+	if string(a) != string(b) {
+		t.Fatal("plans differ under the same seed")
+	}
+	c, _ := json.Marshal(drawPlans(12, 400, ""))
+	if string(a) == string(c) {
+		t.Fatal("plans identical under different seeds")
+	}
+}
+
+func TestPlanKindLevel(t *testing.T) {
+	rng := rand.New(rand.NewPCG(9, 9))
+	for range 5000 {
+		typ := DrawType(rng)
+		a, b := Plan(rng, typ)
+		if len(a) == 0 || len(b) == 0 {
+			t.Fatalf("%s: empty side", typ)
+		}
+		switch typ {
+		case T1Monotone:
+			if len(b) != len(a)+1 || !slices.Equal(a, b[:len(a)]) {
+				t.Fatalf("T1 kinds %v / %v", a, b)
+			}
+		case T3Contrast:
+			if len(a) > 4 || len(b) > 4 || slices.Contains(a, XSpk) || slices.Contains(b, XSpk) {
+				t.Fatalf("T3 kinds %v / %v", a, b)
+			}
+		}
+		for _, s := range [][]Kind{a, b} {
+			if slices.Contains(s, PAdd) && (slices.Contains(s, PDel) || slices.Contains(s, PDelR)) {
+				t.Fatalf("%s: P-add with P-del in %v", typ, s)
+			}
+		}
+	}
+	// the legacy entry point still works
+	src := testSource(rng, 12)
+	if steps := Build(rng, src, []Kind{RDel, PPara}); len(steps) != 2 {
+		t.Fatalf("Build returned %d steps", len(steps))
+	}
+}
