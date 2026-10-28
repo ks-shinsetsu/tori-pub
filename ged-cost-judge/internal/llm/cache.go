@@ -127,15 +127,22 @@ func writeFileAtomic(path string, b []byte) error {
 }
 
 // CachingClient is a caching decorator for Client. On a hit, inner is not called.
+//
+// Truncated responses (finish reason max_tokens / length) are never stored: a truncated structured
+// output would otherwise fail to decode forever under the same key. Refusals are stored.
 type CachingClient struct {
 	inner Client
 	cache *FileCache
+	// BatchRetry bounds the retries of CompleteBatch after a whole-call failure (default
+	// DefaultRetryConfig). Retrying is money-safe: results already stored are cache hits on the
+	// next attempt, and batches not yet stored are resumed, not resubmitted.
+	BatchRetry RetryConfig
 }
 
 var _ Client = (*CachingClient)(nil)
 
 func NewCachingClient(inner Client, cache *FileCache) *CachingClient {
-	return &CachingClient{inner: inner, cache: cache}
+	return &CachingClient{inner: inner, cache: cache, BatchRetry: DefaultRetryConfig()}
 }
 
 // ApplyDefaults forwards to the inner client (see RequestDefaulter).
@@ -158,6 +165,14 @@ func (c *CachingClient) lookup(tag, key string) (*Response, error) {
 	}
 }
 
+// StoreBatchResult implements BatchStore: it writes resp to the cache unless it is truncated.
+func (c *CachingClient) StoreBatchResult(tag, key string, resp *Response) error {
+	if resp == nil || resp.Truncated() {
+		return nil
+	}
+	return c.cache.Put(tag, key, resp)
+}
+
 func (c *CachingClient) Complete(ctx context.Context, req Request) (*Response, error) {
 	// Client-level defaults (e.g. the Anthropic default effort) must be part of the key.
 	req = c.ApplyDefaults(req)
@@ -173,78 +188,127 @@ func (c *CachingClient) Complete(ctx context.Context, req Request) (*Response, e
 	if resp.LatencyMS == 0 {
 		resp.LatencyMS = time.Since(start).Milliseconds()
 	}
-	if err := c.cache.Put(req.Tag, key, resp); err != nil {
+	if err := c.StoreBatchResult(req.Tag, key, resp); err != nil {
 		return nil, err
 	}
 	return resp, nil
 }
 
-var _ BatchClient = (*CachingClient)(nil)
+var (
+	_ BatchClient = (*CachingClient)(nil)
+	_ BatchStore  = (*CachingClient)(nil)
+)
 
 // CompleteBatch serves cached requests from the FileCache and sends only the misses to the inner
-// client, in a single CompleteBatch call when the inner client is a BatchClient (otherwise the
-// misses are completed one by one with Complete). Successful responses are stored; failed items
-// are not cached, so a rerun retries exactly those.
+// client: through CompleteBatchStore when the inner client is a StoringBatchClient (results are
+// stored before the batch is forgotten, including results of resumed batches for requests outside
+// this call), through CompleteBatch for a plain BatchClient, otherwise one by one with Complete.
+// Failed items are not cached, so a rerun retries exactly those.
+//
+// A whole-call failure that IsRetryable is retried (BatchRetry) after re-reading the cache, so
+// what was already stored is not requested again. On a final failure, the results obtained so far
+// are returned together with the error.
 func (c *CachingClient) CompleteBatch(ctx context.Context, reqs []Request) ([]BatchResult, error) {
 	out := make([]BatchResult, len(reqs))
 	norm := make([]Request, len(reqs))
 	keys := make([]string, len(reqs))
-	var missIdx []int
+	done := make([]bool, len(reqs))
 	for i, req := range reqs {
 		norm[i] = c.ApplyDefaults(req)
 		keys[i] = CacheKey(norm[i])
-		hit, err := c.lookup(norm[i].Tag, keys[i])
-		switch {
-		case err != nil:
-			out[i].Err = err
-		case hit != nil:
-			out[i].Response = hit
-		default:
-			missIdx = append(missIdx, i)
+	}
+	retry := c.BatchRetry
+	if retry.MaxAttempts <= 0 {
+		retry = DefaultRetryConfig()
+	}
+	for attempt := 0; ; attempt++ {
+		var missIdx []int
+		for i := range reqs {
+			if done[i] {
+				continue
+			}
+			hit, err := c.lookup(norm[i].Tag, keys[i])
+			switch {
+			case err != nil:
+				out[i], done[i] = BatchResult{Err: err}, true
+			case hit != nil:
+				out[i], done[i] = BatchResult{Response: hit}, true
+			default:
+				missIdx = append(missIdx, i)
+			}
+		}
+		if len(missIdx) == 0 {
+			return out, nil
+		}
+		misses := make([]Request, len(missIdx))
+		for j, i := range missIdx {
+			misses[j] = norm[i]
+		}
+
+		results, stored, err := c.completeMisses(ctx, misses)
+		last := err == nil || !IsRetryable(err) || attempt >= retry.MaxAttempts-1 || ctx.Err() != nil
+		for j, i := range missIdx {
+			if j >= len(results) {
+				break
+			}
+			r := results[j]
+			if r.Response == nil && !last && err != nil {
+				continue // no answer yet: try again on the next attempt
+			}
+			if r.Response != nil && !stored {
+				if perr := c.StoreBatchResult(norm[i].Tag, keys[i], r.Response); perr != nil {
+					// Keep the (paid) response; the caller decides whether a cache write failure is fatal.
+					r.Err = perr
+				}
+			}
+			out[i], done[i] = r, true
+		}
+		if err == nil {
+			return out, nil
+		}
+		if last {
+			for i := range reqs {
+				if !done[i] {
+					out[i].Err = err
+				}
+			}
+			return out, err
+		}
+		if serr := sleepBackoff(ctx, retry, attempt); serr != nil {
+			return out, errors.Join(err, serr)
 		}
 	}
-	if len(missIdx) == 0 {
-		return out, nil
-	}
-	misses := make([]Request, len(missIdx))
-	for j, i := range missIdx {
-		misses[j] = norm[i]
-	}
+}
 
-	var results []BatchResult
+// completeMisses sends the misses to the inner client. stored reports whether the inner client
+// already wrote the successful results to the cache (StoringBatchClient).
+func (c *CachingClient) completeMisses(ctx context.Context, misses []Request) (results []BatchResult, stored bool, err error) {
+	if sc, ok := c.inner.(StoringBatchClient); ok {
+		results, err = sc.CompleteBatchStore(ctx, misses, c)
+		return results, true, checkLen(results, misses, err)
+	}
 	if bc, ok := c.inner.(BatchClient); ok {
-		var err error
 		results, err = bc.CompleteBatch(ctx, misses)
-		if err != nil {
-			return nil, err
-		}
-		if len(results) != len(misses) {
-			return nil, fmt.Errorf("llm: batch returned %d results for %d requests", len(results), len(misses))
-		}
-	} else {
-		results = make([]BatchResult, len(misses))
-		for j, req := range misses {
-			start := time.Now()
-			resp, err := c.inner.Complete(ctx, req)
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			if err == nil && resp.LatencyMS == 0 {
-				resp.LatencyMS = time.Since(start).Milliseconds()
-			}
-			results[j] = BatchResult{Response: resp, Err: err}
-		}
+		return results, false, checkLen(results, misses, err)
 	}
+	results = make([]BatchResult, len(misses))
+	for j, req := range misses {
+		start := time.Now()
+		resp, err := c.inner.Complete(ctx, req)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return results[:j], false, ctxErr
+		}
+		if err == nil && resp.LatencyMS == 0 {
+			resp.LatencyMS = time.Since(start).Milliseconds()
+		}
+		results[j] = BatchResult{Response: resp, Err: err}
+	}
+	return results, false, nil
+}
 
-	for j, i := range missIdx {
-		r := results[j]
-		if r.Err == nil && r.Response != nil {
-			if err := c.cache.Put(norm[i].Tag, keys[i], r.Response); err != nil {
-				// Keep the (paid) response; the caller decides whether a cache write failure is fatal.
-				r.Err = err
-			}
-		}
-		out[i] = r
+func checkLen(results []BatchResult, reqs []Request, err error) error {
+	if err == nil && len(results) != len(reqs) {
+		return fmt.Errorf("llm: batch returned %d results for %d requests", len(results), len(reqs))
 	}
-	return out, nil
+	return err
 }

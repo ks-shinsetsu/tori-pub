@@ -139,9 +139,21 @@ func CompleteJSON[T any](ctx context.Context, c Client, req Request, name, descr
 	if err != nil {
 		return out, nil, err
 	}
+	out, err = DecodeJSON[T](resp)
+	return out, resp, err
+}
+
+// DecodeJSON decodes a structured-output response into T. A refusal or a truncated output is
+// reported as ErrRefusal / ErrTruncated (see Response.FinishError) instead of a JSON error.
+// Use it for the results of CompleteBatch.
+func DecodeJSON[T any](resp *Response) (T, error) {
+	var out T
+	if err := resp.FinishError(); err != nil {
+		return out, err
+	}
 	if err := json.Unmarshal([]byte(resp.Text), &out); err != nil {
-		return out, resp, fmt.Errorf("llm: unmarshal structured output into %s: %w (text=%.200q)",
+		return out, fmt.Errorf("llm: unmarshal structured output into %s: %w (text=%.200q)",
 			reflect.TypeOf(out), err, resp.Text)
 	}
-	return out, resp, nil
+	return out, nil
 }

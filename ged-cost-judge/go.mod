@@ -3,14 +3,19 @@ module github.com/negishi-tako/tori-pub/ged-cost-judge
 go 1.25.1
 
 require (
-	github.com/anthropics/anthropic-sdk-go/v2 v2.4.0 // indirect
+	github.com/anthropics/anthropic-sdk-go/v2 v2.4.0
+	github.com/invopop/jsonschema v0.14.0
+	github.com/joho/godotenv v1.5.1
+	github.com/openai/openai-go/v3 v3.50.0
+	golang.org/x/time v0.15.0
+	gonum.org/v1/gonum v0.17.0
+)
+
+require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/invopop/jsonschema v0.14.0 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
-	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1 // indirect
 	github.com/tidwall/gjson v1.19.0 // indirect
@@ -23,7 +28,5 @@ require (
 	go.opentelemetry.io/otel/trace v1.33.0 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/sync v0.16.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.30.0 // indirect
-	gonum.org/v1/gonum v0.17.0 // indirect
 )
