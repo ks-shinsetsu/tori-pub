@@ -579,7 +579,7 @@ func writeCostProjection(b *bytes.Buffer, mt *meter) {
 	price := map[string][2]float64{
 		"luna":   {0.20, 1.20},
 		"sonnet": {1.0, 5.0}, // Sonnet 5.5 batch price (half of $2 / $10)
-		"haiku":  {0.5, 2.5}, // Haiku 4.5 batch price (half of $1 / $5)
+		"haiku":  {0.05, 0.25}, // Haiku 5.5 batch price (half of $0.10 / $0.50, prompts <= 100K tokens)
 	}
 	cost := func(model string, n float64, in, out float64) float64 {
 		p := price[model]
@@ -595,8 +595,8 @@ func writeCostProjection(b *bytes.Buffer, mt *meter) {
 	fmt.Fprintln(b, "| --- | --: | --: |")
 	fmt.Fprintf(b, "| OpenAI luna | $%.1f | 約 $17 |\n", luna)
 	fmt.Fprintf(b, "| Anthropic Sonnet 5.5（バッチ） | $%.1f | 約 $63 |\n", sonnet)
-	fmt.Fprintf(b, "| Anthropic Haiku 4.5（バッチ） | $%.1f | 約 $12 |\n", haiku)
-	fmt.Fprintf(b, "| 計 | $%.1f | 約 $92 |\n", luna+sonnet+haiku)
+	fmt.Fprintf(b, "| Anthropic Haiku 5.5（バッチ） | $%.1f | 約 $1 |\n", haiku)
+	fmt.Fprintf(b, "| 計 | $%.1f | 約 $81 |\n", luna+sonnet+haiku)
 }
 
 func writeTypeBreakdown(b *bytes.Buffer, kept []*pilotTriplet, js []fit.Judgment, d0 []float64) {
