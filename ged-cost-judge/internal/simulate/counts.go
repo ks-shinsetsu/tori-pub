@@ -8,8 +8,8 @@ import (
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/perturb"
 )
 
-// CellSpec is a per-cell count with its design expectation (dataset-spec §2.3, 1–4 edits) and working minimum
-// (decisions-stats §15.3, which governs), both at 3,000 triplets. Minimum 0 means no minimum.
+// CellSpec is a per-cell count with its design expectation (dataset-spec §2.3: the mean over 20 seeds of this simulator at
+// 3,000 triplets) and working minimum (decisions-stats §15.3, which governs), both at 3,000 triplets. Minimum 0 means no minimum.
 type CellSpec struct {
 	Name     string
 	Expected float64
@@ -36,9 +36,10 @@ const (
 	CellF03        = "f₀.₃ interval"
 	CellPDelOnly   = "P-del only (ΔI-missing ≠ 0, Δedge-missing = 0)"
 	CellRDelOnly   = "R-del only (Δedge-missing ≠ 0, ΔI-missing = 0)"
-	CellPDelIdent  = "P-del only or t3_ident (dataset-spec §2.3 counting)"
-	CellRDelIdent  = "R-del only or t3_ident (dataset-spec §2.3 counting)"
 	CellIdent      = "t3_ident triplets"
+	CellIdentNode  = "  of which P-del-only cell"
+	CellIdentEdge  = "  of which R-del-only cell"
+	CellDiag       = "t3_diag triplets (one CA relabel vs one estimation edit)"
 	CellDiagInf    = "diag CA informative (ΔRA↔CA or ΔCA↔MA ≠ 0)"
 	CellDiagRACA   = "  diag RA↔CA pair draws"
 	CellDiagCAMA   = "  diag CA↔MA pair draws"
@@ -48,38 +49,38 @@ const (
 	CellT1NonPos   = "T1 realized Δ(θ₀) ≤ 0 (excluded from gate)"
 	CellCooccur    = "del_add_cooccur"
 	CellExcluded   = "excluded from fit (x_spk or diag_ca_type)"
-	feasibleAt50   = "draws; ≥ 50 feasible per pair wanted ⇒ ≈ 100 draws at 50% infeasible"
+	feasibleAt50   = "accepted draws per pair (an infeasible relabel is redrawn within the slot); ≥ 100 wanted"
 	ident210       = "10% of T3"
-	pdelOnlyNote   = "§2.3's 340 counts t3_ident (210) as P-del-only, but t3_ident's edge side has an R-del, so Δedge-missing ≠ 0 there"
-	strictFormNote = "strict Δφ definition (decisions-stats §15 item 4)"
+	strictFormNote = "strict Δφ definition (decisions-stats §15 item 4); the t3_ident cells are built to satisfy it"
 )
 
 // Cells are the cells reported by the P1 re-run, in order.
 var Cells = []CellSpec{
-	{CellIMissing, 800, 650, "fit", ""},
-	{CellIExtra, 670, 650, "fit", "thin (§2.3 margin 3%)"},
-	{CellEMissing, 1250, 650, "fit", ""},
-	{CellEExtra, 720, 650, "fit", "thin (margin 11%)"},
-	{CellDirection, 760, 650, "fit", ""},
-	{CellTypeRAMA, 740, 450, "fit", "§15.3 governs (450; §2.3 says 400)"},
-	{CellRAtoMA, 560, 0, "draws", ""},
-	{CellMAtoRA, 560, 0, "draws", ""},
-	{CellNeg, 305, 300, "fit", "thin (margin 2%)"},
-	{CellF09, 1350, 600, "fit", ""},
-	{CellF07, 1300, 600, "fit", ""},
-	{CellF05, 700, 600, "fit", "thin (margin ≈ 15%)"},
-	{CellF03, 800, 600, "fit", ""},
-	{CellPDelOnly, 340, 300, "fit", strictFormNote + "; " + pdelOnlyNote},
-	{CellRDelOnly, 660, 300, "fit", strictFormNote},
-	{CellPDelIdent, 340, 300, "fit", "t3_ident counted for both cells, as §2.3 does"},
-	{CellRDelIdent, 660, 300, "fit", ""},
+	{CellIMissing, 875, 650, "fit", ""},
+	{CellIExtra, 790, 650, "fit", "margin ≈ 20%"},
+	{CellEMissing, 1220, 650, "fit", ""},
+	{CellEExtra, 850, 650, "fit", "margin ≈ 30%"},
+	{CellDirection, 750, 650, "fit", "margin ≈ 15%"},
+	{CellTypeRAMA, 845, 450, "fit", ""},
+	{CellRAtoMA, 770, 0, "draws", ""},
+	{CellMAtoRA, 625, 0, "draws", ""},
+	{CellNeg, 360, 300, "fit", "margin ≈ 20%"},
+	{CellF09, 1390, 600, "fit", ""},
+	{CellF07, 1320, 600, "fit", ""},
+	{CellF05, 815, 600, "fit", ""},
+	{CellF03, 655, 600, "fit", "thinnest (margin ≈ 9%; min over 20 seeds 628)"},
+	{CellPDelOnly, 335, 300, "fit", strictFormNote + "; margin ≈ 11%"},
+	{CellRDelOnly, 680, 300, "fit", strictFormNote},
 	{CellIdent, 210, 0, "all", ident210},
-	{CellDiagInf, 260, 0, "all", "sensitivity only"},
-	{CellDiagRACA, 150, 100, "draws", feasibleAt50},
-	{CellDiagCAMA, 150, 100, "draws", feasibleAt50},
-	{CellT1Low, 95, 0, "all", "re-stratified by the simulated cos"},
-	{CellT1Mid, 95, 0, "all", ""},
-	{CellT1High, 110, 100, "all", "gate set ≥ 100 (§9.1)"},
+	{CellIdentNode, 105, 0, "all", ""},
+	{CellIdentEdge, 105, 0, "all", ""},
+	{CellDiag, 210, 0, "all", ident210 + "; excluded from the fit"},
+	{CellDiagInf, 210, 0, "all", "sensitivity only"},
+	{CellDiagRACA, 105, 100, "draws", feasibleAt50},
+	{CellDiagCAMA, 105, 100, "draws", feasibleAt50},
+	{CellT1Low, 95, 0, "all", "re-stratified by the simulated cos (allocation 90 / 90 / 120)"},
+	{CellT1Mid, 80, 0, "all", ""},
+	{CellT1High, 125, 100, "all", "gate set ≥ 100 (§9.1)"},
 	{CellT1NonPos, 0, 0, "all", ""},
 	{CellCooccur, 0, 0, "all", "must be 0 (m7 ban)"},
 	{CellExcluded, 0, 0, "all", ""},
@@ -147,6 +148,15 @@ func Count(trips []fit.Triplet, metas []Meta, th0 ged.Theta) (Counts, error) {
 		}
 		if m.Info.T3Ident {
 			c.Cells[CellIdent]++
+			switch m.Info.T3IdentCell {
+			case perturb.IdentNodeCell:
+				c.Cells[CellIdentNode]++
+			case perturb.IdentEdgeCell:
+				c.Cells[CellIdentEdge]++
+			}
+		}
+		if m.Info.T3Diag {
+			c.Cells[CellDiag]++
 		}
 		if m.Info.DelAddCooccur {
 			c.Cells[CellCooccur]++
@@ -193,8 +203,6 @@ func Count(trips []fit.Triplet, metas []Meta, th0 ged.Theta) (Counts, error) {
 		inc(CellF03, nz(d[ged.PSub03]))
 		inc(CellPDelOnly, nz(d[ged.PNodeMissing]) && !nz(d[ged.PEdgeMissing]))
 		inc(CellRDelOnly, nz(d[ged.PEdgeMissing]) && !nz(d[ged.PNodeMissing]))
-		inc(CellPDelIdent, m.Info.T3Ident || nz(d[ged.PNodeMissing]) && !nz(d[ged.PEdgeMissing]))
-		inc(CellRDelIdent, m.Info.T3Ident || nz(d[ged.PEdgeMissing]) && !nz(d[ged.PNodeMissing]))
 	}
 	c.Cells[CellRAtoMA] = c.TypeDirs[perturb.DirectionLabel(ged.RA, ged.MA)]
 	c.Cells[CellMAtoRA] = c.TypeDirs[perturb.DirectionLabel(ged.MA, ged.RA)]

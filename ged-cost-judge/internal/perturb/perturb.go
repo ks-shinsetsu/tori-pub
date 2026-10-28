@@ -82,13 +82,15 @@ type BuildOptions struct {
 	AddDistShares [3]float64
 	// IdentShare is the share of T3 plans in the t3_ident sub-stratum (0 → 0.10; negative → none).
 	IdentShare float64
-	// Ident, when set, fixes whether a T3 plan is in the t3_ident sub-stratum instead of drawing it with IdentShare.
-	// A caller that redraws T3 plans (e.g. for Δ targeting) draws the sub-stratum once per slot with DrawIdent and sets it here,
-	// so that the redraw loop does not change the sub-stratum's share.
-	Ident *bool
+	// DiagShare is the share of T3 plans in the t3_diag sub-stratum (0 → 0.10; negative → none).
+	DiagShare float64
+	// Sub, when set, fixes the T3 sub-stratum instead of drawing it with IdentShare / DiagShare.
+	// A caller that redraws T3 plans (e.g. for Δ targeting) draws the sub-stratum once per slot with DrawSub and sets it here,
+	// so that the redraw loop does not change the sub-strata's shares.
+	Sub *T3Sub
 	// T1MaxExtra caps the number of extra edits B \ A in T1 (0 → 3, dataset-spec §3.1 item 3).
 	T1MaxExtra int
-	// T1Shares are the T1 allocation shares over the Δ(θ₀) strata [0.5,1) / [1,2) / ≥2 (zero → 95 / 95 / 110 of 300).
+	// T1Shares are the T1 allocation shares over the Δ(θ₀) strata [0.5,1) / [1,2) / ≥2 (zero → 90 / 90 / 120 of 300).
 	T1Shares [3]float64
 	// Theta0 is the cost table for Δ(θ₀) (nil → ged.Current()).
 	Theta0 *ged.Theta
@@ -96,8 +98,18 @@ type BuildOptions struct {
 	CosPred func(Edit) float64
 }
 
-// DrawIdent draws whether a T3 slot is in the t3_ident sub-stratum (probability IdentShare, default 0.10).
-func (o BuildOptions) DrawIdent(rng *rand.Rand) bool { return rng.Float64() < o.norm().IdentShare }
+// DrawSub draws the sub-stratum of a T3 slot: t3_ident with probability IdentShare (default 0.10), t3_diag with
+// probability DiagShare (default 0.10), ordinary otherwise.
+func (o BuildOptions) DrawSub(rng *rand.Rand) T3Sub {
+	n := o.norm()
+	switch u := rng.Float64(); {
+	case u < n.IdentShare:
+		return T3Ident
+	case u < n.IdentShare+n.DiagShare:
+		return T3Diag
+	}
+	return T3Plain
+}
 
 func (o BuildOptions) norm() BuildOptions {
 	if o.MinAddCos == 0 {
@@ -112,11 +124,17 @@ func (o BuildOptions) norm() BuildOptions {
 	case o.IdentShare < 0:
 		o.IdentShare = 0
 	}
+	switch {
+	case o.DiagShare == 0:
+		o.DiagShare = 0.10
+	case o.DiagShare < 0:
+		o.DiagShare = 0
+	}
 	if o.T1MaxExtra <= 0 {
 		o.T1MaxExtra = 3
 	}
 	if o.T1Shares == ([3]float64{}) {
-		o.T1Shares = [3]float64{95, 95, 110}
+		o.T1Shares = [3]float64{90, 90, 120}
 	}
 	if o.Theta0 == nil {
 		t := ged.Current()
@@ -277,6 +295,9 @@ var AddKindWeights = map[string]float64{ged.RA: 0.6, ged.MA: 0.3, ged.CA: 0.1}
 var (
 	TypeDirections   = [][2]string{{ged.RA, ged.MA}, {ged.MA, ged.RA}}
 	TypeCADirections = [][2]string{{ged.RA, ged.CA}, {ged.CA, ged.RA}, {ged.CA, ged.MA}, {ged.MA, ged.CA}}
+	// TypeCAPairs groups the diagnostic directions by parameter (RA↔CA, CA↔MA); a diagnostic relabel draws the pair
+	// first (uniformly) and then a feasible direction within it, so that the two pairs get equal shares of the draws.
+	TypeCAPairs = [][][2]string{TypeCADirections[:2], TypeCADirections[2:]}
 )
 
 // DirectionLabel is the label "RA→MA" of a relabel.
@@ -373,32 +394,38 @@ func (s *state) draw(rng *rand.Rand, kind Kind, w want) (Edit, bool, string) {
 	case RAdd:
 		return s.drawAdd(rng, w)
 	case RType, RTypeCA:
-		dirs := TypeDirections
+		groups := [][][2]string{TypeDirections}
 		if kind == RTypeCA {
-			dirs = TypeCADirections
-		}
-		var feasible [][2]string
-		var cands [][]ged.Edge
-		for _, d := range dirs {
-			if w.direction != "" && DirectionLabel(d[0], d[1]) != w.direction {
-				continue
-			}
-			es := s.freeEdges(func(e ged.Edge) bool { return e.Kind == d[0] && !w.avoid[edgeKey(e)] })
-			if len(es) > 0 {
-				feasible = append(feasible, d)
-				cands = append(cands, es)
+			groups = slices.Clone(TypeCAPairs)
+			if rng.IntN(2) == 1 {
+				groups[0], groups[1] = groups[1], groups[0]
 			}
 		}
-		if len(feasible) == 0 {
-			return Edit{}, false, "no untouched edge of a relabelable type"
+		for _, dirs := range groups {
+			var feasible [][2]string
+			var cands [][]ged.Edge
+			for _, d := range dirs {
+				if w.direction != "" && DirectionLabel(d[0], d[1]) != w.direction {
+					continue
+				}
+				es := s.freeEdges(func(e ged.Edge) bool { return e.Kind == d[0] && !w.avoid[edgeKey(e)] })
+				if len(es) > 0 {
+					feasible = append(feasible, d)
+					cands = append(cands, es)
+				}
+			}
+			if len(feasible) == 0 {
+				continue // the other pair, if any
+			}
+			i := rng.IntN(len(feasible))
+			e, _ := pick(rng, cands[i])
+			nk := feasible[i][1]
+			ed := s.edgeEdit(kind, e)
+			ed.NewKind, ed.Direction = nk, DirectionLabel(e.Kind, nk)
+			s.replaceEdge(e, ged.Edge{From: e.From, To: e.To, Kind: nk})
+			return ed, true, ""
 		}
-		i := rng.IntN(len(feasible))
-		e, _ := pick(rng, cands[i])
-		nk := feasible[i][1]
-		ed := s.edgeEdit(kind, e)
-		ed.NewKind, ed.Direction = nk, DirectionLabel(e.Kind, nk)
-		s.replaceEdge(e, ged.Edge{From: e.From, To: e.To, Kind: nk})
-		return ed, true, ""
+		return Edit{}, false, "no untouched edge of a relabelable type"
 	case RRev:
 		e, ok := pick(rng, s.freeEdges(func(e ged.Edge) bool { return e.Kind == ged.RA && !w.avoid[edgeKey(e)] }))
 		if !ok {

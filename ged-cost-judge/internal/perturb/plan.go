@@ -38,15 +38,31 @@ type KindWeight struct {
 	W    float64
 }
 
-// graphKinds are the edit kinds and weights used in T3 (dataset-spec §2.2). X-spk is T4 only.
+// graphKinds are the estimation edit kinds and weights used in the ordinary T3 draws (dataset-spec §2.2).
+// X-spk is T4 only; the diagnostic CA relabel (RTypeCA) is drawn only in the t3_diag sub-stratum, never here.
 var graphKinds = []KindWeight{
-	{RDel, 0.13}, {RAdd, 0.11}, {RType, 0.10}, {RTypeCA, 0.03}, {RRev, 0.09},
-	{PPara, 0.09}, {PShift, 0.11}, {PNeg, 0.04}, {PAdd, 0.12}, {PDel, 0.06}, {PDelR, 0.10},
+	{RDel, 0.12}, {RAdd, 0.11}, {RType, 0.10}, {RRev, 0.10},
+	{PPara, 0.08}, {PShift, 0.13}, {PNeg, 0.05}, {PAdd, 0.13}, {PDel, 0.06}, {PDelR, 0.10},
 	{XSurf, 0.02},
 }
 
 // KindWeights returns a copy of the T3 kind weights (dataset-spec §2.2).
 func KindWeights() []KindWeight { return slices.Clone(graphKinds) }
+
+// T3Sub is the sub-stratum of a T3 slot (dataset-spec §2.2): ordinary, t3_ident or t3_diag.
+type T3Sub string
+
+const (
+	T3Plain T3Sub = ""      // ordinary T3 (near / clear Δ targeting applies)
+	T3Ident T3Sub = "ident" // separate-identifiability cells (P-del-only / R-del-only)
+	T3Diag  T3Sub = "diag"  // diagnostic CA relabel vs one estimation edit (excluded from the fit)
+)
+
+// Ident cells of the t3_ident sub-stratum (PlanInfo.T3IdentCell).
+const (
+	IdentNodeCell = "P-del" // node-only side with P-del vs edge side without R-del: ΔI-missing ≠ 0, Δedge-missing = 0
+	IdentEdgeCell = "R-del" // edge-only side with R-del vs node side without P-del: Δedge-missing ≠ 0, ΔI-missing = 0
+)
 
 func restrict(ks ...Kind) []KindWeight {
 	var out []KindWeight
@@ -63,15 +79,19 @@ var (
 	t1Kinds = restrict(RDel, RAdd, RRev, RType, PDel, PAdd, PDelR, PShift)
 	// t1ShiftWeights restricts a T1 extra P-shift to medium / large.
 	t1ShiftWeights = []float64{0, 0.3, 0.5}
-	// identNode / identEdge are the two sides of the t3_ident sub-stratum (dataset-spec §2.2).
-	identNode = restrict(PDel, PAdd, PPara, XSurf)
-	identEdge = restrict(RDel, RAdd, RRev, RType)
+	// identNode / identEdge are the node-only and edge-only sides of the t3_ident sub-stratum (dataset-spec §2.2);
+	// identNodeKeep / identEdgeKeep are the same pools without the deleting kind, used on the side that must leave
+	// the other cost's φ unchanged (P-del-only: node side vs identEdgeKeep; R-del-only: edge side vs identNodeKeep).
+	identNode     = restrict(PDel, PAdd, PPara, XSurf)
+	identEdge     = restrict(RDel, RAdd, RRev, RType)
+	identNodeKeep = restrict(PAdd, PPara, XSurf)
+	identEdgeKeep = restrict(RAdd, RRev, RType)
 	// t4SameKinds are the kinds of the T4 "same kind elsewhere" cell (every graph kind except X-surf and the diagnostic relabel).
 	t4SameKinds = restrict(RDel, RAdd, RType, RRev, PPara, PShift, PNeg, PAdd, PDel, PDelR)
 	// t2Kinds are the T2 kinds (dataset-spec §3), drawn uniformly.
 	t2Kinds = []Kind{PPara, PShift, PDelR, RDel, RType}
-	// aKinds are the kinds of the shared edits A in T1 (T3 weights without the diagnostic relabel, so T1 stays in the fit).
-	aKinds = slices.DeleteFunc(slices.Clone(graphKinds), func(x KindWeight) bool { return x.Kind == RTypeCA })
+	// aKinds are the kinds of the shared edits A in T1 (the T3 estimation weights; the diagnostic relabel is never among them).
+	aKinds = graphKinds
 )
 
 // drawFrom draws a kind from pool, skipping excluded kinds (the weights are renormalized over the rest).
@@ -211,8 +231,12 @@ var t1ExtraCounts = [3][]float64{{1}, {0.7, 0.3}, {0.3, 0.4, 0.3}}
 // PlanInfo is the per-triplet plan metadata recorded with the triplet (dataset-spec §6, decisions-stats §15 item 7).
 type PlanInfo struct {
 	Type TripletType `json:"type"`
-	// T3Ident marks the T3 identifiability sub-stratum (node-only side with P-del vs edge-only side with R-del).
-	T3Ident bool `json:"t3_ident,omitempty"`
+	// T3Ident marks the T3 identifiability sub-stratum; T3IdentCell is its cell (IdentNodeCell: node-only side with
+	// P-del vs edge side without R-del; IdentEdgeCell: edge-only side with R-del vs node side without P-del).
+	T3Ident     bool   `json:"t3_ident,omitempty"`
+	T3IdentCell string `json:"t3_ident_cell,omitempty"`
+	// T3Diag marks the T3 diagnostic sub-stratum (one CA-involving relabel vs one estimation edit; implies DiagCAType).
+	T3Diag bool `json:"t3_diag,omitempty"`
 	// XSpk marks a triplet with an X-spk edit (T4 X-spk cells; excluded from the fit).
 	XSpk bool `json:"x_spk,omitempty"`
 	// DiagCAType marks a triplet with a diagnostic CA-involving relabel (excluded from the fit by default).
@@ -295,7 +319,8 @@ func (b *side) variant() Variant { return snapshot(b.s.src, b.s.g, b.edits) }
 //   - T1: A = 1–2 edits; B = A plus 1–T1MaxExtra extra edits of the §3.1 kinds, drawn into the Δ(θ₀) strata
 //     [0.5,1) / [1,2) / ≥2 (redrawn until the planned stratum is hit; re-stratified if 200 draws miss it).
 //   - T2: one edit vs two edits of the same kind (R-type: same direction).
-//   - T3: 1–4 edits per side with the §2.2 weights and the m7 ban; IdentShare of T3 is the t3_ident sub-stratum.
+//   - T3: 1–4 edits per side with the §2.2 weights and the m7 ban; IdentShare of T3 is the t3_ident sub-stratum
+//     (half P-del-only, half R-del-only cells) and DiagShare the t3_diag sub-stratum (one CA relabel vs one estimation edit).
 //   - T4: the four cells of §3, side randomized; "same kind" uses the same strength / direction / degree at another target.
 func DrawTriplet(rng *rand.Rand, src ged.Graph, typ TripletType, opts BuildOptions) TripletPlan {
 	o := opts.norm()
@@ -338,25 +363,42 @@ func DrawTriplet(rng *rand.Rand, src ged.Graph, typ TripletType, opts BuildOptio
 }
 
 func drawT3(rng *rand.Rand, src ged.Graph, o *BuildOptions, info *PlanInfo) (a, b *side) {
-	ident := false
-	if o.Ident != nil {
-		ident = *o.Ident
+	sub := T3Plain
+	if o.Sub != nil {
+		sub = *o.Sub
 	} else {
-		ident = rng.Float64() < o.IdentShare
+		sub = o.DrawSub(rng)
 	}
-	if ident {
-		node, edge := newSide(src, o), newSide(src, o)
-		if node.add(rng, PDel, want{}) && edge.add(rng, RDel, want{}) {
-			nn, ne := 1+rng.IntN(4), 1+rng.IntN(4)
-			for len(node.edits) < nn && node.addFrom(rng, identNode, want{}) {
-			}
-			for len(edge.edits) < ne && edge.addFrom(rng, identEdge, want{}) {
-			}
-			info.T3Ident = true
-			info.Swapped = rng.IntN(2) == 1
-			return node, edge
+	switch sub {
+	case T3Ident:
+		// Half the slots are the P-del-only cell, half the R-del-only cell (dataset-spec §2.2, decisions-stats §15 item 4).
+		del, keep, cell, first := identNode, identEdgeKeep, IdentNodeCell, PDel
+		if rng.IntN(2) == 1 {
+			del, keep, cell, first = identEdge, identNodeKeep, IdentEdgeCell, RDel
 		}
-		// infeasible on this source (no isolated proposition or no edge): an ordinary T3 slot instead.
+		x, y := newSide(src, o), newSide(src, o)
+		if x.add(rng, first, want{}) {
+			nx, ny := 1+rng.IntN(4), 1+rng.IntN(4)
+			for len(x.edits) < nx && x.addFrom(rng, del, want{}) {
+			}
+			for len(y.edits) < ny && y.addFrom(rng, keep, want{}) {
+			}
+			if len(y.edits) > 0 {
+				info.T3Ident, info.T3IdentCell = true, cell
+				info.Swapped = rng.IntN(2) == 1
+				return x, y
+			}
+		}
+		// infeasible on this source (no isolated proposition / no edge): an ordinary T3 slot instead.
+	case T3Diag:
+		// One CA-involving relabel against one estimation edit (sides randomized); flagged diag_ca_type via the edit.
+		ca, ord := newSide(src, o), newSide(src, o)
+		if ca.add(rng, RTypeCA, want{}) && ord.addFrom(rng, graphKinds, want{}) {
+			info.T3Diag = true
+			info.Swapped = rng.IntN(2) == 1
+			return ca, ord
+		}
+		// no relabelable edge (or nothing else feasible): an ordinary T3 slot instead.
 	}
 	a, b = newSide(src, o), newSide(src, o)
 	na, nb := 1+rng.IntN(4), 1+rng.IntN(4)

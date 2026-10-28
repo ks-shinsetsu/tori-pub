@@ -222,10 +222,10 @@ func countsReport(w io.Writer, cs []simulate.Counts, n int) {
 		fitN[i] = float64(c.FitSet)
 	}
 	fmt.Fprintln(w, "\n## セルごとの情報を持つ三つ組の数（dataset-spec §2.3、decisions-stats §15.3）")
-	fmt.Fprintf(w, "\nΔφ_p ≠ 0（θ₀ の対応付け）の三つ組を数える。期待値と最低数は 3,000 三つ組の値を %d 三つ組に比例換算（×%.2f）。", n, scale)
+	fmt.Fprintf(w, "\nΔφ_p ≠ 0（θ₀ の対応付け）の三つ組を数える。期待値（§2.3 = この simulator の 3,000 三つ組 × 20 seed の平均）と最低数は 3,000 三つ組の値を %d 三つ組に比例換算（×%.2f）。", n, scale)
 	fmt.Fprintf(w, "範囲は %d 回の最小–最大。「fit」は推定に入る三つ組（平均 %.0f）、「all」はすべて、「draws」は編集の抽選数。\n", len(cs), mean(fitN))
 	fmt.Fprintln(w, "判定: 全回で最低数以上 → OK、平均は最低数以上だが下回る回がある → thin、平均が最低数未満 → **SHORT**。")
-	fmt.Fprintln(w, "「全三つ組」列は fit のセルを除外分（X-spk、診断用の CA 種別変更）も含めて数えた平均（§2.3 の Monte Carlo は除外をしていない）。")
+	fmt.Fprintln(w, "「全三つ組」列は fit のセルを除外分（X-spk、t3_diag の CA 種別変更）も含めて数えた平均。")
 	fmt.Fprintln(w, "\n| セル | 範囲 | 期待値 §2.3 | 最低数 §15.3 | 実現（平均） | 範囲 | 判定 | 全三つ組（平均） | 備考 |")
 	fmt.Fprintln(w, "| --- | --- | --: | --: | --: | --- | --- | --: | --- |")
 	for _, spec := range simulate.Cells {
@@ -263,7 +263,7 @@ func countsReport(w io.Writer, cs []simulate.Counts, n int) {
 
 	// edit-kind shares in T3 against the §2.2 weights
 	fmt.Fprintln(w, "\n### T3 の編集の種類の実現割合（dataset-spec §2.2 の重みと比較）")
-	fmt.Fprintln(w, "\n実行できない種類は引き直すため、実現割合は重みからずれうる。t3_ident 層の抽選も含む。")
+	fmt.Fprintln(w, "\n実行できない種類は引き直すため、実現割合は重みからずれうる。t3_ident 層（P-del / R-del のセルの限られた種類）と t3_diag 層（推定側の 1 編集）の抽選も含む。CA を含む種別変更は t3_diag 層だけで引く（下の向きごとの抽選数）。")
 	fmt.Fprintln(w, "\n| 種類 | 重み §2.2 | 実現割合 | 抽選数（平均） | 実行できず引き直した数（全型、平均） |")
 	fmt.Fprintln(w, "| --- | --: | --: | --: | --: |")
 	tot := 0.0

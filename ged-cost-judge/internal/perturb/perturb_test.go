@@ -62,8 +62,11 @@ func TestWeightsSumToOne(t *testing.T) {
 	if math.Abs(sum-1) > 1e-12 {
 		t.Fatalf("weights sum to %v", sum)
 	}
-	want := map[Kind]float64{RDel: .13, RAdd: .11, RType: .10, RTypeCA: .03, RRev: .09, PPara: .09, PShift: .11,
-		PNeg: .04, PAdd: .12, PDel: .06, PDelR: .10, XSurf: .02}
+	want := map[Kind]float64{RDel: .12, RAdd: .11, RType: .10, RRev: .10, PPara: .08, PShift: .13,
+		PNeg: .05, PAdd: .13, PDel: .06, PDelR: .10, XSurf: .02}
+	if len(KindWeights()) != len(want) {
+		t.Errorf("%d T3 kinds, want %d (the diagnostic relabel is drawn only in t3_diag)", len(KindWeights()), len(want))
+	}
 	for _, x := range KindWeights() {
 		if want[x.Kind] != x.W {
 			t.Errorf("%s: weight %v, dataset-spec §2.2 says %v", x.Kind, x.W, want[x.Kind])
@@ -210,7 +213,8 @@ func TestNoDelAddCooccur(t *testing.T) {
 
 func TestT3(t *testing.T) {
 	ps := drawPlans(4, 10000, T3Contrast)
-	ident := 0
+	ident, diag := 0, 0
+	cells := map[string]int{}
 	for _, p := range ps {
 		for _, n := range []int{p.EditsA, p.EditsB} {
 			if n < 1 || n > 4 {
@@ -220,36 +224,65 @@ func TestT3(t *testing.T) {
 		if p.EditsA != len(p.A.Edits) || p.EditsB != len(p.B.Edits) {
 			t.Fatalf("edit counts out of sync")
 		}
+		hasCA := false
 		for _, e := range append(slices.Clone(p.A.Edits), p.B.Edits...) {
 			if e.Kind == XSpk {
 				t.Fatalf("X-spk in T3")
 			}
+			hasCA = hasCA || e.Kind == RTypeCA
+		}
+		if hasCA != p.T3Diag || hasCA != p.DiagCAType {
+			t.Fatalf("CA relabel outside t3_diag or flags out of sync: diag=%v flag=%v %v | %v", p.T3Diag, p.DiagCAType, kindsOf(p.A.Edits), kindsOf(p.B.Edits))
+		}
+		if p.T3Diag {
+			diag++
+			ca, ord := p.A, p.B
+			if p.Swapped {
+				ca, ord = ord, ca
+			}
+			if len(ca.Edits) != 1 || ca.Edits[0].Kind != RTypeCA || len(ord.Edits) != 1 || ord.Edits[0].Kind == RTypeCA {
+				t.Fatalf("t3_diag is not one CA relabel vs one estimation edit: %v | %v", kindsOf(ca.Edits), kindsOf(ord.Edits))
+			}
+			continue
 		}
 		if !p.T3Ident {
 			continue
 		}
 		ident++
-		node, edge := p.A, p.B
+		cells[p.T3IdentCell]++
+		x, y := p.A, p.B
 		if p.Swapped {
-			node, edge = edge, node
+			x, y = y, x
 		}
-		nk, ek := kindsOf(node.Edits), kindsOf(edge.Edits)
-		if !slices.Contains(nk, PDel) || !slices.Contains(ek, RDel) {
-			t.Fatalf("t3_ident without P-del / R-del: %v | %v", nk, ek)
+		xk, yk := kindsOf(x.Edits), kindsOf(y.Edits)
+		del, delPool, keepPool := PDel, []Kind{PDel, PAdd, PPara, XSurf}, []Kind{RAdd, RRev, RType}
+		if p.T3IdentCell == IdentEdgeCell {
+			del, delPool, keepPool = RDel, []Kind{RDel, RAdd, RRev, RType}, []Kind{PAdd, PPara, XSurf}
+		} else if p.T3IdentCell != IdentNodeCell {
+			t.Fatalf("t3_ident cell %q", p.T3IdentCell)
 		}
-		for _, k := range nk {
-			if !slices.Contains([]Kind{PDel, PAdd, PPara, XSurf}, k) {
-				t.Fatalf("t3_ident node side has %s", k)
+		if !slices.Contains(xk, del) {
+			t.Fatalf("t3_ident %s cell without %s: %v | %v", p.T3IdentCell, del, xk, yk)
+		}
+		for _, k := range xk {
+			if !slices.Contains(delPool, k) {
+				t.Fatalf("t3_ident %s cell deleting side has %s", p.T3IdentCell, k)
 			}
 		}
-		for _, k := range ek {
-			if !slices.Contains([]Kind{RDel, RAdd, RRev, RType}, k) {
-				t.Fatalf("t3_ident edge side has %s", k)
+		for _, k := range yk {
+			if !slices.Contains(keepPool, k) {
+				t.Fatalf("t3_ident %s cell other side has %s", p.T3IdentCell, k)
 			}
 		}
 	}
 	if share := float64(ident) / float64(len(ps)); math.Abs(share-0.10) > 0.02 {
 		t.Fatalf("t3_ident share %.3f, want 0.10 ± 0.02", share)
+	}
+	if share := float64(diag) / float64(len(ps)); math.Abs(share-0.10) > 0.02 {
+		t.Fatalf("t3_diag share %.3f, want 0.10 ± 0.02", share)
+	}
+	if lo, hi := cells[IdentNodeCell], cells[IdentEdgeCell]; math.Abs(float64(lo-hi))/float64(ident) > 0.15 {
+		t.Fatalf("t3_ident cells %d / %d, want ≈ half each", lo, hi)
 	}
 }
 

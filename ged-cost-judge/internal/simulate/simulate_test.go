@@ -77,12 +77,18 @@ func TestMetaAndCounts(t *testing.T) {
 	if len(trips) != 480 || len(js) != 480*6 {
 		t.Fatalf("%d triplets, %d judgments", len(trips), len(js))
 	}
-	ident, x := 0, 0
+	ident, diag, x := 0, 0, 0
 	for _, m := range metas {
 		if m.Info.T3Ident {
 			ident++
 			if m.Type != perturb.T3Contrast || m.Target != "" {
 				t.Fatal("t3_ident outside T3 or Δ-targeted")
+			}
+		}
+		if m.Info.T3Diag {
+			diag++
+			if m.Type != perturb.T3Contrast || m.Target != "" || !m.Info.DiagCAType || m.InFit() {
+				t.Fatal("t3_diag outside T3, Δ-targeted, unflagged or in the fit")
 			}
 		}
 		if !m.InFit() {
@@ -95,14 +101,14 @@ func TestMetaAndCounts(t *testing.T) {
 			t.Fatal("T1 without stratum")
 		}
 	}
-	if ident == 0 || x == 0 {
-		t.Fatalf("t3_ident %d, excluded %d", ident, x)
+	if ident == 0 || diag == 0 || x < diag {
+		t.Fatalf("t3_ident %d, t3_diag %d, excluded %d", ident, diag, x)
 	}
 	c, err := Count(trips, metas, ged.Current())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.FitSet != len(trips)-x || c.Cells[CellIdent] != ident || c.Cells[CellCooccur] != 0 {
+	if c.FitSet != len(trips)-x || c.Cells[CellIdent] != ident || c.Cells[CellDiag] != diag || c.Cells[CellCooccur] != 0 {
 		t.Fatalf("counts %+v", c.Cells)
 	}
 	for _, name := range []string{CellIMissing, CellIExtra, CellEMissing, CellEExtra, CellDirection, CellTypeRAMA, CellNeg, CellF09, CellF03} {

@@ -43,7 +43,7 @@ type Config struct {
 	Shape    string
 	MinProps int
 	MaxProps int
-	// Catalogue are the catalogue options (strata shares, t3_ident share, T1 settings); the per-source utterance map
+	// Catalogue are the catalogue options (strata shares, t3_ident / t3_diag shares, T1 settings); the per-source utterance map
 	// and source-proposition cos are filled in by the simulator.
 	Catalogue perturb.BuildOptions
 	// Hetero is the per-source (per-context) cost heterogeneity: each source draws θ_s,p = θ*_p · exp(Hetero·z − Hetero²/2)
@@ -361,8 +361,8 @@ func Generate(cfg Config) ([]fit.Triplet, []fit.Judgment, []Meta, error) {
 			target := ""
 			slot := opts
 			if typ == perturb.T3Contrast {
-				ident := opts.DrawIdent(w.rng) // once per slot, so the Δ-targeting redraws keep the sub-stratum's share
-				slot.Ident = &ident
+				sub := opts.DrawSub(w.rng) // once per slot, so the Δ-targeting redraws keep the sub-strata's shares
+				slot.Sub = &sub
 			}
 			for attempt := 0; ; attempt++ {
 				tp = perturb.DrawTriplet(w.rng, src, typ, slot)
@@ -372,11 +372,11 @@ func Generate(cfg Config) ([]fit.Triplet, []fit.Judgment, []Meta, error) {
 				if d0, err = delta(src, tp.A, tp.B, sa, sb, th0); err != nil {
 					return nil, nil, nil, err
 				}
-				if typ != perturb.T3Contrast || tp.T3Ident {
+				if typ != perturb.T3Contrast || tp.T3Ident || tp.T3Diag {
 					target = ""
 					break
 				}
-				// The non-t3_ident T3 slots: half have a difference near 0 under current costs and half a clear difference (plan §4.3).
+				// The ordinary T3 slots: half have a difference near 0 under current costs and half a clear difference (plan §4.3).
 				wantNear := k%2 == 0
 				target = map[bool]string{true: "near", false: "clear"}[wantNear]
 				if (math.Abs(d0) < nearThreshold) == wantNear || attempt >= 50 {
