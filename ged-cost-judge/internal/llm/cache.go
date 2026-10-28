@@ -31,6 +31,10 @@ func CacheKey(req Request) string {
 		SchemaName  string    `json:"schema_name,omitempty"`
 		SchemaJSON  string    `json:"schema_json,omitempty"`
 		Strict      bool      `json:"strict,omitempty"`
+		// Added with the Anthropic path. omitempty keeps the keys of requests that leave them
+		// empty (all OpenAI requests made before) byte-identical.
+		Thinking string `json:"thinking,omitempty"`
+		Effort   string `json:"effort,omitempty"`
 	}
 	k := keyShape{
 		Model:       req.Model,
@@ -38,6 +42,8 @@ func CacheKey(req Request) string {
 		Temperature: req.Temperature,
 		Seed:        req.Seed,
 		MaxTokens:   req.MaxTokens,
+		Thinking:    req.Thinking,
+		Effort:      req.Effort,
 	}
 	if req.Schema != nil {
 		k.SchemaName = req.Schema.Name
@@ -132,9 +138,12 @@ func NewCachingClient(inner Client, cache *FileCache) *CachingClient {
 	return &CachingClient{inner: inner, cache: cache}
 }
 
-func (c *CachingClient) Complete(ctx context.Context, req Request) (*Response, error) {
-	key := CacheKey(req)
-	cached, err := c.cache.Get(req.Tag, key)
+// ApplyDefaults forwards to the inner client (see RequestDefaulter).
+func (c *CachingClient) ApplyDefaults(req Request) Request { return applyDefaults(c.inner, req) }
+
+// lookup returns the cached response marked as a hit, or (nil, nil) on a miss.
+func (c *CachingClient) lookup(tag, key string) (*Response, error) {
+	cached, err := c.cache.Get(tag, key)
 	switch {
 	case err == nil:
 		hit := *cached
@@ -142,8 +151,19 @@ func (c *CachingClient) Complete(ctx context.Context, req Request) (*Response, e
 		// Cache hits are not billed, so they are not mixed into cost totals.
 		hit.Usage.CostUSD = 0
 		return &hit, nil
-	case !errors.Is(err, ErrCacheMiss):
+	case errors.Is(err, ErrCacheMiss):
+		return nil, nil
+	default:
 		return nil, err
+	}
+}
+
+func (c *CachingClient) Complete(ctx context.Context, req Request) (*Response, error) {
+	// Client-level defaults (e.g. the Anthropic default effort) must be part of the key.
+	req = c.ApplyDefaults(req)
+	key := CacheKey(req)
+	if hit, err := c.lookup(req.Tag, key); err != nil || hit != nil {
+		return hit, err
 	}
 	start := time.Now()
 	resp, err := c.inner.Complete(ctx, req)
@@ -157,4 +177,74 @@ func (c *CachingClient) Complete(ctx context.Context, req Request) (*Response, e
 		return nil, err
 	}
 	return resp, nil
+}
+
+var _ BatchClient = (*CachingClient)(nil)
+
+// CompleteBatch serves cached requests from the FileCache and sends only the misses to the inner
+// client, in a single CompleteBatch call when the inner client is a BatchClient (otherwise the
+// misses are completed one by one with Complete). Successful responses are stored; failed items
+// are not cached, so a rerun retries exactly those.
+func (c *CachingClient) CompleteBatch(ctx context.Context, reqs []Request) ([]BatchResult, error) {
+	out := make([]BatchResult, len(reqs))
+	norm := make([]Request, len(reqs))
+	keys := make([]string, len(reqs))
+	var missIdx []int
+	for i, req := range reqs {
+		norm[i] = c.ApplyDefaults(req)
+		keys[i] = CacheKey(norm[i])
+		hit, err := c.lookup(norm[i].Tag, keys[i])
+		switch {
+		case err != nil:
+			out[i].Err = err
+		case hit != nil:
+			out[i].Response = hit
+		default:
+			missIdx = append(missIdx, i)
+		}
+	}
+	if len(missIdx) == 0 {
+		return out, nil
+	}
+	misses := make([]Request, len(missIdx))
+	for j, i := range missIdx {
+		misses[j] = norm[i]
+	}
+
+	var results []BatchResult
+	if bc, ok := c.inner.(BatchClient); ok {
+		var err error
+		results, err = bc.CompleteBatch(ctx, misses)
+		if err != nil {
+			return nil, err
+		}
+		if len(results) != len(misses) {
+			return nil, fmt.Errorf("llm: batch returned %d results for %d requests", len(results), len(misses))
+		}
+	} else {
+		results = make([]BatchResult, len(misses))
+		for j, req := range misses {
+			start := time.Now()
+			resp, err := c.inner.Complete(ctx, req)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if err == nil && resp.LatencyMS == 0 {
+				resp.LatencyMS = time.Since(start).Milliseconds()
+			}
+			results[j] = BatchResult{Response: resp, Err: err}
+		}
+	}
+
+	for j, i := range missIdx {
+		r := results[j]
+		if r.Err == nil && r.Response != nil {
+			if err := c.cache.Put(norm[i].Tag, keys[i], r.Response); err != nil {
+				// Keep the (paid) response; the caller decides whether a cache write failure is fatal.
+				r.Err = err
+			}
+		}
+		out[i] = r
+	}
+	return out, nil
 }

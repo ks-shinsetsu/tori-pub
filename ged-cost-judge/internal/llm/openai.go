@@ -91,6 +91,12 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (*Response, er
 	if req.MaxTokens > 0 {
 		params.MaxCompletionTokens = openai.Int(req.MaxTokens)
 	}
+	if req.Thinking != "" {
+		return nil, fmt.Errorf("llm: openai: Request.Thinking is not supported (use Effort)")
+	}
+	if req.Effort != "" {
+		params.ReasoningEffort = shared.ReasoningEffort(req.Effort)
+	}
 	if req.Schema != nil {
 		// Schema.JSON must be passed as any (the SDK marshals it again).
 		var schemaObj any
