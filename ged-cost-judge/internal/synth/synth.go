@@ -1,7 +1,14 @@
 // Package synth uses an LLM to build source arguments (graph + text) (plan G1),
-// realize edit plans as variant text (G3), and judge triplets (J).
+// realize edit plans as variant text (G3), verify them (G4), and judge triplets (J).
 //
 // Generation and judgment always use separate requests with no conversation history (plan §2.2).
+//
+// Two prompt versions coexist:
+//
+//   - "v1" is the pilot-2 pipeline (synth_source_v1, realize_v1/v2, verify_v1, judge_v1; one model).
+//     Its requests are kept byte-identical so that a pilot-2 run replays from the response cache.
+//   - "v2" is the revised pipeline of dataset-spec §9 (synth_source_v2 with exemplars, realize_v3,
+//     verify_v2, verify_source_v1, synth_topics_v1; two generator families, cross-family verifier).
 package synth
 
 import (
@@ -21,6 +28,12 @@ import (
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/perturb"
 )
 
+// Prompt versions.
+const (
+	V1 = "v1"
+	V2 = "v2"
+)
+
 // Prompt is a prompt file's body and hash.
 type Prompt struct {
 	Name string
@@ -34,8 +47,12 @@ func LoadPrompt(dir, name string) (Prompt, error) {
 	if err != nil {
 		return Prompt{}, err
 	}
-	h := sha256.Sum256(b)
-	return Prompt{Name: name, Body: string(b), Hash: hex.EncodeToString(h[:6])}, nil
+	return newPrompt(name, string(b)), nil
+}
+
+func newPrompt(name, body string) Prompt {
+	h := sha256.Sum256([]byte(body))
+	return Prompt{Name: name, Body: body, Hash: hex.EncodeToString(h[:6])}
 }
 
 // Utterance is an utterance.
@@ -48,7 +65,8 @@ type Utterance struct {
 type Discussion struct {
 	Utterances []Utterance `json:"utterances"`
 	Graph      ged.Graph   `json:"graph"`
-	// PropUtterance maps proposition → index of the utterance stating it (source arguments only).
+	// PropUtterance maps proposition → index of the utterance stating it.
+	// Source arguments always carry it; v2 realizations carry it too (needed for incremental T1).
 	PropUtterance map[string]int `json:"prop_utterance,omitempty"`
 }
 
@@ -61,16 +79,149 @@ func (d Discussion) Render() string {
 	return b.String()
 }
 
-// Spec is the allocation of a source argument (the factors of plan §4.1).
-type Spec struct {
-	Format    string `json:"format"`
-	Domain    string `json:"domain"`
-	Speakers  int    `json:"speakers"`
-	Props     int    `json:"props"`
-	Structure string `json:"structure"`
+// renderNumbered is the text with utterance numbers (verifier input).
+func (d Discussion) renderNumbered() string {
+	var b strings.Builder
+	for i, u := range d.Utterances {
+		fmt.Fprintf(&b, "[%d] %s: %s\n", i, u.Speaker, u.Text)
+	}
+	return b.String()
 }
 
+// PropText returns the text of proposition id ("" if absent).
+func (d Discussion) PropText(id string) string {
+	for _, p := range d.Graph.Props {
+		if p.ID == id {
+			return p.Text
+		}
+	}
+	return ""
+}
+
+// Spec is the allocation of a source argument (plan §4.1, dataset-spec §1.2).
+type Spec struct {
+	Format   string `json:"format"`
+	Domain   string `json:"domain"`
+	Speakers int    `json:"speakers"`
+	Props    int    `json:"props"`
+	// Structure is the v1 structure label (chain / convergent / …). v2 replaces it with the numeric targets.
+	Structure string `json:"structure,omitempty"`
+
+	// Numeric targets (v2, dataset-spec §1.2).
+	RA           int  `json:"ra,omitempty"`
+	CA           int  `json:"ca,omitempty"`
+	MA           int  `json:"ma,omitempty"`
+	Isolated     int  `json:"isolated,omitempty"`
+	MultiPremise bool `json:"multi_premise,omitempty"`
+	Chain        bool `json:"chain,omitempty"`
+	// SizeBin is the n_P bin ("8-10", "11-15", "16-20").
+	SizeBin string `json:"size_bin,omitempty"`
+
+	TopicID string   `json:"topic_id,omitempty"`
+	Topic   string   `json:"topic,omitempty"`
+	Names   []string `json:"names,omitempty"`
+	// ExemplarPair is the two exemplars shown in the prompt (dataset-spec §1.5.2).
+	ExemplarPair ExemplarPair `json:"exemplar_pair,omitzero"`
+	// Generator is the model id assigned to write this source and all its variants.
+	Generator string `json:"generator,omitempty"`
+	// Seed is the per-source seed (exemplar order, plan draws).
+	Seed uint64 `json:"seed,omitempty"`
+}
+
+// Edges is the target number of relations.
+func (s Spec) Edges() int { return s.RA + s.CA + s.MA }
+
+// Agent is one model endpoint with its fixed reasoning settings.
+type Agent struct {
+	Client llm.Client
+	Model  string
+	// Family is the provider family ("openai" / "anthropic"); see FamilyOf.
+	Family   string
+	Effort   string
+	Thinking string
+}
+
+// FamilyOf maps a model id to its provider family.
+func FamilyOf(model string) string {
+	switch {
+	case strings.HasPrefix(model, "claude-"):
+		return "anthropic"
+	case strings.HasPrefix(model, "gpt-"):
+		return "openai"
+	}
+	return "unknown"
+}
+
+// NewAgent builds an agent for model with its family filled in.
+func NewAgent(c llm.Client, model, effort, thinking string) Agent {
+	return Agent{Client: c, Model: model, Family: FamilyOf(model), Effort: effort, Thinking: thinking}
+}
+
+// Setting is the reasoning setting as recorded ("effort=low,thinking=adaptive").
+func (a Agent) Setting() string {
+	var parts []string
+	if a.Effort != "" {
+		parts = append(parts, "effort="+a.Effort)
+	}
+	if a.Thinking != "" {
+		parts = append(parts, "thinking="+a.Thinking)
+	}
+	if len(parts) == 0 {
+		return "default"
+	}
+	return strings.Join(parts, ",")
+}
+
+func (a Agent) request(system, user, tag string) llm.Request {
+	return llm.Request{
+		Model:    a.Model,
+		Messages: []llm.Message{llm.System(system), llm.User(user)},
+		Effort:   a.Effort,
+		Thinking: a.Thinking,
+		Tag:      tag,
+	}
+}
+
+// Generator bundles LLM calls.
+type Generator struct {
+	// Client / Model are the writer (generator family). For v1 they are also the verifier and the judge.
+	Client   llm.Client
+	Model    string
+	Effort   string
+	Thinking string
+
+	// Verifier is the other-family model of v2 (nil in v1: the writer verifies itself).
+	Verifier *Agent
+
+	Version            string // V1 (default) or V2
+	SourcePrompt       Prompt
+	RealizePrompt      Prompt
+	JudgePrompt        Prompt
+	VerifyPrompt       Prompt
+	VerifySourcePrompt Prompt
+	TopicPrompt        Prompt
+	// Exemplars is the exemplar bank rendered into the v2 source prompt (looked up by id).
+	Exemplars []Exemplar
+}
+
+// Writer returns the generator model as an Agent.
+func (g *Generator) Writer() Agent {
+	return Agent{Client: g.Client, Model: g.Model, Family: FamilyOf(g.Model), Effort: g.Effort, Thinking: g.Thinking}
+}
+
+// verifier returns the verifier agent (the writer itself when none is set, as in v1).
+func (g *Generator) verifier() Agent {
+	if g.Verifier != nil {
+		return *g.Verifier
+	}
+	return g.Writer()
+}
+
+// Usage aggregates cost (per call purpose).
+type Usage map[string]llm.Usage
+
 // sourceOut is the structured output of source argument generation.
+// Its shape (field order, tags) is part of the cache key of every v1 and v2 source request.
 type sourceOut struct {
 	Utterances   []Utterance `json:"utterances"`
 	Propositions []struct {
@@ -85,39 +236,91 @@ type sourceOut struct {
 	} `json:"relations"`
 }
 
-// Generator bundles LLM calls.
-type Generator struct {
-	Client        llm.Client
-	Model         string
-	SourcePrompt  Prompt
-	RealizePrompt Prompt
-	JudgePrompt   Prompt
-	VerifyPrompt  Prompt
-}
-
-// Usage aggregates cost (per call purpose).
-type Usage map[string]llm.Usage
-
-// GenerateSource builds a source argument. prefix is the proposition ID prefix (unique per source argument).
-func (g *Generator) GenerateSource(ctx context.Context, spec Spec, prefix string, attempt int) (Discussion, *llm.Response, error) {
-	user := fmt.Sprintf("Format: %s\nTopic area: %s\nNumber of speakers: %d\nTarget number of propositions: %d\nStructure: %s\n",
-		spec.Format, spec.Domain, spec.Speakers, spec.Props, spec.Structure)
+// SourceUserMessage is the user message of source generation for the generator's prompt version.
+func (g *Generator) SourceUserMessage(spec Spec, attempt int) string {
+	var user string
+	if g.Version == V2 {
+		yn := map[bool]string{false: "no", true: "yes"}
+		names := strings.Join(spec.Names, ", ")
+		if names == "" {
+			names = "(none; use the role only)"
+		}
+		user = fmt.Sprintf("Format: %s\nTopic: %s\nSpeaker names: %s\nTargets: propositions %d, RA %d, CA %d, MA %d, isolated %d, multi-premise %s, chain %s\n",
+			spec.Format, spec.Topic, names, spec.Props, spec.RA, spec.CA, spec.MA, spec.Isolated, yn[spec.MultiPremise], yn[spec.Chain])
+	} else {
+		user = fmt.Sprintf("Format: %s\nTopic area: %s\nNumber of speakers: %d\nTarget number of propositions: %d\nStructure: %s\n",
+			spec.Format, spec.Domain, spec.Speakers, spec.Props, spec.Structure)
+	}
 	if attempt > 0 {
 		user += fmt.Sprintf("(attempt %d)\n", attempt+1)
 	}
-	out, resp, err := llm.CompleteJSON[sourceOut](ctx, g.Client, llm.Request{
+	return user
+}
+
+// SourceSystemPrompt is the system prompt of source generation: v1 verbatim; v2 with the two exemplars
+// of spec.ExemplarPair rendered in place of {{exemplars}} (in the pair's display order).
+// withExemplars=false renders the v2 prompt without examples (homogeneity monitor, dataset-spec §1.5.2 (4)).
+func (g *Generator) SourceSystemPrompt(spec Spec, withExemplars bool) (string, error) {
+	if g.Version != V2 {
+		return g.SourcePrompt.Body, nil
+	}
+	if !withExemplars {
+		return RenderExemplarsInto(g.SourcePrompt.Body, nil), nil
+	}
+	var exs []Exemplar
+	for _, id := range spec.ExemplarPair.Order {
+		ex, ok := FindExemplar(g.Exemplars, id)
+		if !ok {
+			return "", fmt.Errorf("synth: exemplar %q not loaded", id)
+		}
+		exs = append(exs, ex)
+	}
+	if len(exs) != 2 {
+		return "", fmt.Errorf("synth: spec has %d exemplars, want 2", len(exs))
+	}
+	return RenderExemplarsInto(g.SourcePrompt.Body, exs), nil
+}
+
+// GenerateSource builds a source argument. prefix is the proposition ID prefix (unique per source argument).
+// v2 renders the exemplar pair of spec into the system prompt; the pair is part of the prompt text and
+// therefore of the LLM cache key.
+func (g *Generator) GenerateSource(ctx context.Context, spec Spec, prefix string, attempt int) (Discussion, *llm.Response, error) {
+	return g.generateSource(ctx, spec, prefix, attempt, true)
+}
+
+// GenerateSourceNoExemplars is GenerateSource with the v2 prompt but no examples (homogeneity monitor only).
+func (g *Generator) GenerateSourceNoExemplars(ctx context.Context, spec Spec, prefix string) (Discussion, *llm.Response, error) {
+	return g.generateSource(ctx, spec, prefix, 0, false)
+}
+
+func (g *Generator) generateSource(ctx context.Context, spec Spec, prefix string, attempt int, withEx bool) (Discussion, *llm.Response, error) {
+	sys, err := g.SourceSystemPrompt(spec, withEx)
+	if err != nil {
+		return Discussion{}, nil, err
+	}
+	req := llm.Request{
 		Model:    g.Model,
-		Messages: []llm.Message{llm.System(g.SourcePrompt.Body), llm.User(user)},
+		Messages: []llm.Message{llm.System(sys), llm.User(g.SourceUserMessage(spec, attempt))},
 		Tag:      "synth_source",
-	}, "discussion", "A discussion with its argument structure")
+	}
+	if g.Version == V2 {
+		req.Effort, req.Thinking = g.Effort, g.Thinking
+	}
+	out, resp, err := llm.CompleteJSON[sourceOut](ctx, g.Client, req, "discussion", "A discussion with its argument structure")
 	if err != nil {
 		return Discussion{}, resp, err
 	}
+	d, err := out.discussion(prefix)
+	return d, resp, err
+}
+
+// discussion converts the structured output to a Discussion, checking the references.
+func (out sourceOut) discussion(prefix string) (Discussion, error) {
 	d := Discussion{Utterances: out.Utterances, PropUtterance: map[string]int{}}
 	ids := map[string]string{}
 	for _, p := range out.Propositions {
 		if _, dup := ids[p.ID]; dup || p.Utterance < 0 || p.Utterance >= len(out.Utterances) || strings.TrimSpace(p.Text) == "" {
-			return Discussion{}, resp, fmt.Errorf("synth: invalid proposition %q", p.ID)
+			return Discussion{}, fmt.Errorf("synth: invalid proposition %q", p.ID)
 		}
 		id := prefix + p.ID
 		ids[p.ID] = id
@@ -129,7 +332,7 @@ func (g *Generator) GenerateSource(ctx context.Context, spec Spec, prefix string
 		f, ok1 := ids[r.From]
 		t, ok2 := ids[r.To]
 		if !ok1 || !ok2 || f == t {
-			return Discussion{}, resp, fmt.Errorf("synth: invalid relation %s→%s", r.From, r.To)
+			return Discussion{}, fmt.Errorf("synth: invalid relation %s→%s", r.From, r.To)
 		}
 		k := [2]string{min(f, t), max(f, t)}
 		if seen[k] {
@@ -139,9 +342,100 @@ func (g *Generator) GenerateSource(ctx context.Context, spec Spec, prefix string
 		d.Graph.Edges = append(d.Graph.Edges, ged.Edge{From: f, To: t, Kind: r.Kind})
 	}
 	if len(d.Graph.Props) < 4 || len(d.Graph.Edges) < 2 {
-		return Discussion{}, resp, errors.New("synth: too few propositions or relations")
+		return Discussion{}, errors.New("synth: too few propositions or relations")
 	}
-	return d, resp, nil
+	return d, nil
+}
+
+// GraphStats are the shape statistics of a source graph (dataset-spec §1.2 / §1.3 report).
+type GraphStats struct {
+	Props, Edges, RA, CA, MA, Isolated int
+	// MultiPremise: some proposition has ≥ 2 incoming RA. Chain: a directed RA/CA/MA path of length ≥ 2 edges.
+	MultiPremise, Chain bool
+	// MaxPerUtterance is the largest number of propositions stated in one utterance.
+	MaxPerUtterance int
+	// Distances counts edges by utterance distance (|u(from) − u(to)|).
+	Distances map[int]int
+}
+
+// Stats computes GraphStats.
+func Stats(d Discussion) GraphStats {
+	g := d.Graph
+	st := GraphStats{Props: len(g.Props), Edges: len(g.Edges), Distances: map[int]int{}}
+	deg := map[string]int{}
+	inRA := map[string]int{}
+	succ := map[string][]string{}
+	for _, e := range g.Edges {
+		switch e.Kind {
+		case ged.RA:
+			st.RA++
+			inRA[e.To]++
+		case ged.CA:
+			st.CA++
+		case ged.MA:
+			st.MA++
+		}
+		deg[e.From]++
+		deg[e.To]++
+		succ[e.From] = append(succ[e.From], e.To)
+		if d.PropUtterance != nil {
+			st.Distances[abs(d.PropUtterance[e.From]-d.PropUtterance[e.To])]++
+		}
+	}
+	for _, p := range g.Props {
+		if deg[p.ID] == 0 {
+			st.Isolated++
+		}
+		if inRA[p.ID] >= 2 {
+			st.MultiPremise = true
+		}
+		for _, q := range succ[p.ID] {
+			if len(succ[q]) > 0 {
+				st.Chain = true
+			}
+		}
+	}
+	per := map[int]int{}
+	for _, u := range d.PropUtterance {
+		per[u]++
+		st.MaxPerUtterance = max(st.MaxPerUtterance, per[u])
+	}
+	return st
+}
+
+// TargetProblems compares a generated source with its numeric targets (dataset-spec §7 "source
+// acceptance": relation counts within ±1 per type, isolated ≥ 2) and returns the violations.
+func TargetProblems(d Discussion, spec Spec) []string {
+	st := Stats(d)
+	var out []string
+	check := func(name string, got, want int) {
+		if abs(got-want) > 1 {
+			out = append(out, fmt.Sprintf("%s: %d relations, target %d (±1)", name, got, want))
+		}
+	}
+	check("RA", st.RA, spec.RA)
+	check("CA", st.CA, spec.CA)
+	check("MA", st.MA, spec.MA)
+	if st.CA < 1 {
+		out = append(out, "no CA relation (≥ 1 required)")
+	}
+	if st.Isolated < 2 {
+		out = append(out, fmt.Sprintf("%d isolated propositions (≥ 2 required)", st.Isolated))
+	}
+	if abs(st.Props-spec.Props) > 1 {
+		out = append(out, fmt.Sprintf("%d propositions, target %d (±1)", st.Props, spec.Props))
+	}
+	if st.MaxPerUtterance > 2 {
+		out = append(out, fmt.Sprintf("an utterance states %d propositions (≤ 2)", st.MaxPerUtterance))
+	}
+	return out
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 var verbs = map[string]string{ged.RA: "supports", ged.CA: "attacks", ged.MA: "restates"}
@@ -153,7 +447,10 @@ func short(id string) string {
 	return id
 }
 
-// describe turns an edit into an English instruction for realization.
+// Short is the prompt-facing proposition id ("s3.p4" → "p4").
+func Short(id string) string { return short(id) }
+
+// describe turns an edit into an English instruction for realization (v1 wording; part of the v1 cache keys).
 func describe(e perturb.Edit) string {
 	switch e.Kind {
 	case perturb.PPara:
@@ -186,27 +483,6 @@ func describe(e perturb.Edit) string {
 	return ""
 }
 
-type realizeOut struct {
-	Changes []struct {
-		Utterance int    `json:"utterance"`
-		Op        string `json:"op" jsonschema:"enum=replace,enum=insert_after,enum=delete"`
-		Speaker   string `json:"speaker"`
-		Text      string `json:"text"`
-		Role      string `json:"role" jsonschema:"enum=edit,enum=connective"`
-	} `json:"changes"`
-	Propositions []struct {
-		ID   string `json:"id"`
-		Text string `json:"text"`
-	} `json:"propositions"`
-}
-
-// RealizeStats is the result of mechanically checking a realization.
-type RealizeStats struct {
-	Changed     int `json:"changed"`
-	Connective  int `json:"connective"`
-	MissingText int `json:"missing_text"`
-}
-
 // Instructions are the edit instructions passed to realization and verification (speaker swaps are done by the harness, so they are excluded).
 func Instructions(v perturb.Variant) []string {
 	var instr []string
@@ -221,8 +497,8 @@ func Instructions(v perturb.Variant) []string {
 // NeedsLLM reports whether the variant needs LLM realization (speaker swaps alone are handled by the harness).
 func NeedsLLM(v perturb.Variant) bool { return len(Instructions(v)) > 0 }
 
-func swapsSpeakers(v perturb.Variant) bool {
-	for _, e := range v.Edits {
+func swapsSpeakers(edits []perturb.Edit) bool {
+	for _, e := range edits {
 		if e.Kind == perturb.XSpk {
 			return true
 		}
@@ -244,110 +520,6 @@ func describeSource(b *strings.Builder, utts []Utterance, src Discussion) {
 	for _, e := range src.Graph.Edges {
 		fmt.Fprintf(b, "%s %s %s\n", short(e.From), verbs[e.Kind], short(e.To))
 	}
-}
-
-// Realize realizes variant v as text based on src. Unchanged utterances are assembled here verbatim (plan §4.4).
-// attempt and feedback are passed on regeneration (0 and "" for the first attempt).
-func (g *Generator) Realize(ctx context.Context, src Discussion, v perturb.Variant, prefix string, attempt int, feedback string) (Discussion, RealizeStats, *llm.Response, error) {
-	out := Discussion{Graph: v.Graph.Clone()}
-	instr := Instructions(v)
-	needLLM := len(instr) > 0
-	utts := slices.Clone(src.Utterances)
-	if swapsSpeakers(v) {
-		utts = swapSpeakers(utts)
-	}
-	srcText := map[string]string{}
-	for _, p := range src.Graph.Props {
-		srcText[p.ID] = p.Text
-	}
-	if !needLLM {
-		out.Utterances = utts
-		for i, p := range out.Graph.Props {
-			out.Graph.Props[i].Text = srcText[p.ID]
-		}
-		return out, RealizeStats{}, nil, nil
-	}
-
-	var b strings.Builder
-	describeSource(&b, utts, src)
-	b.WriteString("\nEdits:\n" + strings.Join(instr, "\n") + "\n")
-	if feedback != "" {
-		fmt.Fprintf(&b, "\nA previous attempt (%d) was rejected: %s\n", attempt, feedback)
-	}
-
-	res, resp, err := llm.CompleteJSON[realizeOut](ctx, g.Client, llm.Request{
-		Model:    g.Model,
-		Messages: []llm.Message{llm.System(g.RealizePrompt.Body), llm.User(b.String())},
-		Tag:      "realize",
-	}, "edited_discussion", "Changed utterances and propositions")
-	if err != nil {
-		return Discussion{}, RealizeStats{}, resp, err
-	}
-
-	var st RealizeStats
-	replace := map[int]Utterance{}
-	deleted := map[int]bool{}
-	inserts := map[int][]Utterance{}
-	for _, c := range res.Changes {
-		if c.Utterance < -1 || c.Utterance >= len(utts) {
-			return Discussion{}, st, resp, fmt.Errorf("synth: change refers to utterance %d", c.Utterance)
-		}
-		st.Changed++
-		if c.Role == "connective" {
-			st.Connective++
-		}
-		u := Utterance{Speaker: c.Speaker, Text: c.Text}
-		switch c.Op {
-		case "replace":
-			if c.Utterance < 0 {
-				return Discussion{}, st, resp, errors.New("synth: replace of utterance -1")
-			}
-			if u.Speaker == "" {
-				u.Speaker = utts[c.Utterance].Speaker
-			}
-			replace[c.Utterance] = u
-		case "delete":
-			if c.Utterance >= 0 {
-				deleted[c.Utterance] = true
-			}
-		case "insert_after":
-			inserts[c.Utterance] = append(inserts[c.Utterance], u)
-		}
-	}
-	out.Utterances = append(out.Utterances, inserts[-1]...)
-	for i, u := range utts {
-		if !deleted[i] {
-			if r, ok := replace[i]; ok {
-				u = r
-			}
-			out.Utterances = append(out.Utterances, u)
-		}
-		out.Utterances = append(out.Utterances, inserts[i]...)
-	}
-
-	newText := map[string]string{}
-	for _, p := range res.Propositions {
-		newText[prefix+p.ID] = p.Text
-		newText[p.ID] = p.Text
-	}
-	for i, p := range out.Graph.Props {
-		t, changed := newText[p.ID]
-		if !changed {
-			t, changed = newText[short(p.ID)]
-		}
-		_, mustChange := v.Changed[p.ID]
-		isNew := !strings.HasPrefix(p.ID, prefix)
-		switch {
-		case (mustChange || isNew) && changed && strings.TrimSpace(t) != "":
-			out.Graph.Props[i].Text = t
-		case mustChange || isNew:
-			st.MissingText++
-			out.Graph.Props[i].Text = srcText[p.ID]
-		default:
-			out.Graph.Props[i].Text = srcText[p.ID]
-		}
-	}
-	return out, st, resp, nil
 }
 
 func swapSpeakers(us []Utterance) []Utterance {
@@ -373,86 +545,60 @@ func swapSpeakers(us []Utterance) []Utterance {
 	return out
 }
 
-// Verification is the result of verifying a realization (plan G4; in the PoC, the same luna as generation does it).
-type Verification struct {
-	Edits []struct {
-		Index    int  `json:"index" jsonschema_description:"Number of the requested edit"`
-		Realized bool `json:"realized"`
-	} `json:"edits"`
-	UnintendedChange bool   `json:"unintended_change"`
-	Note             string `json:"note"`
-	Naturalness      string `json:"naturalness" jsonschema:"enum=1,enum=2,enum=3,enum=4,enum=5"`
-}
-
-// Natural is naturalness (1–5, or 0 if unreadable).
-func (v Verification) Natural() int {
-	if len(v.Naturalness) == 1 && v.Naturalness[0] >= '1' && v.Naturalness[0] <= '5' {
-		return int(v.Naturalness[0] - '0')
-	}
-	return 0
-}
-
-// Problems returns the reasons for failing (empty if passed). n is the number of instructed edits.
-// Criteria: every edit appears in the text, no uninstructed changes, naturalness 3 or more (plan §4.4).
-func (v Verification) Problems(n int) []string {
-	var out []string
-	seen := map[int]bool{}
-	for _, e := range v.Edits {
-		seen[e.Index] = true
-		if !e.Realized {
-			out = append(out, fmt.Sprintf("edit %d is not clearly visible in the text", e.Index))
-		}
-	}
-	for i := 1; i <= n; i++ {
-		if !seen[i] {
-			out = append(out, fmt.Sprintf("edit %d was not checked", i))
-		}
-	}
-	if v.UnintendedChange {
-		out = append(out, "it changes something no edit asked for ("+v.Note+")")
-	}
-	if v.Natural() < 3 {
-		out = append(out, fmt.Sprintf("it reads unnaturally (naturalness %s of 5)", v.Naturalness))
-	}
-	return out
-}
-
-// Verify checks, in a separate request, whether the realized variant d implements variant v's edits.
-func (g *Generator) Verify(ctx context.Context, src Discussion, d Discussion, v perturb.Variant) (Verification, *llm.Response, error) {
-	var b strings.Builder
-	b.WriteString("ORIGINAL DISCUSSION\n\n")
-	describeSource(&b, src.Utterances, src)
-	b.WriteString("\nEDITED DISCUSSION\n\n")
-	b.WriteString(d.Render())
-	b.WriteString("\nREQUESTED EDITS\n\n" + strings.Join(Instructions(v), "\n") + "\n")
-	if swapsSpeakers(v) {
-		b.WriteString("\nSpeaker names were swapped on purpose.\n")
-	}
-	return llm.CompleteJSON[Verification](ctx, g.Client, llm.Request{
-		Model:    g.Model,
-		Messages: []llm.Message{llm.System(g.VerifyPrompt.Body), llm.User(b.String())},
-		Tag:      "verify",
-	}, "verification", "Whether each requested edit is visible, unintended changes, naturalness")
-}
-
 type judgeOut struct {
 	Answer string `json:"answer" jsonschema:"enum=1,enum=2,enum=same"`
 }
 
-// JudgeAnswer is the result of one judgment ("1" / "2" / "same").
-func (g *Generator) JudgeAnswer(ctx context.Context, s, first, second Discussion) (string, *llm.Response, error) {
+// Judge is one judge model with the judge prompt.
+type Judge struct {
+	Agent
+	Prompt Prompt
+}
+
+// Request builds the judgment request for (S, Version 1, Version 2). The request is the same for v1 and
+// v2 except for the agent's reasoning settings (empty for the pilot-2 luna judge).
+func (j Judge) Request(s, first, second Discussion) (llm.Request, error) {
 	user := "Original discussion S:\n" + s.Render() +
 		"\nVersion 1:\n" + first.Render() +
 		"\nVersion 2:\n" + second.Render()
-	out, resp, err := llm.CompleteJSON[judgeOut](ctx, g.Client, llm.Request{
-		Model:    g.Model,
-		Messages: []llm.Message{llm.System(g.JudgePrompt.Body), llm.User(user)},
-		Tag:      "judge",
-	}, "judgment", "Which version better preserves the original")
+	req := j.request(j.Prompt.Body, user, "judge")
+	schema, err := llm.SchemaFor[judgeOut]("judgment", "Which version better preserves the original")
 	if err != nil {
-		return "", resp, err
+		return llm.Request{}, err
 	}
-	return out.Answer, resp, nil
+	req.Schema = schema
+	return req, nil
+}
+
+// ParseJudgeAnswer decodes a judge response ("1" / "2" / "same").
+func ParseJudgeAnswer(resp *llm.Response) (string, error) {
+	if resp == nil {
+		return "", errors.New("synth: no judge response")
+	}
+	var out judgeOut
+	if err := json.Unmarshal([]byte(resp.Text), &out); err != nil {
+		return "", fmt.Errorf("synth: judge answer: %w (text=%.200q)", err, resp.Text)
+	}
+	switch out.Answer {
+	case "1", "2", "same":
+		return out.Answer, nil
+	}
+	return "", fmt.Errorf("synth: judge answer %q", out.Answer)
+}
+
+// JudgeAnswer is the result of one judgment ("1" / "2" / "same") by the generator model (v1 path).
+func (g *Generator) JudgeAnswer(ctx context.Context, s, first, second Discussion) (string, *llm.Response, error) {
+	j := Judge{Agent: Agent{Client: g.Client, Model: g.Model}, Prompt: g.JudgePrompt}
+	req, err := j.Request(s, first, second)
+	if err != nil {
+		return "", nil, err
+	}
+	resp, err := g.Client.Complete(ctx, req)
+	if err != nil {
+		return "", nil, err
+	}
+	ans, err := ParseJudgeAnswer(resp)
+	return ans, resp, err
 }
 
 // MarshalIndent is for writing JSON.
