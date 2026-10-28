@@ -10,6 +10,7 @@ isolated: 2
 multi_premise: true (p1 has four supporting premises)
 chain: true (p7 → p8 → p1)
 words: 204
+reserved_names: Varde
 ---
 
 ```json

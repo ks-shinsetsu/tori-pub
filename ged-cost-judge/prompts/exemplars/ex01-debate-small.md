@@ -10,6 +10,7 @@ isolated: 1
 multi_premise: false
 chain: true
 words: 182
+reserved_names: Harlow Bay, Ashcombe
 ---
 
 ```json

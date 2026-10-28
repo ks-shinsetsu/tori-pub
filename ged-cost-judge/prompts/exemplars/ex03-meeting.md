@@ -10,6 +10,7 @@ isolated: 2
 multi_premise: true (p4 has two supporting premises)
 chain: true (p1 → p2 → p4)
 words: 166
+reserved_names: Corn Exchange
 ---
 
 ```json
