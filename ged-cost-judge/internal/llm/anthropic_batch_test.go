@@ -198,6 +198,63 @@ func TestBatchLostSubmitResponseIsReconciled(t *testing.T) {
 	}
 }
 
+// R1: a lost-response batch is first read by a call for unrelated requests (after the process
+// that submitted it died). Its results have no recorded tag yet, so it must stay pending until the
+// original requests come back; then they are stored and nothing is submitted twice.
+func TestAmbiguousBatchReadByUnrelatedCallStaysPending(t *testing.T) {
+	f, srv := newFakeAnthropic(t)
+	stateDir, cacheDir := t.TempDir(), t.TempDir()
+	mod := func(cfg *AnthropicConfig) { cfg.BatchStateDir = stateDir }
+	orig, other := judgeReq("claude-haiku-5-5", "orig"), judgeReq("claude-haiku-5-5", "other")
+
+	// Run 1: the upload is accepted but the response is lost; the process dies right after.
+	run1 := NewCachingClient(newTestAnthropic(t, srv, mod), NewFileCache(cacheDir))
+	run1.BatchRetry = fastRetry(1)
+	f.dropSubmits = 1
+	if _, err := run1.CompleteBatch(context.Background(), []Request{orig}); err == nil {
+		t.Fatal("run 1: want an error for the lost submission")
+	}
+	if st := readState(t, filepath.Join(stateDir, "msgbatch_1.json")); !st.Ambiguous || st.Status != batchSubmitted {
+		t.Fatalf("run 1 state = %+v, want ambiguous submitted", st)
+	}
+
+	// Run 2: an unrelated call reads the ambiguous batch first.
+	inner2 := newTestAnthropic(t, srv, mod)
+	run2 := NewCachingClient(inner2, NewFileCache(cacheDir))
+	if res, err := run2.CompleteBatch(context.Background(), []Request{other}); err != nil || res[0].Err != nil {
+		t.Fatalf("run 2: %v %+v", err, res)
+	}
+	keyOrig := CacheKey(inner2.ApplyDefaults(orig))
+	st := readState(t, filepath.Join(stateDir, "msgbatch_1.json"))
+	if st.Ambiguous || st.Status != batchSubmitted || len(st.Items) != 1 || st.Items[0].CustomID != keyOrig || len(st.Items[0].Tags) != 0 {
+		t.Fatalf("after the unrelated call: %+v, want submitted with the item recorded untagged", st)
+	}
+
+	// Run 3: the original call resumes the batch, stores its result, and submits nothing.
+	run3 := NewCachingClient(newTestAnthropic(t, srv, mod), NewFileCache(cacheDir))
+	res, err := run3.CompleteBatch(context.Background(), []Request{orig})
+	if err != nil || res[0].Err != nil || res[0].Response.Text != `{"echo":"orig"}` {
+		t.Fatalf("run 3: %v %+v", err, res)
+	}
+	batchesWithOrig := 0
+	for _, items := range f.batches {
+		for _, it := range items {
+			if it.CustomID == keyOrig {
+				batchesWithOrig++
+			}
+		}
+	}
+	if batchesWithOrig != 1 || f.batchCreates != 2 {
+		t.Errorf("batches with orig = %d (want 1), creates = %d (want 2: orig + other)", batchesWithOrig, f.batchCreates)
+	}
+	if st := readState(t, filepath.Join(stateDir, "msgbatch_1.json")); st.Status != batchCollected {
+		t.Errorf("final status %q, want collected", st.Status)
+	}
+	if _, err := NewFileCache(cacheDir).Get(orig.Tag, keyOrig); err != nil {
+		t.Errorf("orig not cached: %v", err)
+	}
+}
+
 // M2: connection failures while polling do not end the wait.
 func TestBatchPollingSurvivesTransportErrors(t *testing.T) {
 	f, srv := newFakeAnthropic(t)

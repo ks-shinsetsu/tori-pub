@@ -267,8 +267,14 @@ func (c *AnthropicClient) collect(ctx context.Context, st *batchState, items map
 			complete = false // should not happen; keep the batch to read it again
 		}
 	}
+	// The state records the tags learned from this call, so later calls can store those results.
+	refIdx := make(map[string]int, len(updated.Items))
+	updated.Items = slices.Clone(updated.Items)
+	for i, ref := range updated.Items {
+		refIdx[ref.CustomID] = i
+	}
 	var storeErrs []error
-	succeeded, failed := 0, 0
+	succeeded, failed, untagged := 0, 0, 0
 	for k, r := range got {
 		if r.Err != nil || r.Response == nil {
 			failed++
@@ -283,9 +289,14 @@ func (c *AnthropicClient) collect(ctx context.Context, st *batchState, items map
 				}
 			}
 		}
+		if i, ok := refIdx[k]; ok {
+			updated.Items[i].Tags = slices.Clone(tags)
+		}
 		if len(tags) == 0 {
-			// A result of an ambiguous batch that no recorded request asked for (another
-			// process's batch, or ours from a call we cannot reconstruct): it cannot be stored.
+			// A result of an ambiguous batch that no call has asked for yet: it cannot be stored
+			// (no cache tag). The batch stays "submitted", so the call that wants it (matched by
+			// custom_id) stores it later; re-reading an ended batch is free.
+			untagged++
 			continue
 		}
 		for _, tag := range tags {
@@ -301,7 +312,7 @@ func (c *AnthropicClient) collect(ctx context.Context, st *batchState, items map
 		}
 		return got, fmt.Errorf("llm: anthropic batch %s: storing results: %w", st.ID, errors.Join(storeErrs...))
 	}
-	if !complete {
+	if !complete || untagged > 0 {
 		return got, c.saveState(&updated)
 	}
 	now := time.Now().UTC()
