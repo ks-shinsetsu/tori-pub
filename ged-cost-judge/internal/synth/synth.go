@@ -456,7 +456,6 @@ func (g *Generator) JudgeAnswer(ctx context.Context, s, first, second Discussion
 }
 
 // MarshalIndent is for writing JSON.
-func MarshalIndent(v any) []byte {
-	b, _ := json.MarshalIndent(v, "", "  ")
-	return b
+func MarshalIndent(v any) ([]byte, error) {
+	return json.MarshalIndent(v, "", "  ")
 }

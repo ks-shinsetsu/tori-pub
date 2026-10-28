@@ -153,7 +153,7 @@ func (pp *verifyPipeline) slot(s slotSpec) *pilotTriplet {
 		}
 		t.Replans = plan
 		a, b, pred := drawPair(rng, src.Graph, s.typ, near)
-		t.A, t.B, t.EditsA, t.EditsB, t.PredDelta = a, b, a.Edits, b.Edits, pred
+		t.A, t.B, t.EditsA, t.EditsB, t.PredDelta = a, b, a.Edits, b.Edits, finite(pred)
 		da, sa, ca, ok := pp.realizeVerified(src, a, prefix)
 		t.CheckA = ca
 		if !ok {
@@ -190,6 +190,14 @@ func drawPair(rng *rand.Rand, src ged.Graph, typ perturb.TripletType, near *bool
 		}
 	}
 	return a, b, pred
+}
+
+// finite returns nil for NaN, which encoding/json cannot encode.
+func finite(x float64) *float64 {
+	if math.IsNaN(x) {
+		return nil
+	}
+	return &x
 }
 
 // predictedDelta predicts the difference Δ under current prices, using a cos estimated from edit strength.

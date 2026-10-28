@@ -128,7 +128,7 @@ type pilotTriplet struct {
 	// The following are filled only by the procedure with verification (-verify).
 	Replans    int          `json:"replans,omitempty"`
 	NearTarget *bool        `json:"near_target,omitempty"`
-	PredDelta  float64      `json:"pred_delta,omitempty"`
+	PredDelta  *float64     `json:"pred_delta,omitempty"` // T3 only
 	CheckA     variantCheck `json:"check_a,omitzero"`
 	CheckB     variantCheck `json:"check_b,omitzero"`
 }
@@ -536,11 +536,17 @@ func runPilot(o pilotOptions) error {
 	if err := os.WriteFile(filepath.Join(o.out, "pilot.md"), b.Bytes(), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(o.out, "pilot_sources.json"), synth.MarshalIndent(sources), 0o644); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(o.out, "pilot_triplets.json"), synth.MarshalIndent(trips), 0o644); err != nil {
-		return err
+	for _, f := range []struct {
+		name string
+		v    any
+	}{{"pilot_sources.json", sources}, {"pilot_triplets.json", trips}} {
+		js, err := synth.MarshalIndent(f.v)
+		if err != nil {
+			return fmt.Errorf("pilot: %s: %w", f.name, err)
+		}
+		if err := os.WriteFile(filepath.Join(o.out, f.name), js, 0o644); err != nil {
+			return err
+		}
 	}
 	fmt.Print(b.String())
 	if fails := errors.Join(srcErr...); fails != nil && errors.Is(fails, errBudget) {
