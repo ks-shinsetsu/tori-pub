@@ -1,0 +1,291 @@
+{
+ "nodeset_id": "90004",
+ "corpus": "cutietestrun22October2020",
+ "text": "(fixture)",
+ "graph": {
+  "id": "1",
+  "nodes": [
+   {
+    "nodeID": "1001",
+    "type": "L",
+    "text": "Fiona Bruce : claim number 1 is stated here",
+    "speaker": "Fiona Bruce"
+   },
+   {
+    "nodeID": "1002",
+    "type": "YA",
+    "text": "Asserting",
+    "scheme": "Asserting"
+   },
+   {
+    "nodeID": "1003",
+    "type": "I",
+    "text": "claim number 1 is stated here"
+   },
+   {
+    "nodeID": "1004",
+    "type": "L",
+    "text": "Panellist A : claim number 2 is stated here",
+    "speaker": "Panellist A"
+   },
+   {
+    "nodeID": "1005",
+    "type": "YA",
+    "text": "Asserting",
+    "scheme": "Asserting"
+   },
+   {
+    "nodeID": "1006",
+    "type": "I",
+    "text": "claim number 2 is stated here"
+   },
+   {
+    "nodeID": "1007",
+    "type": "TA",
+    "text": "Default Transition",
+    "scheme": "Default Transition"
+   },
+   {
+    "nodeID": "1008",
+    "type": "L",
+    "text": "Panellist B : claim number 3 is stated here",
+    "speaker": "Panellist B"
+   },
+   {
+    "nodeID": "1009",
+    "type": "YA",
+    "text": "Asserting",
+    "scheme": "Asserting"
+   },
+   {
+    "nodeID": "1010",
+    "type": "I",
+    "text": "claim number 3 is stated here"
+   },
+   {
+    "nodeID": "1011",
+    "type": "TA",
+    "text": "Default Transition",
+    "scheme": "Default Transition"
+   },
+   {
+    "nodeID": "1012",
+    "type": "L",
+    "text": "Fiona Bruce : claim number 4 is stated here",
+    "speaker": "Fiona Bruce"
+   },
+   {
+    "nodeID": "1013",
+    "type": "YA",
+    "text": "Asserting",
+    "scheme": "Asserting"
+   },
+   {
+    "nodeID": "1014",
+    "type": "I",
+    "text": "claim number 4 is stated here"
+   },
+   {
+    "nodeID": "1015",
+    "type": "TA",
+    "text": "Default Transition",
+    "scheme": "Default Transition"
+   },
+   {
+    "nodeID": "1016",
+    "type": "L",
+    "text": "Panellist A : claim number 5 is stated here",
+    "speaker": "Panellist A"
+   },
+   {
+    "nodeID": "1017",
+    "type": "YA",
+    "text": "Asserting",
+    "scheme": "Asserting"
+   },
+   {
+    "nodeID": "1018",
+    "type": "I",
+    "text": "claim number 5 is stated here"
+   },
+   {
+    "nodeID": "1019",
+    "type": "TA",
+    "text": "Default Transition",
+    "scheme": "Default Transition"
+   },
+   {
+    "nodeID": "1020",
+    "type": "L",
+    "text": "Panellist B : claim number 6 is stated here",
+    "speaker": "Panellist B"
+   },
+   {
+    "nodeID": "1021",
+    "type": "YA",
+    "text": "Asserting",
+    "scheme": "Asserting"
+   },
+   {
+    "nodeID": "1022",
+    "type": "I",
+    "text": "claim number 6 is stated here"
+   },
+   {
+    "nodeID": "1023",
+    "type": "TA",
+    "text": "Default Transition",
+    "scheme": "Default Transition"
+   },
+   {
+    "nodeID": "1024",
+    "type": "RA",
+    "text": "RA",
+    "scheme": "Default"
+   },
+   {
+    "nodeID": "1025",
+    "type": "CA",
+    "text": "CA",
+    "scheme": "Default"
+   },
+   {
+    "nodeID": "1026",
+    "type": "MA",
+    "text": "MA",
+    "scheme": "Default"
+   },
+   {
+    "nodeID": "1027",
+    "type": "L",
+    "text": "Fiona Bruce : orphan locution"
+   }
+  ],
+  "edges": [
+   {
+    "fromID": "1001",
+    "toID": "1002"
+   },
+   {
+    "fromID": "1002",
+    "toID": "1003"
+   },
+   {
+    "fromID": "1004",
+    "toID": "1005"
+   },
+   {
+    "fromID": "1005",
+    "toID": "1006"
+   },
+   {
+    "fromID": "1001",
+    "toID": "1007"
+   },
+   {
+    "fromID": "1007",
+    "toID": "1004"
+   },
+   {
+    "fromID": "1008",
+    "toID": "1009"
+   },
+   {
+    "fromID": "1009",
+    "toID": "1010"
+   },
+   {
+    "fromID": "1004",
+    "toID": "1011"
+   },
+   {
+    "fromID": "1011",
+    "toID": "1008"
+   },
+   {
+    "fromID": "1012",
+    "toID": "1013"
+   },
+   {
+    "fromID": "1013",
+    "toID": "1014"
+   },
+   {
+    "fromID": "1008",
+    "toID": "1015"
+   },
+   {
+    "fromID": "1015",
+    "toID": "1012"
+   },
+   {
+    "fromID": "1016",
+    "toID": "1017"
+   },
+   {
+    "fromID": "1017",
+    "toID": "1018"
+   },
+   {
+    "fromID": "1012",
+    "toID": "1019"
+   },
+   {
+    "fromID": "1019",
+    "toID": "1016"
+   },
+   {
+    "fromID": "1020",
+    "toID": "1021"
+   },
+   {
+    "fromID": "1021",
+    "toID": "1022"
+   },
+   {
+    "fromID": "1016",
+    "toID": "1023"
+   },
+   {
+    "fromID": "1023",
+    "toID": "1020"
+   },
+   {
+    "fromID": "1006",
+    "toID": "1024"
+   },
+   {
+    "fromID": "1010",
+    "toID": "1024"
+   },
+   {
+    "fromID": "1024",
+    "toID": "1003"
+   },
+   {
+    "fromID": "1014",
+    "toID": "1025"
+   },
+   {
+    "fromID": "1025",
+    "toID": "1003"
+   },
+   {
+    "fromID": "1018",
+    "toID": "1026"
+   },
+   {
+    "fromID": "1026",
+    "toID": "1014"
+   },
+   {
+    "fromID": "9999",
+    "toID": "1003"
+   }
+  ]
+ },
+ "graph_source": "fixture",
+ "text_source": "episode-excerpt",
+ "text_located": 6,
+ "text_locutions": 6
+}
