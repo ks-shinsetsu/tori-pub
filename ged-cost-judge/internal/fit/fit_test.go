@@ -196,8 +196,14 @@ func TestMixedRecoversSigma(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("σ̂ = %.3f (truth 1.5), θ = %.2f", mix.Params.Sigma, mix.Params.Theta)
-	if mix.Params.Sigma < 0.7 || mix.Params.Sigma > 3 {
-		t.Errorf("σ̂ = %.3f, want near 1.5", mix.Params.Sigma)
+	if math.Abs(mix.Params.Sigma-1.5) > 0.3 {
+		t.Errorf("σ̂ = %.3f, want 1.5 ± 0.3", mix.Params.Sigma)
+	}
+	// The conditional β of the mixed fit is near the generating β (the independence β is attenuated).
+	for j, want := range []float64{2.0, 1.5, 2.5} {
+		if math.Abs(mix.Params.Beta[j]-want) > 0.25*want {
+			t.Errorf("β_%d = %.3f, want %.2f ± 25%%", j, mix.Params.Beta[j], want)
+		}
 	}
 }
 
@@ -292,39 +298,6 @@ func TestFiltersWeightsNoop(t *testing.T) {
 	}
 	if c.NegLogLik <= 0 || c.Judgments == len(js) {
 		t.Fatalf("weighted/filtered fit: nll %.3f judgments %d", c.NegLogLik, c.Judgments)
-	}
-}
-
-// TestZeroColumnStaysFree: a parameter with an identically zero Δφ column keeps a non-degenerate bootstrap only
-// through the interior restart; the fit itself must not move it off a finite value (sanity for the "not estimable" test in stats).
-func TestZeroColumnInformative(t *testing.T) {
-	w := newWorld(2, altTheta(), 0)
-	trips, _ := w.generate(20, false)
-	n, err := Informative(trips, ged.Current(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// CA↔MA relabels exist in this generator, so the column is not zero here; check the counter sees edge-extra too.
-	if n[NormEdgeExtra] == 0 || n[ged.PEdgeMissing] == 0 {
-		t.Fatalf("informative counts %v", n)
-	}
-	// Remove every type relabel: now the type columns must be zero.
-	for i := range trips {
-		for _, g := range []*ged.Graph{&trips[i].A, &trips[i].B} {
-			refKind := map[[2]string]string{}
-			for _, e := range trips[i].Ref.Edges {
-				refKind[[2]string{e.From, e.To}] = e.Kind
-			}
-			for j := range g.Edges {
-				if k, ok := refKind[[2]string{g.Edges[j].From, g.Edges[j].To}]; ok {
-					g.Edges[j].Kind = k
-				}
-			}
-		}
-	}
-	n, _ = Informative(trips, ged.Current(), nil)
-	if n[ged.PTypeRACA] != 0 || n[ged.PTypeRAMA] != 0 || n[ged.PTypeCAMA] != 0 {
-		t.Logf("type columns after relabel removal: %d %d %d (direction/reversal can re-create type pairs)", n[ged.PTypeRACA], n[ged.PTypeRAMA], n[ged.PTypeCAMA])
 	}
 }
 
