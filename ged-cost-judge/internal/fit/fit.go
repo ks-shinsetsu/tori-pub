@@ -146,6 +146,9 @@ type Params struct {
 	Beta     []float64
 	Tau      []float64
 	Pi       []float64
+	// Lapse is the per-judge random-answer rate ℓ_j of the lapse mixture P'(y) = (1 − ℓ_j)·P(y) + ℓ_j/3
+	// (decisions §2 as revised 2026-10-29; nil or 0 means no lapses).
+	Lapse []float64
 	// Gamma is the coefficient of Δcoh (0 unless Options.Gamma is on).
 	Gamma float64
 	// Sigma is the random-intercept SD (0 for the working-independence fit).
@@ -225,6 +228,8 @@ type Options struct {
 	Quadrature int
 	// Sigma0 is the initial random-intercept SD for FitMixed (0 → 1).
 	Sigma0 float64
+	// NoLapse fixes every ℓ_j at 0 (the pre-2026-10-29 model; a recorded deviation in Confirmatory).
+	NoLapse bool
 }
 
 // TypeTie is the pre-registered tie of the three type-mismatch costs to the RA↔MA cost (decisions §12b).
@@ -463,13 +468,14 @@ func (d diff) value(th ged.Theta) float64 {
 // Variable vector layout: θ[11] (direct, bounded), neg, log β[J], log τ[J], π[J], γ, log σ.
 type layout struct{ j int }
 
-func (l layout) size() int      { return ged.NumParams + 1 + 3*l.j + 2 }
-func (l layout) neg() int       { return ged.NumParams }
-func (l layout) beta(j int) int { return ged.NumParams + 1 + j }
-func (l layout) tau(j int) int  { return ged.NumParams + 1 + l.j + j }
-func (l layout) pi(j int) int   { return ged.NumParams + 1 + 2*l.j + j }
-func (l layout) gamma() int     { return ged.NumParams + 1 + 3*l.j }
-func (l layout) logSigma() int  { return ged.NumParams + 1 + 3*l.j + 1 }
+func (l layout) size() int       { return ged.NumParams + 1 + 4*l.j + 2 }
+func (l layout) neg() int        { return ged.NumParams }
+func (l layout) beta(j int) int  { return ged.NumParams + 1 + j }
+func (l layout) tau(j int) int   { return ged.NumParams + 1 + l.j + j }
+func (l layout) pi(j int) int    { return ged.NumParams + 1 + 2*l.j + j }
+func (l layout) lapse(j int) int { return ged.NumParams + 1 + 3*l.j + j }
+func (l layout) gamma() int      { return ged.NumParams + 1 + 4*l.j }
+func (l layout) logSigma() int   { return ged.NumParams + 1 + 4*l.j + 1 }
 
 func sigmoid(x float64) float64 { return 1 / (1 + math.Exp(-x)) }
 
@@ -480,6 +486,23 @@ func logSigmoid(x float64) float64 {
 	}
 	return -math.Log1p(math.Exp(-x))
 }
+
+// broadStep is the largest trapezoid spacing of the adaptive quadrature at nq = 20 (logit units); minStep its floor.
+const (
+	broadStep   = 0.6
+	minStep     = 0.1
+	pruneMargin = 40.0
+)
+
+// LapseMax / LapseMin bound a judge's random-answer rate (ℓ is optimised on the logit scale, so the lower bound is
+// a floor rather than an active constraint); LapseInit is the starting value.
+const (
+	LapseMax  = 0.5
+	LapseMin  = 1e-4
+	LapseInit = 0.05
+)
+
+func logit(p float64) float64 { return math.Log(p / (1 - p)) }
 
 const (
 	logBetaMin, logBetaMax   = -7.0, 7.0
@@ -500,6 +523,11 @@ func (l layout) pack(p Params, mixed bool) []float64 {
 		x[l.beta(j)] = math.Log(math.Max(p.Beta[j], 1e-3))
 		x[l.tau(j)] = math.Log(math.Max(p.Tau[j], 1e-3))
 		x[l.pi(j)] = p.Pi[j]
+		if j < len(p.Lapse) {
+			x[l.lapse(j)] = logit(clampTo(p.Lapse[j], LapseMin, LapseMax))
+		} else {
+			x[l.lapse(j)] = logit(LapseMin)
+		}
 	}
 	x[l.gamma()] = p.Gamma
 	if mixed {
@@ -509,7 +537,7 @@ func (l layout) pack(p Params, mixed bool) []float64 {
 }
 
 func (l layout) unpack(x []float64, tie map[int]int, mixed bool) Params {
-	p := Params{Beta: make([]float64, l.j), Tau: make([]float64, l.j), Pi: make([]float64, l.j)}
+	p := Params{Beta: make([]float64, l.j), Tau: make([]float64, l.j), Pi: make([]float64, l.j), Lapse: make([]float64, l.j)}
 	for i := range ged.NumParams {
 		p.Theta[i] = x[i]
 	}
@@ -521,6 +549,7 @@ func (l layout) unpack(x []float64, tie map[int]int, mixed bool) Params {
 		p.Beta[j] = math.Exp(x[l.beta(j)])
 		p.Tau[j] = math.Exp(x[l.tau(j)])
 		p.Pi[j] = x[l.pi(j)]
+		p.Lapse[j] = sigmoid(x[l.lapse(j)])
 	}
 	p.Gamma = x[l.gamma()]
 	if mixed {
@@ -554,6 +583,11 @@ func (l layout) bounds(opts Options, p Params, mixed bool) (lo, hi []float64) {
 		lo[l.beta(j)], hi[l.beta(j)] = logBetaMin, logBetaMax
 		lo[l.tau(j)], hi[l.tau(j)] = logTauMin, logTauMax
 		lo[l.pi(j)], hi[l.pi(j)] = -piBound, piBound
+		if opts.NoLapse {
+			lo[l.lapse(j)], hi[l.lapse(j)] = logit(LapseMin), logit(LapseMin)
+		} else {
+			lo[l.lapse(j)], hi[l.lapse(j)] = logit(LapseMin), logit(LapseMax)
+		}
 	}
 	switch opts.Gamma {
 	case GammaFree:
@@ -590,6 +624,32 @@ func answerLogLik(y Answer, z, tau float64) (ll, dz, dtau float64) {
 		}
 		return math.Log(pt), (-a*(1-a) + b*(1-b)) / pt, (a*(1-a) + b*(1-b)) / pt
 	}
+}
+
+// mixLogLik is the log-likelihood of one judgment under the lapse mixture P' = (1 − ℓ)·P(y) + ℓ/3 and its
+// derivatives with respect to z, τ and ℓ.
+func mixLogLik(y Answer, z, tau, lapse float64) (ll, dz, dtau, dl float64) {
+	ll0, dz0, dtau0 := answerLogLik(y, z, tau)
+	if lapse <= 0 {
+		return ll0, dz0, dtau0, 1/3.0/math.Exp(ll0) - 1
+	}
+	p := math.Exp(ll0)
+	pm := (1-lapse)*p + lapse/3
+	a := (1 - lapse) * p / pm
+	return math.Log(pm), a * dz0, a * dtau0, (1/3.0 - p) / pm
+}
+
+// mixCurvature is d²/dz² of the mixture log-likelihood.
+func mixCurvature(y Answer, z, tau, lapse float64) float64 {
+	ll0, dz0, _ := answerLogLik(y, z, tau)
+	d20 := answerCurvature(y, z, tau)
+	if lapse <= 0 {
+		return d20
+	}
+	p := math.Exp(ll0)
+	pm := (1-lapse)*p + lapse/3
+	a := (1 - lapse) * p
+	return (a*(dz0*dz0+d20)*pm - (a*dz0)*(a*dz0)) / (pm * pm)
 }
 
 // answerCurvature is d²/dz² of the log-likelihood of one judgment (used to centre the adaptive quadrature).
@@ -639,11 +699,17 @@ type objective struct {
 	mixed  bool
 	ghX    []float64
 	ghLogW []float64
-	// Adaptive Gauss–Hermite (Liu & Pierce 1994): per-triplet centre û_t and scale s_t of the integrand in u,
-	// computed once per outer round at the round's starting parameters and held fixed inside the inner optimizer,
-	// so the inner objective is smooth with exact gradients (review-fit-impl M3).
-	center, scale []float64
-	nllRaw        float64
+	// Adaptive quadrature (review-fit-impl M3, N12): per triplet, a trapezoid rule on the integrand
+	// Π_k P'(y_k | z_k + u)·φ(u; σ) over [−7σ, 7σ] ∪ [û_t − 8 s_t, û_t + 8 s_t] with spacing min(broadStep·20/nq, s_t, σ/3),
+	// where û_t and s_t are the mode and curvature scale of the log-integrand (Liu & Pierce 1994). The trapezoid rule converges exponentially on smooth integrands with Gaussian tails, resolves the
+	// logistic-scale structure of contradictory judgments and the broad prior-shaped plateau that the lapse mixture's
+	// floor ℓ/3 produces (which mode-centred Gauss–Hermite nodes, spaced ≈ σ apart, cannot), and the spacing bound s_t
+	// resolves a narrow posterior. nodes[t][q] is the node and logc[t][q] = log(spacing): the integrand's own
+	// log φ(u; σ) and Σ_k log P(y_k | z_k + u) are added in eval, so σ keeps an exact gradient. The nodes are computed
+	// once per outer round at the round's starting parameters and held fixed inside the inner optimizer, so the inner
+	// objective is smooth with exact gradients. nq (Options.Quadrature) is a resolution knob: 20 → spacing ≤ 0.6.
+	nodes, logc [][]float64
+	nllRaw      float64
 }
 
 func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Options, ridge float64, mixed bool, at Params) *objective {
@@ -667,12 +733,7 @@ func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Opti
 		if nq <= 0 {
 			nq = 20
 		}
-		x, w := ghRule(nq)
-		o.ghX = x
-		o.ghLogW = make([]float64, nq)
-		for q := range w {
-			o.ghLogW[q] = math.Log(w[q]) + x[q]*x[q] // e^{x²} undoes the Hermite weight; the Gaussian prior is applied explicitly
-		}
+		o.ghX = make([]float64, nq) // only the length (the resolution knob) is used by recenter
 		o.recenter(at)
 	}
 	return o
@@ -683,10 +744,34 @@ func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Opti
 // probabilities are log-concave in z).
 func (o *objective) recenter(p Params) {
 	n := len(o.byTrip)
-	o.center, o.scale = make([]float64, n), make([]float64, n)
+	o.nodes, o.logc = make([][]float64, n), make([][]float64, n)
 	sigma := math.Max(p.Sigma, 1e-8)
+	nq := len(o.ghX)
+	build := func(t int, center, scale float64, logf func(u float64) float64) {
+		// Support: the prior confines u to ±7σ (L ≤ 1), and the mode ± 8 s_t covers a likelihood-pulled posterior;
+		// spacing: the logistic scale (broadStep at nq = 20), the posterior scale and the prior scale. Nodes whose
+		// log-integrand at the round's start parameters lies more than pruneMargin below the maximum are dropped
+		// (their total weight is < e^{−pruneMargin}·n; the inner optimizer moves the integrand little, and every
+		// outer round rebuilds the nodes).
+		step := math.Min(math.Min(broadStep*20/float64(nq), math.Max(scale, minStep)), sigma/3)
+		lo := math.Min(-7*sigma, center-8*scale)
+		hi := math.Max(7*sigma, center+8*scale)
+		n := int(math.Ceil((hi-lo)/step)) + 1
+		vals := make([]float64, n)
+		best := math.Inf(-1)
+		for i := range n {
+			vals[i] = logf(lo + float64(i)*step)
+			best = math.Max(best, vals[i])
+		}
+		o.nodes[t], o.logc[t] = make([]float64, 0, n), make([]float64, 0, n)
+		for i := range n {
+			if vals[i] >= best-pruneMargin {
+				o.nodes[t] = append(o.nodes[t], lo+float64(i)*step)
+				o.logc[t] = append(o.logc[t], math.Log(step))
+			}
+		}
+	}
 	for t, ks := range o.byTrip {
-		o.scale[t] = sigma
 		if len(ks) == 0 {
 			continue
 		}
@@ -700,10 +785,10 @@ func (o *objective) recenter(p Params) {
 			val, d1, d2 = -u*u/(2*sigma*sigma), -u/(sigma*sigma), -1/(sigma*sigma)
 			for i, ki := range ks {
 				k := o.js[ki]
-				ll, dz, _ := answerLogLik(k.Answer, base[i]+u, p.Tau[k.Judge])
+				ll, dz, _, _ := mixLogLik(k.Answer, base[i]+u, p.Tau[k.Judge], p.Lapse[k.Judge])
 				val += ll
 				d1 += dz
-				d2 += answerCurvature(k.Answer, base[i]+u, p.Tau[k.Judge])
+				d2 += mixCurvature(k.Answer, base[i]+u, p.Tau[k.Judge], p.Lapse[k.Judge])
 			}
 			return val, d1, d2
 		}
@@ -720,8 +805,7 @@ func (o *objective) recenter(p Params) {
 				step /= 2
 			}
 		}
-		o.center[t] = u
-		o.scale[t] = 1 / math.Sqrt(math.Max(-d2, 1/(sigma*sigma)))
+		build(t, u, 1/math.Sqrt(math.Max(-d2, 1/(sigma*sigma))), func(u float64) float64 { v, _, _ := g(u); return v })
 	}
 }
 
@@ -742,7 +826,7 @@ func (o *objective) delta(t int, p Params) float64 {
 }
 
 // accum adds the gradient contribution of one judgment given dz, dtau (derivatives of its log-likelihood), scaled by w.
-func (o *objective) accum(g []float64, k Judgment, p Params, D, dz, dtau, w float64) {
+func (o *objective) accum(g []float64, k Judgment, p Params, D, dz, dtau, dl, w float64) {
 	l := o.l
 	j := k.Judge
 	t := k.Triplet
@@ -753,6 +837,7 @@ func (o *objective) accum(g []float64, k Judgment, p Params, D, dz, dtau, w floa
 	g[l.beta(j)] -= w * dz * D * p.Beta[j] // d/d log β
 	g[l.tau(j)] -= w * dtau * p.Tau[j]     // d/d log τ
 	g[l.pi(j)] -= w * dz * k.Order
+	g[l.lapse(j)] -= w * dl * p.Lapse[j] * (1 - p.Lapse[j]) // d/d logit ℓ
 	g[l.gamma()] -= w * dz * o.trips[t].DeltaCoh()
 }
 
@@ -770,40 +855,45 @@ func (o *objective) eval(x, grad []float64) float64 {
 			D := o.delta(t, p)
 			j := k.Judge
 			z := p.Beta[j]*D + p.Pi[j]*k.Order + p.Gamma*o.trips[t].DeltaCoh()
-			ll, dz, dtau := answerLogLik(k.Answer, z, p.Tau[j])
+			ll, dz, dtau, dl := mixLogLik(k.Answer, z, p.Tau[j], p.Lapse[j])
 			nll -= w * ll
 			if grad != nil {
-				o.accum(grad, k, p, D, dz, dtau, w)
+				o.accum(grad, k, p, D, dz, dtau, dl, w)
 			}
 		}
 	} else {
-		nq := len(o.ghX)
-		llq := make([]float64, nq)
-		dzq := make([][]float64, nq)
-		dtq := make([][]float64, nq)
+		var llq []float64
+		var dzq, dtq, dlq [][]float64
 		for t, ks := range o.byTrip {
 			if len(ks) == 0 {
 				continue
 			}
+			nq := len(o.nodes[t])
+			if cap(llq) < nq {
+				llq = make([]float64, nq)
+				dzq, dtq, dlq = make([][]float64, nq), make([][]float64, nq), make([][]float64, nq)
+			}
+			llq, dzq, dtq, dlq = llq[:nq], dzq[:nq], dtq[:nq], dlq[:nq]
 			w := o.weight(t)
 			D := o.delta(t, p)
 			sig2 := p.Sigma * p.Sigma
-			logPrior := -math.Log(p.Sigma) - 0.5*math.Log(2*math.Pi) + math.Log(math.Sqrt2*o.scale[t])
+			logPrior := -math.Log(p.Sigma) - 0.5*math.Log(2*math.Pi)
 			for q := range nq {
-				u := o.center[t] + math.Sqrt2*o.scale[t]*o.ghX[q]
-				s := o.ghLogW[q] + logPrior - u*u/(2*sig2)
+				u := o.nodes[t][q]
+				s := o.logc[t][q] + logPrior - u*u/(2*sig2)
 				if grad != nil {
 					dzq[q] = make([]float64, len(ks))
 					dtq[q] = make([]float64, len(ks))
+					dlq[q] = make([]float64, len(ks))
 				}
 				for i, ki := range ks {
 					k := o.js[ki]
 					j := k.Judge
 					z := p.Beta[j]*D + p.Pi[j]*k.Order + p.Gamma*o.trips[t].DeltaCoh() + u
-					ll, dz, dtau := answerLogLik(k.Answer, z, p.Tau[j])
+					ll, dz, dtau, dl := mixLogLik(k.Answer, z, p.Tau[j], p.Lapse[j])
 					s += ll
 					if grad != nil {
-						dzq[q][i], dtq[q][i] = dz, dtau
+						dzq[q][i], dtq[q][i], dlq[q][i] = dz, dtau, dl
 					}
 				}
 				llq[q] = s
@@ -818,10 +908,10 @@ func (o *objective) eval(x, grad []float64) float64 {
 				if r < 1e-300 {
 					continue
 				}
-				u := o.center[t] + math.Sqrt2*o.scale[t]*o.ghX[q]
+				u := o.nodes[t][q]
 				for i, ki := range ks {
 					k := o.js[ki]
-					o.accum(grad, k, p, D, dzq[q][i], dtq[q][i], w*r)
+					o.accum(grad, k, p, D, dzq[q][i], dtq[q][i], dlq[q][i], w*r)
 				}
 				// The nodes are fixed; σ enters only through the prior density: d/dlogσ log φ(u; σ) = u²/σ² − 1.
 				grad[l.logSigma()] -= w * r * (u*u/sig2 - 1)
@@ -848,11 +938,12 @@ func (o *objective) eval(x, grad []float64) float64 {
 	}
 	for j := range l.j {
 		lb, lt := x[l.beta(j)], x[l.tau(j)]
-		f += o.ridge * (lb*lb + lt*lt + p.Pi[j]*p.Pi[j])
+		f += o.ridge * (lb*lb + lt*lt + p.Pi[j]*p.Pi[j] + p.Lapse[j]*p.Lapse[j])
 		if grad != nil {
 			grad[l.beta(j)] += 2 * o.ridge * lb
 			grad[l.tau(j)] += 2 * o.ridge * lt
 			grad[l.pi(j)] += 2 * o.ridge * p.Pi[j]
+			grad[l.lapse(j)] += 2 * o.ridge * p.Lapse[j] * p.Lapse[j] * (1 - p.Lapse[j])
 		}
 	}
 	if grad != nil {
@@ -866,6 +957,11 @@ func (o *objective) eval(x, grad []float64) float64 {
 		}
 		if o.opts.Gamma != GammaFree {
 			grad[l.gamma()] = 0
+		}
+		if o.opts.NoLapse {
+			for j := range l.j {
+				grad[l.lapse(j)] = 0
+			}
 		}
 		if !o.mixed {
 			grad[l.logSigma()] = 0
@@ -893,9 +989,12 @@ func logSumExp(v []float64) float64 {
 
 // Init returns the initial values (θ = Theta0, β = 1, τ = 0.5, π = 0, γ = GammaValue if fixed, σ = Sigma0).
 func Init(opts Options) Params {
-	p := Params{Theta: opts.Theta0, Beta: make([]float64, opts.Judges), Tau: make([]float64, opts.Judges), Pi: make([]float64, opts.Judges)}
+	p := Params{Theta: opts.Theta0, Beta: make([]float64, opts.Judges), Tau: make([]float64, opts.Judges), Pi: make([]float64, opts.Judges), Lapse: make([]float64, opts.Judges)}
 	for j := range opts.Judges {
-		p.Beta[j], p.Tau[j] = 1, 0.5
+		p.Beta[j], p.Tau[j], p.Lapse[j] = 1, 0.5, LapseInit
+		if opts.NoLapse {
+			p.Lapse[j] = LapseMin
+		}
 	}
 	if opts.Gamma == GammaFixed {
 		p.Gamma = opts.GammaValue
@@ -1034,6 +1133,17 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 	case GammaFixed:
 		p.Gamma = opts.GammaValue
 	}
+	if len(p.Lapse) != opts.Judges {
+		p.Lapse = make([]float64, opts.Judges)
+		for j := range p.Lapse {
+			p.Lapse[j] = LapseInit
+		}
+	}
+	if opts.NoLapse {
+		for j := range p.Lapse {
+			p.Lapse[j] = LapseMin
+		}
+	}
 	if mixed && p.Sigma <= 0 {
 		p.Sigma = opts.Sigma0
 		if p.Sigma <= 0 {
@@ -1136,11 +1246,23 @@ func clone(p Params) Params {
 	q.Beta = append([]float64(nil), p.Beta...)
 	q.Tau = append([]float64(nil), p.Tau...)
 	q.Pi = append([]float64(nil), p.Pi...)
+	q.Lapse = append([]float64(nil), p.Lapse...)
 	return q
 }
 
 // Clone returns a deep copy of p.
 func (p Params) Clone() Params { return clone(p) }
+
+// lapse returns ℓ_j (0 when Lapse is unset).
+func (p Params) lapse(j int) float64 {
+	if j < len(p.Lapse) {
+		return p.Lapse[j]
+	}
+	return 0
+}
+
+// LapseOf is the exported form of lapse.
+func (p Params) LapseOf(j int) float64 { return p.lapse(j) }
 
 // NegLogLik is the negative log-likelihood at the given parameters (no penalty; matching solved at p.Theta;
 // working independence; no filters or weights).
@@ -1166,7 +1288,7 @@ func LogLik(trips []Triplet, js []Judgment, p Params) ([]float64, error) {
 	for i, k := range js {
 		D := ds[k.Triplet].value(p.Theta) + p.ThetaNeg*trips[k.Triplet].NegDiff
 		z := p.Beta[k.Judge]*D + p.Pi[k.Judge]*k.Order + p.Gamma*trips[k.Triplet].DeltaCoh()
-		ll, _, _ := answerLogLik(k.Answer, z, p.Tau[k.Judge])
+		ll, _, _, _ := mixLogLik(k.Answer, z, p.Tau[k.Judge], p.lapse(k.Judge))
 		out[i] = ll
 	}
 	return out, nil

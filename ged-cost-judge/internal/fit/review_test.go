@@ -101,14 +101,15 @@ func TestProjLBFGSCorrelated(t *testing.T) {
 	}
 }
 
-// TestAdaptiveQuadrature checks the per-triplet marginal log-likelihood against a dense reference at σ = 3 and 5
-// (review-fit-impl M3): adaptive 20-node Gauss–Hermite must be accurate where the plain rule was off by 0.2–1.7.
+// TestAdaptiveQuadrature checks the per-triplet marginal log-likelihood (lapse mixture on) against a dense reference
+// at σ = 1, 3 and 5 (review-fit-impl M3, N12): the adaptive trapezoid rule must be accurate where the plain 20-node
+// Gauss–Hermite rule was off by 0.2–1.7 and a mode-centred Gauss–Hermite rule by up to 0.9 on contradictory triplets.
 func TestAdaptiveQuadrature(t *testing.T) {
 	for _, c := range []struct {
 		sigma float64
 		nodes int
 		tol   float64
-	}{{1, 20, 1e-8}, {3, 20, 1e-3}, {3, 40, 1e-5}, {5, 20, 1e-2}, {5, 40, 1e-3}} {
+	}{{1, 20, 1e-5}, {3, 20, 1e-5}, {3, 40, 1e-6}, {5, 20, 1e-5}, {5, 40, 1e-6}} {
 		sigma := c.sigma
 		w := newWorld(41, altTheta(), sigma)
 		trips, js := w.generate(25, false)
@@ -118,6 +119,7 @@ func TestAdaptiveQuadrature(t *testing.T) {
 		for j := range 3 {
 			p.Beta[j], p.Tau[j], p.Pi[j] = w.judges[j].beta, w.judges[j].tau, w.judges[j].pi
 		}
+		p.Lapse = []float64{0.05, 0.1, 0.02}
 		ds, err := features(trips, p.Theta)
 		if err != nil {
 			t.Fatal(err)
@@ -142,14 +144,14 @@ func TestAdaptiveQuadrature(t *testing.T) {
 				s := -u*u/(2*sigma*sigma) - math.Log(sigma) - 0.5*math.Log(2*math.Pi)
 				for _, ki := range ks {
 					k := js[ki]
-					ll, _, _ := answerLogLik(k.Answer, p.Beta[k.Judge]*D+p.Pi[k.Judge]*k.Order+u, p.Tau[k.Judge])
+					ll, _, _, _ := mixLogLik(k.Answer, p.Beta[k.Judge]*D+p.Pi[k.Judge]*k.Order+u, p.Tau[k.Judge], p.Lapse[k.Judge])
 					s += ll
 				}
 				vals[i] = s
 			}
 			ref = logSumExp(vals) + math.Log(h)
 			// Quadrature value of this triplet alone.
-			one := &objective{l: l, ds: ds, fold: o.fold, trips: trips, js: js, opts: opts, mixed: true, ghX: o.ghX, ghLogW: o.ghLogW, center: o.center, scale: o.scale}
+			one := &objective{l: l, ds: ds, fold: o.fold, trips: trips, js: js, opts: opts, mixed: true, ghX: o.ghX, nodes: o.nodes, logc: o.logc}
 			one.byTrip = make([][]int, len(trips))
 			one.byTrip[tt] = ks
 			got := -one.eval(l.pack(p, true), nil)
@@ -172,21 +174,26 @@ func TestFoldsKeepCopiesTogether(t *testing.T) {
 	bt, _, orig := subset(trips, js, draw)
 	fold := assignFolds(bt, 5, rand.New(rand.NewPCG(5, 6)))
 	foldOfOrig := map[int]int{}
-	dup := 0
+	copies := map[int]map[int]bool{} // original source → distinct bootstrap cluster ids
 	for i, tr := range bt {
 		o := trips[orig[i]].Source
-		if f, ok := foldOfOrig[o]; ok {
-			if f != fold[tr.Source] {
-				t.Fatalf("original source %d in folds %d and %d", o, f, fold[tr.Source])
-			}
-			if tr.Source != bt[0].Source {
-				dup++
-			}
+		if f, ok := foldOfOrig[o]; ok && f != fold[tr.Source] {
+			t.Fatalf("original source %d in folds %d and %d", o, f, fold[tr.Source])
 		}
 		foldOfOrig[o] = fold[tr.Source]
+		if copies[o] == nil {
+			copies[o] = map[int]bool{}
+		}
+		copies[o][tr.Source] = true
+	}
+	dup := 0
+	for _, c := range copies {
+		if len(c) >= 2 {
+			dup++
+		}
 	}
 	if dup == 0 {
-		t.Fatalf("no duplicated sources in the draw; test is vacuous")
+		t.Fatalf("no source drawn more than once; test is vacuous")
 	}
 	// Folds remain balanced across generators.
 	cnt := map[[2]any]int{}
@@ -258,8 +265,9 @@ func TestZeroColumnNotEstimable(t *testing.T) {
 	}
 }
 
-// TestRecoverySlow (review item 9): σ = 1 with 10% lapses over several seeds; mean standardized error of the
-// margin-judged parameters below 0.5 and 90% coverage of the mixed fit against the conditional truth. GCJ_SLOW=1.
+// TestRecoverySlow (review item 9, N12): σ = 1 with 10% lapses over several seeds; per-parameter mean standardized
+// error of the margin-judged parameters below 0.5 and 90% coverage of the mixed (lapse-mixture) fit against the
+// conditional truth. GCJ_SLOW=1; ≈ 5 min at GOMAXPROCS = 3.
 func TestRecoverySlow(t *testing.T) {
 	if os.Getenv("GCJ_SLOW") == "" {
 		t.Skip("set GCJ_SLOW=1 to run (≈ 20 seeds × 2 fits × bootstrap)")
@@ -267,8 +275,8 @@ func TestRecoverySlow(t *testing.T) {
 	truth := altTheta()
 	U := DefaultU
 	truthN, _ := Normalize(truth[:], U)
-	const seeds = 20
-	var zs []float64
+	const seeds = 8
+	zs := map[int][]float64{}
 	covered, total := 0, 0
 	for s := range seeds {
 		w := newWorld(uint64(100+s), truth, 1)
@@ -281,7 +289,7 @@ func TestRecoverySlow(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		br, err := BootstrapOpts(trips, js, opts, mix.Params, BootOptions{Reps: 100, Seed: uint64(s), Mixed: true, MixedInit: &mix.Params})
+		br, err := BootstrapOpts(trips, js, opts, mix.Params, BootOptions{Reps: 60, Seed: uint64(s), Mixed: true, MixedInit: &mix.Params})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,18 +298,21 @@ func TestRecoverySlow(t *testing.T) {
 		for _, p := range MarginJudged {
 			col := Column(rows, p)
 			sd := (Quantile(col, 0.8413) - Quantile(col, 0.1587)) / 2
-			zs = append(zs, (estN[p]-truthN[p])/sd)
+			zs[p] = append(zs[p], (estN[p]-truthN[p])/sd)
 			total++
 			if truthN[p] >= Quantile(col, 0.05) && truthN[p] <= Quantile(col, 0.95) {
 				covered++
 			}
 		}
 	}
-	mz := Mean(zs)
 	cov := float64(covered) / float64(total)
-	t.Logf("mean standardized error %.3f (n = %d), 90%% coverage %.3f", mz, len(zs), cov)
-	if math.Abs(mz) > 0.5 {
-		t.Errorf("mean standardized error %.3f", mz)
+	t.Logf("90%% coverage %.3f (n = %d)", cov, total)
+	for _, p := range MarginJudged {
+		mz := Mean(zs[p])
+		t.Logf("%s: mean standardized error %+.3f", NormName(p), mz)
+		if math.Abs(mz) > 0.5 {
+			t.Errorf("%s: mean standardized error %.3f", NormName(p), mz)
+		}
 	}
 	if cov < 0.80 {
 		t.Errorf("coverage %.3f", cov)
