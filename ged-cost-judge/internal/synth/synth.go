@@ -474,6 +474,11 @@ func describe(e perturb.Edit) string {
 	case perturb.RType:
 		return fmt.Sprintf("Change the relation \"%s %s %s\" so that %s now %s %s, keeping what each proposition claims as far as possible.",
 			short(e.Edge.From), verbs[e.Edge.Kind], short(e.Edge.To), short(e.Edge.From), verbs[e.NewKind], short(e.Edge.To))
+	case perturb.RTypeCA:
+		// The diagnostic CA-involving relabel (dataset-spec §2.1–§2.2); only the v3 realizer is given it.
+		// New case, so the v1 wording (and cache keys) of the other kinds is unchanged.
+		return fmt.Sprintf("Change the relation \"%s %s %s\" so that %s now %s %s, keeping the wording of both propositions.",
+			short(e.Edge.From), verbs[e.Edge.Kind], short(e.Edge.To), short(e.Edge.From), verbs[e.NewKind], short(e.Edge.To))
 	case perturb.RRev:
 		return fmt.Sprintf("Reverse the relation \"%s %s %s\" so that %s now %s %s.",
 			short(e.Edge.From), verbs[e.Edge.Kind], short(e.Edge.To), short(e.Edge.To), verbs[e.Edge.Kind], short(e.Edge.From))
@@ -575,9 +580,10 @@ func ParseJudgeAnswer(resp *llm.Response) (string, error) {
 	if resp == nil {
 		return "", errors.New("synth: no judge response")
 	}
-	var out judgeOut
-	if err := json.Unmarshal([]byte(resp.Text), &out); err != nil {
-		return "", fmt.Errorf("synth: judge answer: %w (text=%.200q)", err, resp.Text)
+	// DecodeJSON reports a refusal as llm.ErrRefusal and a truncation as llm.ErrTruncated (never as a tie).
+	out, err := llm.DecodeJSON[judgeOut](resp)
+	if err != nil {
+		return "", fmt.Errorf("synth: judge answer: %w", err)
 	}
 	switch out.Answer {
 	case "1", "2", "same":

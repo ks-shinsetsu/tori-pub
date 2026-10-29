@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/llm"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/perturb"
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/stats"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/synth"
 )
 
@@ -55,6 +57,15 @@ type pilotOptions struct {
 	// withQT30 adds <out>/qt30_sources.json (from -import-qt30) as transfer-set sources.
 	withQT30 bool
 	aifdb    string
+	// diagShare overrides the share of T3 slots in the t3_diag sub-stratum (0 → the dataset-spec §2.2 default
+	// 0.10); not a flag, set by the offline tests so that the sub-stratum is exercised.
+	diagShare float64
+	// dReps overrides the nested-D replicates of the confirmatory analysis (0 → fit's pre-registered 200); not a
+	// flag, set by the offline tests.
+	dReps int
+	// keepJudges keeps judges that fail the mechanical QC in the confirmatory fit (fit.ConfirmOptions.SkipExclusions);
+	// not a flag: the offline tests have too few gate triplets for any judge to pass §9.1.
+	keepJudges bool
 }
 
 // Defaults of the revised pipeline (dataset-spec §4.1, plan §5.1).
@@ -107,6 +118,9 @@ type meter struct {
 	// byModel[tag][returned model] and modelCalls[tag][model] are the per-model totals (cost projection).
 	byModel    map[string]map[string]llm.Usage
 	modelCalls map[string]map[string]int
+	// reserved is the projected cost of submitted batches not yet metered; check and remaining count it as spent,
+	// so concurrent request-by-request calls cannot spend it (review-synth-impl M5).
+	reserved float64
 }
 
 func newMeter(limit float64) *meter {
@@ -149,10 +163,31 @@ func (m *meter) total() float64 {
 	return t
 }
 
-func (m *meter) remaining() float64 { return m.limit - m.total() }
+func (m *meter) remaining() float64 { return m.limit - m.total() - m.pending() }
 
+func (m *meter) pending() float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.reserved
+}
+
+// reserve holds x (a batch projection) against the budget until release.
+func (m *meter) reserve(x float64) {
+	m.mu.Lock()
+	m.reserved += x
+	m.mu.Unlock()
+}
+
+// release drops a reservation once the batch's responses are metered.
+func (m *meter) release(x float64) {
+	m.mu.Lock()
+	m.reserved = math.Max(0, m.reserved-x)
+	m.mu.Unlock()
+}
+
+// check fails once the metered cost plus the reserved batch projections reach the limit (-budget 0: no calls).
 func (m *meter) check() error {
-	if m.total() >= m.limit {
+	if m.total()+m.pending() >= m.limit {
 		return errBudget
 	}
 	return nil
@@ -217,38 +252,47 @@ type pilotTriplet struct {
 	CheckA     variantCheck `json:"check_a,omitzero"`
 	CheckB     variantCheck `json:"check_b,omitzero"`
 
-	// v2 (dataset-spec §6). TODO(integration): fit.Triplet gains Type, Flags, Generator, VerifierFamily,
-	// ExemplarPair, Domain, Weight, CohA, CohB, T1Delta0 — copy them from here in toFitTriplet.
-	ID              string           `json:"id,omitempty"`
-	SourceID        string           `json:"source_id,omitempty"`
-	Seed            uint64           `json:"seed,omitempty"`
-	Generator       string           `json:"generator,omitempty"`
-	GeneratorFamily string           `json:"generator_family,omitempty"`
-	VerifierFamily  string           `json:"verifier_family,omitempty"`
-	VerifierModel   string           `json:"verifier_model,omitempty"`
-	ExemplarPair    int              `json:"exemplar_pair,omitempty"`
-	Exemplars       []string         `json:"exemplars,omitempty"`
-	Domain          string           `json:"domain,omitempty"`
-	Format          string           `json:"format,omitempty"`
-	TopicID         string           `json:"topic_id,omitempty"`
-	Flags           tripletFlags     `json:"flags,omitzero"`
-	PlanA           []editRecord     `json:"plan_a,omitempty"`
-	PlanB           []editRecord     `json:"plan_b,omitempty"`
-	T1Planned       string           `json:"t1_planned_stratum,omitempty"`
-	T1Delta0        *float64         `json:"t1_delta0,omitempty"`
-	T1Stratum       string           `json:"t1_stratum,omitempty"`
-	Delta0          *float64         `json:"delta0,omitempty"` // realized Δ under θ₀ (all types)
-	PhiA            *ged.Features    `json:"phi_a,omitempty"`
-	PhiB            *ged.Features    `json:"phi_b,omitempty"`
-	RealizeA        *variantRecord   `json:"realization_a,omitempty"`
-	RealizeB        *variantRecord   `json:"realization_b,omitempty"`
-	Discarded       []discardedPlan  `json:"discarded_plans,omitempty"`
-	Infeasible      []string         `json:"infeasible_reasons,omitempty"`
-	CohA            int              `json:"coh_a,omitempty"`
-	CohB            int              `json:"coh_b,omitempty"`
-	FluA            int              `json:"flu_a,omitempty"`
-	FluB            int              `json:"flu_b,omitempty"`
-	Judgments       []judgmentRecord `json:"judgments,omitempty"`
+	// v2 (dataset-spec §6). fitTriplets copies the contract fields into fit.Triplet.
+	ID              string       `json:"id,omitempty"`
+	SourceID        string       `json:"source_id,omitempty"`
+	Seed            uint64       `json:"seed,omitempty"`
+	Generator       string       `json:"generator,omitempty"`
+	GeneratorFamily string       `json:"generator_family,omitempty"`
+	VerifierFamily  string       `json:"verifier_family,omitempty"`
+	VerifierModel   string       `json:"verifier_model,omitempty"`
+	ExemplarPair    int          `json:"exemplar_pair,omitempty"`
+	Exemplars       []string     `json:"exemplars,omitempty"`
+	Domain          string       `json:"domain,omitempty"`
+	Format          string       `json:"format,omitempty"`
+	TopicID         string       `json:"topic_id,omitempty"`
+	Flags           tripletFlags `json:"flags,omitzero"`
+	// Plan is the catalogue's plan metadata verbatim (perturb.PlanInfo: sub-strata, flags, T1 target and
+	// predicted Δ(θ₀), per-side counts, swap, catalogue redraws and infeasible kinds); PlanA / PlanB its edits.
+	Plan  *perturb.PlanInfo `json:"plan,omitempty"`
+	PlanA []editRecord      `json:"plan_a,omitempty"`
+	PlanB []editRecord      `json:"plan_b,omitempty"`
+	// SubPlanned is the T3 sub-stratum drawn for the slot; DiagInfeasible counts the t3_diag relabels returned
+	// infeasible and redrawn inside the slot; DiagFallback marks a t3_diag slot that became ordinary T3 after
+	// maxDiagInfeasible of them (dataset-spec §2.2).
+	SubPlanned     perturb.T3Sub `json:"t3_sub_planned,omitempty"`
+	ReplacementOf  string        `json:"replacement_of,omitempty"` // the discarded slot this one replaces
+	DiagInfeasible int           `json:"diag_infeasible,omitempty"`
+	DiagFallback   bool          `json:"diag_fallback,omitempty"`
+	// T1Delta0 / T1Stratum are the realized Δ(θ₀) and its stratum (Plan.T1Target / T1Delta0 are the planned ones).
+	T1Delta0   *float64         `json:"t1_delta0,omitempty"`
+	T1Stratum  string           `json:"t1_stratum,omitempty"`
+	Delta0     *float64         `json:"delta0,omitempty"` // realized Δ under θ₀ (all types)
+	PhiA       *ged.Features    `json:"phi_a,omitempty"`
+	PhiB       *ged.Features    `json:"phi_b,omitempty"`
+	RealizeA   *variantRecord   `json:"realization_a,omitempty"`
+	RealizeB   *variantRecord   `json:"realization_b,omitempty"`
+	Discarded  []discardedPlan  `json:"discarded_plans,omitempty"`
+	Infeasible []string         `json:"infeasible_reasons,omitempty"`
+	CohA       int              `json:"coh_a,omitempty"`
+	CohB       int              `json:"coh_b,omitempty"`
+	FluA       int              `json:"flu_a,omitempty"`
+	FluB       int              `json:"flu_b,omitempty"`
+	Judgments  []judgmentRecord `json:"judgments,omitempty"`
 	// Weight is the §0.1 reweighting weight (computed by the statistics side; nil here).
 	Weight *float64 `json:"weight,omitempty"`
 
@@ -283,6 +327,9 @@ type sourceRecord struct {
 	Episode   string                `json:"episode,omitempty"`
 	NodesetID string                `json:"nodeset_id,omitempty"`
 	Pilot     bool                  `json:"pilot,omitempty"`
+	// ReplacementOf / ReplacedBy link a rejected or duplicate source and its replacement (review M2).
+	ReplacementOf string `json:"replacement_of,omitempty"`
+	ReplacedBy    string `json:"replaced_by,omitempty"`
 }
 
 func (s *sourceRecord) prefix() string {
@@ -311,8 +358,8 @@ func newTripletRecord(sr *sourceRecord, s slotSpec) *pilotTriplet {
 		Source: s.source, Type: s.typ, ID: fmt.Sprintf("%s-t%d", sr.SourceID, s.k), SourceID: sr.SourceID,
 		Seed: sr.Spec.Seed, Generator: sr.Generator, GeneratorFamily: sr.GeneratorFamily,
 		ExemplarPair: sr.ExemplarPair, Exemplars: sr.Exemplars, Domain: sr.Spec.Domain, Format: sr.Spec.Format,
-		TopicID: sr.Spec.TopicID, T1Planned: s.t1Stratum,
-		Flags: tripletFlags{QT30: sr.QT30, Episode: sr.Episode, Pilot: sr.Pilot, T3Ident: s.ident},
+		TopicID: sr.Spec.TopicID, SubPlanned: s.sub, ReplacementOf: s.replaces,
+		Flags: tripletFlags{QT30: sr.QT30, Episode: sr.Episode, Pilot: sr.Pilot},
 	}
 }
 
@@ -844,6 +891,9 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 				break
 			}
 		}
+		if g.Verifier == nil {
+			return nil, fmt.Errorf("pilot: no generator of another family than %s to verify it (dataset-spec §4.1: the verifier is never the realizer's family); add one to -generators", m)
+		}
 		r.gens[m] = g
 	}
 	for _, m := range o.judges {
@@ -881,19 +931,28 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	if err != nil {
 		return err
 	}
+	var topics *synth.TopicQueue
 	if len(specs) > 0 {
 		bank, err := readTopics(cmp(o.topicBank, filepath.Join(o.out, "topics.json")))
 		if err != nil {
 			return fmt.Errorf("pilot: 話題バンクが読めない（先に -topics を実行する）: %w", err)
 		}
-		if err := synth.AssignTopics(specs, synth.NewTopicQueue(bank)); err != nil {
+		topics = synth.NewTopicQueue(bank)
+		if err := synth.AssignTopics(specs, topics); err != nil {
 			return err
 		}
 	}
 
-	// ---- G1 sources: generate, targets, copy check, cross-family re-annotation; dedup ----
-	all := r.generateSources(ctx, specs)
+	// ---- G1 sources: generate, targets, copy check, cross-family re-annotation; dedup; replenish ----
+	jobs := make([]sourceJob, len(specs))
+	for i, sp := range specs {
+		jobs[i] = sourceJob{spec: sp, index: i}
+	}
+	all := r.generateSources(ctx, jobs)
 	if err := r.dedup(ctx, all); err != nil {
+		return err
+	}
+	if all, err = r.replenishSources(ctx, all, topics); err != nil {
 		return err
 	}
 	var accepted []*sourceRecord
@@ -916,8 +975,12 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	}
 
 	// ---- G2–G4 plans, realization, verification ----
-	pp := &pipelineV2{ctx: ctx, gens: r.gens, mt: mt, emb: env.emb, sources: accepted, seed: o.seed, stats: newV2Stats()}
-	trips := pp.buildAll(rand.New(rand.NewPCG(o.seed, 0xb11d)))
+	pp := &pipelineV2{ctx: ctx, gens: r.gens, mt: mt, emb: env.emb, sources: accepted, seed: o.seed, stats: newV2Stats(),
+		catalogue: catalogueOptions(o.diagShare)}
+	trips, err := pp.buildAll(rand.New(rand.NewPCG(o.seed, 0xb11d)))
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "realized, cost $%.3f\n", mt.total())
 	var kept []*pilotTriplet
 	for _, t := range trips {
@@ -949,13 +1012,14 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	writeCostTable(&b, mt, []string{"synth_topics", "synth_source", "verify_source", "realize", "verify", "judge"})
 	writeCostProjection(&b, mt, projectionFor(o, env.pricing))
 	writeSourceReport(&b, all)
-	ft, d0 := r.fitTriplets(kept, accepted)
+	ft, d0 := fitTriplets(kept, accepted)
 	writeVerifyReportV2(&b, pp.stats, kept, d0)
 	writeT1Report(&b, kept, js, o.judges)
+	writeJudgeFailures(&b, kept, o.judges)
 	if judgeErr != nil {
 		fmt.Fprintf(&b, "\n**判定の一部が失敗した**: %v\n", judgeErr)
 	}
-	if err := r.writeFitReport(&b, kept, ft, js, d0); err != nil {
+	if err := r.writeFitReport(&b, kept, ft, js, d0, pp.stats); err != nil {
 		fmt.Fprintf(&b, "\n（当てはめを行わなかった: %v）\n", err)
 	}
 	if err := os.WriteFile(filepath.Join(o.out, "pilot.md"), b.Bytes(), 0o644); err != nil {
@@ -968,20 +1032,31 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	return nil
 }
 
-// generateSources runs G1 for every spec: up to 3 attempts, each checked against the numeric targets,
+// sourceJob is one G1 generation: a spec of the allocation (index = its position, source id s%04d) or the
+// replacement of a rejected / duplicate source (index after the allocation, attempts continued so that the
+// requests differ from the rejected ones).
+type sourceJob struct {
+	spec          synth.Spec
+	index         int
+	firstAttempt  int
+	replacementOf string
+}
+
+// generateSources runs G1 for every job: up to 3 attempts, each checked against the numeric targets,
 // the exemplar copy rules (§1.5.2) and the other family's blind re-annotation (§4.3). A retry keeps
 // the spec and its topic (the rejected topic goes first to the replacement, §1.3).
-func (r *v2run) generateSources(ctx context.Context, specs []synth.Spec) []*sourceRecord {
-	out := make([]*sourceRecord, len(specs))
-	parallel(len(specs), 8, func(i int) error {
-		sp := specs[i]
+func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*sourceRecord {
+	out := make([]*sourceRecord, len(jobs))
+	parallel(len(jobs), 8, func(j int) error {
+		sp, i := jobs[j].spec, jobs[j].index
 		g := r.gens[sp.Generator]
 		rec := &sourceRecord{SourceID: fmt.Sprintf("s%04d", i), Index: i, Spec: sp, Generator: sp.Generator,
 			GeneratorFamily: synth.FamilyOf(sp.Generator), GeneratorSetting: g.Writer().Setting(), PromptHashes: r.promptHashes(),
-			ExemplarPair: sp.ExemplarPair.ID, Exemplars: sp.ExemplarPair.Order, EmbeddingModel: r.env.emb.Model(), Pilot: r.o.p2}
-		out[i] = rec
+			ExemplarPair: sp.ExemplarPair.ID, Exemplars: sp.ExemplarPair.Order, EmbeddingModel: r.env.emb.Model(), Pilot: r.o.p2,
+			ReplacementOf: jobs[j].replacementOf}
+		out[j] = rec
 		prefix := fmt.Sprintf("s%d.", i)
-		for attempt := range 3 {
+		for attempt := jobs[j].firstAttempt; attempt < jobs[j].firstAttempt+3; attempt++ {
 			if err := r.mt.check(); err != nil {
 				rec.Reason = err.Error()
 				return err
@@ -1107,6 +1182,60 @@ func (r *v2run) dedup(ctx context.Context, all []*sourceRecord) error {
 	return nil
 }
 
+// maxReplaceRounds caps the replacement rounds of rejected sources and of discarded triplet slots.
+const maxReplaceRounds = 3
+
+// replenishSources replaces rejected and duplicate sources until -sources are accepted, the budget stops, or
+// maxReplaceRounds rounds have run (review-synth-impl M2, dataset-spec §1.3 / §4.5). A replacement keeps the
+// rejected spec's stratum (format, targets, generator, exemplar pair, names) and continues its attempt numbers;
+// a rejected source passes its topic on (§1.3: a topic is consumed only by an accepted source), a duplicate takes
+// the next topic of its domain. Each round is de-duplicated against every accepted source.
+func (r *v2run) replenishSources(ctx context.Context, all []*sourceRecord, topics *synth.TopicQueue) ([]*sourceRecord, error) {
+	for round := 1; round <= maxReplaceRounds; round++ {
+		acc := 0
+		for _, s := range all {
+			if s.Accepted {
+				acc++
+			}
+		}
+		deficit := r.o.sources - acc
+		if deficit <= 0 || r.mt.check() != nil {
+			break
+		}
+		var jobs []sourceJob
+		for _, s := range all {
+			if len(jobs) == deficit {
+				break
+			}
+			if s.Accepted || s.ReplacedBy != "" {
+				continue
+			}
+			sp := s.Spec
+			if s.DuplicateOf != "" && topics != nil {
+				if t, ok := topics.Next(sp.Domain); ok {
+					sp.TopicID, sp.Topic = t.ID, t.Question
+				}
+			}
+			first := 0
+			if n := len(s.Attempts); n > 0 {
+				first = s.Attempts[n-1].Attempt + 1
+			}
+			j := sourceJob{spec: sp, index: len(all) + len(jobs), firstAttempt: first, replacementOf: s.SourceID}
+			s.ReplacedBy = fmt.Sprintf("s%04d", j.index)
+			jobs = append(jobs, j)
+		}
+		if len(jobs) == 0 {
+			break
+		}
+		all = append(all, r.generateSources(ctx, jobs)...)
+		if err := r.dedup(ctx, all); err != nil {
+			return all, err
+		}
+		fmt.Fprintf(os.Stderr, "replacement round %d: %d sources\n", round, len(jobs))
+	}
+	return all, nil
+}
+
 // qt30Sources loads the transfer set written by -import-qt30; generators alternate over nodesets.
 func (r *v2run) qt30Sources(offset int) ([]*sourceRecord, error) {
 	var qs []synth.QT30Source
@@ -1144,11 +1273,11 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 		items    []item
 		results  []llm.BatchResult
 		useBatch bool
+		reserved float64 // batch projection held in the meter until the results are metered
 		skip     error
 		err      error
 	}
 	runs := make([]*judgeRun, len(r.judges))
-	reserved := 0.0
 	for j, judge := range r.judges {
 		jr := &judgeRun{}
 		runs[j] = jr
@@ -1172,12 +1301,13 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 		jr.useBatch = isBatch && judge.Family == "anthropic"
 		if jr.useBatch && len(jr.reqs) > 0 {
 			proj := r.projectBatch(judge, jr.reqs)
-			if rem := r.mt.remaining() - reserved; proj > rem {
+			if rem := r.mt.remaining(); proj > rem {
 				jr.skip = fmt.Errorf("%w: %s の判定 %d 件（未キャッシュ分の見込み $%.2f）が残りの予算 $%.2f を超えるので投げなかった",
 					errBudget, judge.Model, len(jr.reqs), proj, rem)
 				continue
 			}
-			reserved += proj
+			r.mt.reserve(proj)
+			jr.reserved = proj
 		}
 	}
 	var wg sync.WaitGroup
@@ -1190,15 +1320,19 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 		go func() {
 			defer wg.Done()
 			if jr.useBatch {
+				// On a whole-call error the slice still holds every response obtained before the failure (llm
+				// contract): they are paid for, so they are metered and recorded like the others (review M1).
 				res, err := judge.Client.(llm.BatchClient).CompleteBatch(ctx, jr.reqs)
+				for i, x := range res {
+					r.mt.add("judge", x.Response)
+					if i < len(jr.results) {
+						jr.results[i] = x
+					}
+				}
+				r.mt.release(jr.reserved)
 				if err != nil {
 					jr.err = fmt.Errorf("judge %s: batch: %w", judge.Model, err)
-					return
 				}
-				for _, x := range res {
-					r.mt.add("judge", x.Response)
-				}
-				jr.results = res
 				return
 			}
 			parallel(len(jr.reqs), 8, func(i int) error {
@@ -1219,9 +1353,12 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 	var errs []error
 	for j, judge := range r.judges {
 		jr := runs[j]
-		if jr.skip != nil || jr.err != nil {
-			errs = append(errs, cmpErr(jr.skip, jr.err))
+		if jr.skip != nil {
+			errs = append(errs, jr.skip)
 			continue
+		}
+		if jr.err != nil {
+			errs = append(errs, jr.err)
 		}
 		failed := 0
 		for i, res := range jr.results {
@@ -1236,11 +1373,16 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 			}
 			var ans string
 			err := res.Err
+			if err == nil && res.Response == nil {
+				err = errors.New("no result (the batch call failed before this item)")
+			}
 			if err == nil {
 				ans, err = synth.ParseJudgeAnswer(res.Response)
 			}
 			if err != nil {
 				rec.Error = err.Error()
+				// A refusal or truncation is recorded as such and never becomes an answer (review M7).
+				rec.Refusal, rec.Truncated = errors.Is(err, llm.ErrRefusal), errors.Is(err, llm.ErrTruncated)
 				failed++
 				t.Judgments = append(t.Judgments, rec)
 				continue
@@ -1251,20 +1393,13 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 				rec.Answer = "same"
 			}
 			t.Judgments = append(t.Judgments, rec)
-			js = append(js, fit.Judgment{Triplet: it.t, Judge: j, Order: float64(it.order), Answer: a})
+			js = append(js, fit.Judgment{Triplet: it.t, Judge: j, Order: float64(it.order), Answer: a, Family: judge.Family})
 		}
 		if failed > 0 {
 			errs = append(errs, fmt.Errorf("judge %s: %d/%d judgments failed", judge.Model, failed, len(jr.results)))
 		}
 	}
 	return js, errors.Join(errs...)
-}
-
-func cmpErr(a, b error) error {
-	if a != nil {
-		return a
-	}
-	return b
 }
 
 func applyDefaults(c llm.Client, req llm.Request) llm.Request {
@@ -1296,17 +1431,28 @@ func (r *v2run) projectBatch(judge synth.Judge, reqs []llm.Request) float64 {
 	return total
 }
 
-// fitTriplets builds the fit input of the kept triplets (sources are the accepted list).
-// TODO(integration): copy Type, Flags, Generator, VerifierFamily, ExemplarPair, Domain, Weight, CohA,
-// CohB and T1Delta0 into fit.Triplet (and Family into fit.Judgment) once those fields exist.
-func (r *v2run) fitTriplets(kept []*pilotTriplet, sources []*sourceRecord) ([]fit.Triplet, []float64) {
+// fitTriplets builds the fit input of the kept triplets (sources are the accepted list): every fit.Triplet
+// contract field is copied from the record (decisions-stats §16 #16–17), so a re-fit from the records needs no
+// other state than the cos tables.
+func fitTriplets(kept []*pilotTriplet, sources []*sourceRecord) ([]fit.Triplet, []float64) {
 	ft := make([]fit.Triplet, len(kept))
 	d0 := make([]float64, len(kept))
 	for i, t := range kept {
 		s := sources[t.Source].Discussion
 		ft[i] = fit.Triplet{Source: t.Source, Ref: s.Graph, A: t.TextA.Graph, B: t.TextB.Graph,
 			SimA: t.simA, SimB: t.simB,
-			NegDiff: float64(t.B.Neg - t.A.Neg)}
+			NegDiff: float64(t.Flags.PNegB - t.Flags.PNegA),
+			Type:    string(t.Type), Flags: t.fitFlagList(), Generator: t.Generator, VerifierFamily: t.VerifierFamily,
+			Domain: t.Domain, CohA: float64(t.CohA), CohB: float64(t.CohB)}
+		if t.ExemplarPair != 0 {
+			ft[i].ExemplarPair = strconv.Itoa(t.ExemplarPair)
+		}
+		if t.Weight != nil {
+			ft[i].Weight = *t.Weight
+		}
+		if t.T1Delta0 != nil {
+			ft[i].T1Delta0 = *t.T1Delta0
+		}
 		if t.Delta0 != nil {
 			d0[i] = *t.Delta0
 		}
@@ -1314,9 +1460,36 @@ func (r *v2run) fitTriplets(kept []*pilotTriplet, sources []*sourceRecord) ([]fi
 	return ft, d0
 }
 
-// writeFitReport fits the pairwise model. In P2 mode θ is fixed at θ₀ and only the auxiliary parameters
-// are reported (decisions-stats §16 #12); otherwise θ is estimated as in the PoC.
-func (r *v2run) writeFitReport(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.Triplet, js []fit.Judgment, d0 []float64) error {
+// pilotExclude is fit.DefaultExclude without "pilot": a pilot run fits its own (pilot-flagged) triplets, which the
+// main analysis drops by default; every other default exclusion (x_spk, diag_ca_type, qt30, del_add_cooccur) stays.
+func pilotExclude() []string {
+	return slices.DeleteFunc(slices.Clone(fit.DefaultExclude), func(f string) bool { return f == "pilot" })
+}
+
+// pilotFitOptions are the pre-registered fit settings of a run: the type tie (decisions-stats §12b), the default
+// exclusions (pilotExclude) and the three starts θ₀ / R1 / all-0.5 (§11.3). The P2 fit drops the starts (θ fixed).
+func (r *v2run) pilotFitOptions() fit.Options {
+	th0 := ged.Current()
+	starts, names := fit.DefaultStarts(th0)
+	return fit.Options{Judges: len(r.judges), Theta0: th0, Lambda: r.o.lambda, FitNeg: true, MaxOuter: 20,
+		Tie: fit.TypeTie(), Exclude: pilotExclude(), Starts: starts, StartNames: names}
+}
+
+// writeFitSet reports which triplets enter the fit.
+func writeFitSet(b *bytes.Buffer, ft []fit.Triplet, js []fit.Judgment, opts fit.Options) {
+	fs, fj, _ := fit.Filter(ft, js, opts)
+	var counts []string
+	for _, kv := range sortedKV(fit.ExclusionCounts(ft, opts)) {
+		counts = append(counts, kv[0]+" "+kv[1])
+	}
+	fmt.Fprintf(b, "\n- 当てはめに使う三つ組 %d / %d、判定 %d / %d（除いた三つ組: %s）。種別のタイ（RA↔CA、CA↔MA を RA↔MA に、決定文書 §12b）\n",
+		len(fs), len(ft), len(fj), len(js), strings.Join(counts, "、"))
+}
+
+// writeFitReport fits the pairwise model. In P2 mode θ is fixed at θ₀ and the P2 report of decisions-stats
+// §16 #12 is written (no θ); otherwise the confirmatory analysis (writeConfirmatory) and the untied diagnostic
+// fit of §12b run.
+func (r *v2run) writeFitReport(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.Triplet, js []fit.Judgment, d0 []float64, st *v2Stats) error {
 	if len(ft) < 10 || len(js) == 0 {
 		return fmt.Errorf("使える三つ組が %d、判定が %d しかない", len(ft), len(js))
 	}
@@ -1324,43 +1497,188 @@ func (r *v2run) writeFitReport(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.T
 	types, sign, neg := tripletMasks(kept, ft, d0)
 	judgeDiagnostics(b, o.judges, types, sign, js)
 	dNaive, _ := fit.Delta(ft, naiveTheta())
-	opts := fit.Options{Judges: len(r.judges), Theta0: ged.Current(), Lambda: o.lambda, FitNeg: true, MaxOuter: 20, AuxRidge: 0.5}
+	opts := r.pilotFitOptions()
 	writeICC(b, kept, js, d0)
 	if o.p2 {
-		opts.FixTheta = true
-		res, err := fit.Fit(ft, js, opts, nil)
+		// θ fixed at θ₀; the weak aux ridge of the pilots keeps β finite on ≈ 100 triplets.
+		opts.FixTheta, opts.AuxRidge, opts.Starts, opts.StartNames = true, 0.5, nil, nil
+		aux, err := fit.Fit(ft, js, opts, nil)
 		if err != nil {
 			return err
 		}
+		in := p2Input{Names: o.judges, Aux: aux.Params, Tie: opts.Tie, MinInf: fit.DefaultMinInformative(), Discards: st.discardRows()}
+		in.Trips, in.Js, _ = fit.Filter(ft, js, opts)
+		if mix, err := fit.FitMixed(ft, js, opts, nil); err == nil {
+			in.Mixed = &mix.Params
+		} else {
+			fmt.Fprintf(b, "\n（ランダム切片の当てはめに失敗した: %v）\n", err)
+		}
 		fmt.Fprintln(b, "\n## 補助パラメータ（θ = θ₀ に固定。P2 は θ を出さない）")
-		auxTable(b, o.judges, res.Params, nil)
+		writeFitSet(b, ft, js, opts)
+		if err := writeP2Report(b, in); err != nil {
+			return err
+		}
 		agreementTable(b, []agreeRow{{"R0 現行のコスト表", d0}, {"R1 素朴な一様コスト（種別違い・向き違い = 2.0）", dNaive}}, js, neg)
 		writeTypeBreakdown(b, kept, js, d0)
 		return nil
 	}
-	res, err := fit.Fit(ft, js, opts, nil)
-	if err != nil {
+	if err := r.writeConfirmatory(b, ft, js, opts); err != nil {
 		return err
 	}
-	boot, err := fit.Bootstrap(ft, js, opts, res.Params, o.boot, o.seed+100)
-	if err != nil {
-		return err
+	if err := r.writeDiagnosticFit(b, kept, ft, js, opts, st); err != nil {
+		fmt.Fprintf(b, "\n（診断用の当てはめに失敗した: %v）\n", err)
 	}
-	cv, err := fit.CrossValidate(ft, js, opts, 5, o.seed)
-	if err != nil {
-		return err
-	}
-	dEst, _ := fit.Delta(ft, res.Params.Theta)
-	agreementTable(b, []agreeRow{
-		{"R0 現行のコスト表", d0},
-		{"R1 素朴な一様コスト（種別違い・向き違い = 2.0）", dNaive},
-		{"R2 学習したコスト（学習に使ったデータ）", dEst},
-		{"R2 学習したコスト（5 分割交差検証）", cv},
-	}, js, neg)
-	paramTable(b, ged.Current(), nil, nil, res.Params, boot, o.m)
-	auxTable(b, o.judges, res.Params, nil)
+	agreementTable(b, []agreeRow{{"R0 現行のコスト表", d0}, {"R1 素朴な一様コスト（種別違い・向き違い = 2.0）", dNaive}}, js, neg)
 	writeTypeBreakdown(b, kept, js, d0)
-	return writeProfiles(filepath.Join(o.out, "profile.csv"), ft, js, opts, res.Params)
+	return nil
+}
+
+// writeConfirmatory is the θ analysis of a non-P2 run: fit.Confirmatory (judge QC before θ, the default filters
+// without "pilot", co-primary multi-start fits, paired bootstrap, §3 rule, §4 contrasts, D, verdict, LOJO) and its
+// only formatter WriteConfirmatory, then the profile likelihoods of the independence fit.
+func (r *v2run) writeConfirmatory(b *bytes.Buffer, ft []fit.Triplet, js []fit.Judgment, opts fit.Options) error {
+	o := r.o
+	co := fit.ConfirmOptions{Theta0: opts.Theta0, M: o.m, B: o.boot, DReps: o.dReps, Seed: o.seed, JudgeNames: o.judges, SkipExclusions: o.keepJudges}
+	res, err := fit.Confirmatory(ft, js, opts, co)
+	if err != nil {
+		if res.QC.Names != nil { // the QC ran before θ (e.g. every judge failed it): show why
+			writeJudgeQC(b, res.QC, res.Options)
+		}
+		return err
+	}
+	models := map[string]string{}
+	for _, m := range o.generators {
+		models["generator "+m] = m + "（" + r.gens[m].Writer().Setting() + "）"
+		if v := r.gens[m].Verifier; v != nil {
+			models["verifier of "+m] = v.Model + "（" + v.Setting() + "）"
+		}
+	}
+	for _, j := range r.judges {
+		models["judge "+j.Model] = j.Model + "（" + j.Setting() + "）"
+	}
+	WriteConfirmatory(b, res, provenance{Seeds: map[string]uint64{"pilot": o.seed}, PromptHashes: r.promptHashes(), ModelIDs: models,
+		M: res.Options.M, B: res.Options.B, U: res.Options.U, Extra: map[string]string{"sources": strconv.Itoa(o.sources), "qt30": strconv.FormatBool(o.withQT30)}})
+	single := opts
+	single.Starts, single.StartNames = nil, nil
+	return writeProfiles(filepath.Join(o.out, "profile.csv"), ft, js, single, res.Indep.Params)
+}
+
+// caPairOf maps a diagnostic relabel direction ("RA→CA" etc.) to its cost (RA↔CA or CA↔MA).
+func caPairOf(dir string) int {
+	if strings.Contains(dir, ged.RA) {
+		return ged.PTypeRACA
+	}
+	return ged.PTypeCAMA
+}
+
+// diagCounts are the accepted diagnostic relabels per CA pair among the kept triplets, and whether a pair is
+// reported as counts only (a direction's infeasibility rate > 60% in the realization attempts, decisions-stats §12b).
+func diagCounts(kept []*pilotTriplet, st *v2Stats) (feasible map[int]int, countsOnly map[int]bool) {
+	feasible, countsOnly = map[int]int{}, map[int]bool{}
+	for _, t := range kept {
+		if t.Plan == nil || !t.Plan.DiagCAType || t.Flags.QT30 {
+			continue
+		}
+		for _, e := range append(slices.Clone(t.EditsA), t.EditsB...) {
+			if e.Kind == perturb.RTypeCA {
+				feasible[caPairOf(e.Direction)]++
+			}
+		}
+	}
+	if st != nil {
+		for dir := range st.diagDir {
+			if st.diagInfeasibleRate(dir) > diagCountsOnly {
+				countsOnly[caPairOf(dir)] = true
+			}
+		}
+	}
+	return feasible, countsOnly
+}
+
+// writeDiagnosticFit is the pre-registered untied diagnostic fit (decisions-stats §12b; descriptive, no §3 label is
+// printed): fit.Confirmatory with Untied, the diag_ca_type triplets included (the other exclusions kept), the same
+// judge QC, θ₀ / R1 / all-0.5 starts and stratified bootstrap as the primary fit (no random-intercept fit, no D, no
+// LOJO). It reports the CA pairs' normalized estimates with 90% intervals and their contrasts with the fit's own
+// θ̃_RA↔MA (the two directions of a pair pooled; a pair with a direction > 60% infeasible is counts only).
+func (r *v2run) writeDiagnosticFit(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.Triplet, js []fit.Judgment, base fit.Options, st *v2Stats) error {
+	od := base
+	od.Tie = nil
+	od.Exclude = slices.DeleteFunc(slices.Clone(base.Exclude), func(f string) bool { return f == "diag_ca_type" })
+	feas, countsOnly := diagCounts(kept, st)
+	fmt.Fprintln(b, "\n## 種別のタイを外した診断用の当てはめ（決定文書 §12b、記述のみ）")
+	if feas[ged.PTypeRACA]+feas[ged.PTypeCAMA] == 0 {
+		fmt.Fprintln(b, "\n採用した t3_diag の付け替えが無いので当てはめない。")
+		return nil
+	}
+	o := r.o
+	res, err := fit.Confirmatory(ft, js, od, fit.ConfirmOptions{Theta0: od.Theta0, M: o.m, B: o.boot, Seed: o.seed, JudgeNames: o.judges,
+		Untied: true, SkipMixed: true, SkipD: true, SkipLOJO: true, SkipExclusions: o.keepJudges, MinInformative: map[int]int{}})
+	if err != nil {
+		return err
+	}
+	param := map[int]fit.ParamResult{}
+	for _, p := range res.Params {
+		param[p.Index] = p
+	}
+	boot, _ := fit.NormalizeRows(res.Boot.Theta, res.Options.U)
+	ownType := param[ged.PTypeRAMA].Indep.Est
+	fmt.Fprintf(b, "\n`fit.Confirmatory`（Untied）: タイなし、diag_ca_type の三つ組を含める（ほかの除外は同じ）。三つ組 %d、判定 %d、除外した判定者 %v。自身の θ̃_RA↔MA = %.3f。区間はクラスタブートストラップ B = %d のパーセンタイル。\n",
+		res.Triplets, res.Judgments, res.ExcludedJudges, ownType, res.Options.B)
+	fmt.Fprintln(b, "\n| 種別の組 | θ₀ | 推定（固定尺度） | 推定（正規化） | 90% 区間 | θ̃_RA↔MA との差 | 95% 区間 | 採用した付け替え |")
+	fmt.Fprintln(b, "| --- | --: | --: | --: | --- | --: | --- | --: |")
+	for _, p := range []int{ged.PTypeRACA, ged.PTypeCAMA} {
+		pr := param[p]
+		var cb []float64
+		for _, row := range boot {
+			if row != nil {
+				cb = append(cb, row[p]-row[ged.PTypeRAMA])
+			}
+		}
+		con := stats.BootstrapContrast(pr.Indep.Est-ownType, cb, 0, stats.TwoSided)
+		cell := fmt.Sprintf("%.3f | %.3f | %s | %+.3f | %s", pr.Anchored, pr.Indep.Est, intervalCell(pr.Indep), con.Est, ci(con.CI95))
+		if countsOnly[p] {
+			cell = "— | — | 件数のみ（infeasible の率 > 60%） | — | —"
+		}
+		fmt.Fprintf(b, "| %s | %s | %s | %d |\n", ged.ParamNames[p], num(pr.Theta0), cell, feas[p])
+	}
+	fmt.Fprintln(b, "\n診断セルは実現可能な（弱い関係の）付け替えだけなので、一般の符号反転の費用ではない（review m14）。m の帯による判断はしない。")
+	return nil
+}
+
+// writeJudgeFailures counts, per judge, the judgments that failed, separating refusals and truncations (which are
+// neither answers nor ties; review-synth-impl M7).
+func writeJudgeFailures(b *bytes.Buffer, kept []*pilotTriplet, judges []string) {
+	type cnt struct{ n, failed, refused, truncated int }
+	by := map[string]*cnt{}
+	for _, t := range kept {
+		for _, j := range t.Judgments {
+			c := by[j.Judge]
+			if c == nil {
+				c = &cnt{}
+				by[j.Judge] = c
+			}
+			c.n++
+			if j.Error != "" {
+				c.failed++
+			}
+			if j.Refusal {
+				c.refused++
+			}
+			if j.Truncated {
+				c.truncated++
+			}
+		}
+	}
+	fmt.Fprintln(b, "\n## 判定の失敗（拒否・打ち切りは回答にも「同程度」にも数えない）")
+	fmt.Fprintln(b, "\n| 判定者 | 判定 | 失敗 | うち拒否 | うち打ち切り |")
+	fmt.Fprintln(b, "| --- | --: | --: | --: | --: |")
+	for _, name := range judges {
+		c := by[name]
+		if c == nil {
+			c = &cnt{}
+		}
+		fmt.Fprintf(b, "| %s | %d | %d | %d | %d |\n", name, c.n, c.failed, c.refused, c.truncated)
+	}
 }
 
 // writeProvenance is the provenance block of every v2 output (decisions-stats §16 #13).
@@ -1543,20 +1861,24 @@ func writeT1Report(b *bytes.Buffer, kept []*pilotTriplet, js []fit.Judgment, jud
 		}
 		n++
 		strata[t.T1Stratum]++
-		p := planned[t.T1Planned]
+		target := ""
+		if t.Plan != nil {
+			target = t.Plan.T1Target
+		}
+		p := planned[target]
 		p[0]++
-		if t.T1Planned == t.T1Stratum {
+		if target == t.T1Stratum {
 			p[1]++
 		}
-		planned[t.T1Planned] = p
+		planned[target] = p
 	}
-	fmt.Fprintf(b, "\n- T1 の三つ組 %d。実現後の層: [0.5,1) %d、[1,2) %d、≥2（関門集合）%d\n", n, strata[t1Low], strata[t1Mid], strata[t1Gate])
+	fmt.Fprintf(b, "\n- T1 の三つ組 %d。実現後の層: [0.5,1) %d、[1,2) %d、≥2（関門集合）%d\n", n, strata[perturb.T1Low], strata[perturb.T1Mid], strata[perturb.T1High])
 	for _, k := range sortedKeys(planned) {
 		fmt.Fprintf(b, "- 計画の層 %s: %d 件、うち実現後も同じ層 %d\n", k, planned[k][0], planned[k][1])
 	}
 	gate := map[int]bool{}
 	for i, t := range kept {
-		if t.Type == perturb.T1Monotone && t.T1Stratum == t1Gate {
+		if t.Type == perturb.T1Monotone && t.T1Stratum == perturb.T1High {
 			gate[i] = true
 		}
 	}
@@ -1936,12 +2258,12 @@ func runImportQT30(o pilotOptions) error {
 	return nil
 }
 
-// runQC runs the P2 audits on the records of a previous run (dataset-spec §7, §1.5.2):
+// runAudit (-audit) runs the P2 data audits on the records of a previous run (dataset-spec §7, §1.5.2):
 // (a) label-correctness audit: 100 accepted variants stratified by edit kind × direction, fully
 // re-annotated blind by the triplet's verifier family; (b) homogeneity monitor: 40 accepted sources
 // (20 per generator) against 40 generated without exemplars; (c) the G1 verifier on the 7 exemplars
-// (both families). Writes <out>/qc.md.
-func runQC(o pilotOptions) error {
+// (both families). Writes <out>/audit.md.
+func runAudit(o pilotOptions) error {
 	if o.budget < 0 {
 		o.budget = 5
 	}
@@ -1949,10 +2271,10 @@ func runQC(o pilotOptions) error {
 	if err != nil {
 		return err
 	}
-	return runQCEnv(context.Background(), o, env)
+	return runAuditEnv(context.Background(), o, env)
 }
 
-func runQCEnv(ctx context.Context, o pilotOptions, env *pilotEnv) error {
+func runAuditEnv(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	r, err := newV2Run(o, env)
 	if err != nil {
 		return err
@@ -1966,12 +2288,12 @@ func runQCEnv(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 		return err
 	}
 	var b bytes.Buffer
-	fmt.Fprintln(&b, "# P2 の監査（-qc）")
+	fmt.Fprintln(&b, "# P2 のデータの監査（-audit）")
 	r.qcExemplars(ctx, &b)
 	r.qcLabels(ctx, &b, trips)
 	r.qcHomogeneity(ctx, &b, srcs)
 	writeCostTable(&b, r.mt, []string{"qc"})
-	if err := os.WriteFile(filepath.Join(o.out, "qc.md"), b.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(o.out, "audit.md"), b.Bytes(), 0o644); err != nil {
 		return err
 	}
 	fmt.Print(b.String())
@@ -2115,7 +2437,7 @@ func auditEdit(e editRecord, g ged.Graph, read []ged.Edge, content map[string]st
 		return !related(e.Edge.From, e.Edge.To), true
 	case perturb.RAdd:
 		return has(e.Edge.From, e.Edge.To, e.Edge.Kind), true
-	case perturb.RType:
+	case perturb.RType, perturb.RTypeCA:
 		return has(e.Edge.From, e.Edge.To, e.NewKind), true
 	case perturb.RRev:
 		return has(e.Edge.To, e.Edge.From, e.Edge.Kind), true
