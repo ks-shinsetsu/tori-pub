@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/llm"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/perturb"
 )
@@ -29,8 +30,10 @@ type realizeOut struct {
 	} `json:"propositions"`
 }
 
-// InfeasibleKinds are the kinds for which the realizer may declare an edit infeasible (dataset-spec §4.2).
-var InfeasibleKinds = []perturb.Kind{perturb.RType, perturb.RRev, perturb.RAdd}
+// InfeasibleKinds are the kinds for which the realizer may declare an edit infeasible (dataset-spec §4.2):
+// the relation edits that change a relation's kind (including the diagnostic CA relabel of the t3_diag
+// sub-stratum, §2.2), reverse it, or add it.
+var InfeasibleKinds = []perturb.Kind{perturb.RType, perturb.RTypeCA, perturb.RRev, perturb.RAdd}
 
 // RealizeInput is one realization request.
 type RealizeInput struct {
@@ -108,11 +111,44 @@ func describeV3(e perturb.Edit) string {
 	case perturb.RType:
 		return fmt.Sprintf("Change the relation %s so that %s now %s %s. Keep the wording of both propositions; change only the signalling words or the framing around them. Do not negate or weaken either proposition to make the new relation fit. If this cannot be done without changing what a proposition claims, declare the edit infeasible.",
 			rel(e.Edge.From, e.Edge.Kind, e.Edge.To), short(e.Edge.From), verbs[e.NewKind], short(e.Edge.To))
+	case perturb.RTypeCA:
+		return fmt.Sprintf("Change the relation %s so that %s now %s %s (%s). Keep the wording of both propositions; change only the signalling words or the framing around them. Do not negate, weaken or qualify either proposition to make the new relation fit: %s. If this cannot be done without changing what a proposition claims, declare the edit infeasible; that is an expected answer for this edit, not a failure.",
+			rel(e.Edge.From, e.Edge.Kind, e.Edge.To), short(e.Edge.From), verbs[e.NewKind], short(e.Edge.To), caDirectionGloss(e), caDirectionHint(e))
 	case perturb.RRev:
 		return fmt.Sprintf("Reverse the relation %s so that %s now %s %s. Keep what each proposition claims; change only how they are linked. If this cannot be done without changing what a proposition claims, declare the edit infeasible.",
 			rel(e.Edge.From, e.Edge.Kind, e.Edge.To), short(e.Edge.To), verbs[e.Edge.Kind], short(e.Edge.From))
 	}
 	return describe(e)
+}
+
+// relationNoun names a relation kind for the realizer.
+var relationNoun = map[string]string{ged.RA: "a support", ged.CA: "an attack", ged.MA: "a restatement"}
+
+// caDirection returns the relabel's old and new kinds: from Edit.Direction ("RA→CA") when set, else from the edge.
+func caDirection(e perturb.Edit) (from, to string) {
+	if a, b, ok := strings.Cut(e.Direction, "→"); ok {
+		return a, b
+	}
+	return e.Edge.Kind, e.NewKind
+}
+
+// caDirectionGloss is the plain-words direction of a CA relabel ("an attack becomes a support").
+func caDirectionGloss(e perturb.Edit) string {
+	from, to := caDirection(e)
+	return relationNoun[from] + " becomes " + relationNoun[to]
+}
+
+// caDirectionHint tells the realizer what the new relation's signalling looks like in that direction.
+func caDirectionHint(e perturb.Edit) string {
+	from, to := caDirection(e)
+	switch {
+	case to == ged.CA:
+		return "present the first claim as an objection to the second (\"but\", \"that ignores\", \"on the contrary\") while it still says exactly what it said"
+	case from == ged.CA && to == ged.RA:
+		return "present the first claim as a reason for the second (\"because\", \"so\", \"that is why\") while it still says exactly what it said"
+	default: // CA → MA
+		return "present the first claim as a restatement of the second (\"in other words\", \"that is to say\") while it still says exactly what it said"
+	}
 }
 
 // instructionsV3 numbers the v3 instructions (speaker swaps are done by the harness).
@@ -199,7 +235,7 @@ func (g *Generator) Realize(ctx context.Context, in RealizeInput) (RealizeResult
 			}
 		}
 		if !ok {
-			return RealizeResult{}, resp, errors.New("synth: infeasible declared for edits that do not allow it (only R-type, R-rev, R-add)")
+			return RealizeResult{}, resp, errors.New("synth: infeasible declared for edits that do not allow it (only R-type, R-type-CA, R-rev, R-add)")
 		}
 		return RealizeResult{Infeasible: true, Reason: res.Reason}, resp, nil
 	}

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/llm"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/perturb"
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/stats"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/synth"
 )
 
@@ -55,6 +57,15 @@ type pilotOptions struct {
 	// withQT30 adds <out>/qt30_sources.json (from -import-qt30) as transfer-set sources.
 	withQT30 bool
 	aifdb    string
+	// diagShare overrides the share of T3 slots in the t3_diag sub-stratum (0 → the dataset-spec §2.2 default
+	// 0.10); not a flag, set by the offline tests so that the sub-stratum is exercised.
+	diagShare float64
+	// dReps overrides the nested-D replicates of the confirmatory analysis (0 → fit's pre-registered 200); not a
+	// flag, set by the offline tests.
+	dReps int
+	// keepJudges keeps judges that fail the mechanical QC in the confirmatory fit (fit.ConfirmOptions.SkipExclusions);
+	// not a flag: the offline tests have too few gate triplets for any judge to pass §9.1.
+	keepJudges bool
 }
 
 // Defaults of the revised pipeline (dataset-spec §4.1, plan §5.1).
@@ -217,38 +228,46 @@ type pilotTriplet struct {
 	CheckA     variantCheck `json:"check_a,omitzero"`
 	CheckB     variantCheck `json:"check_b,omitzero"`
 
-	// v2 (dataset-spec §6). TODO(integration): fit.Triplet gains Type, Flags, Generator, VerifierFamily,
-	// ExemplarPair, Domain, Weight, CohA, CohB, T1Delta0 — copy them from here in toFitTriplet.
-	ID              string           `json:"id,omitempty"`
-	SourceID        string           `json:"source_id,omitempty"`
-	Seed            uint64           `json:"seed,omitempty"`
-	Generator       string           `json:"generator,omitempty"`
-	GeneratorFamily string           `json:"generator_family,omitempty"`
-	VerifierFamily  string           `json:"verifier_family,omitempty"`
-	VerifierModel   string           `json:"verifier_model,omitempty"`
-	ExemplarPair    int              `json:"exemplar_pair,omitempty"`
-	Exemplars       []string         `json:"exemplars,omitempty"`
-	Domain          string           `json:"domain,omitempty"`
-	Format          string           `json:"format,omitempty"`
-	TopicID         string           `json:"topic_id,omitempty"`
-	Flags           tripletFlags     `json:"flags,omitzero"`
-	PlanA           []editRecord     `json:"plan_a,omitempty"`
-	PlanB           []editRecord     `json:"plan_b,omitempty"`
-	T1Planned       string           `json:"t1_planned_stratum,omitempty"`
-	T1Delta0        *float64         `json:"t1_delta0,omitempty"`
-	T1Stratum       string           `json:"t1_stratum,omitempty"`
-	Delta0          *float64         `json:"delta0,omitempty"` // realized Δ under θ₀ (all types)
-	PhiA            *ged.Features    `json:"phi_a,omitempty"`
-	PhiB            *ged.Features    `json:"phi_b,omitempty"`
-	RealizeA        *variantRecord   `json:"realization_a,omitempty"`
-	RealizeB        *variantRecord   `json:"realization_b,omitempty"`
-	Discarded       []discardedPlan  `json:"discarded_plans,omitempty"`
-	Infeasible      []string         `json:"infeasible_reasons,omitempty"`
-	CohA            int              `json:"coh_a,omitempty"`
-	CohB            int              `json:"coh_b,omitempty"`
-	FluA            int              `json:"flu_a,omitempty"`
-	FluB            int              `json:"flu_b,omitempty"`
-	Judgments       []judgmentRecord `json:"judgments,omitempty"`
+	// v2 (dataset-spec §6). fitTriplets copies the contract fields into fit.Triplet.
+	ID              string       `json:"id,omitempty"`
+	SourceID        string       `json:"source_id,omitempty"`
+	Seed            uint64       `json:"seed,omitempty"`
+	Generator       string       `json:"generator,omitempty"`
+	GeneratorFamily string       `json:"generator_family,omitempty"`
+	VerifierFamily  string       `json:"verifier_family,omitempty"`
+	VerifierModel   string       `json:"verifier_model,omitempty"`
+	ExemplarPair    int          `json:"exemplar_pair,omitempty"`
+	Exemplars       []string     `json:"exemplars,omitempty"`
+	Domain          string       `json:"domain,omitempty"`
+	Format          string       `json:"format,omitempty"`
+	TopicID         string       `json:"topic_id,omitempty"`
+	Flags           tripletFlags `json:"flags,omitzero"`
+	// Plan is the catalogue's plan metadata verbatim (perturb.PlanInfo: sub-strata, flags, T1 target and
+	// predicted Δ(θ₀), per-side counts, swap, catalogue redraws and infeasible kinds); PlanA / PlanB its edits.
+	Plan  *perturb.PlanInfo `json:"plan,omitempty"`
+	PlanA []editRecord      `json:"plan_a,omitempty"`
+	PlanB []editRecord      `json:"plan_b,omitempty"`
+	// SubPlanned is the T3 sub-stratum drawn for the slot; DiagInfeasible counts the t3_diag relabels returned
+	// infeasible and redrawn inside the slot; DiagFallback marks a t3_diag slot that became ordinary T3 after
+	// maxDiagInfeasible of them (dataset-spec §2.2).
+	SubPlanned     perturb.T3Sub `json:"t3_sub_planned,omitempty"`
+	DiagInfeasible int           `json:"diag_infeasible,omitempty"`
+	DiagFallback   bool          `json:"diag_fallback,omitempty"`
+	// T1Delta0 / T1Stratum are the realized Δ(θ₀) and its stratum (Plan.T1Target / T1Delta0 are the planned ones).
+	T1Delta0   *float64         `json:"t1_delta0,omitempty"`
+	T1Stratum  string           `json:"t1_stratum,omitempty"`
+	Delta0     *float64         `json:"delta0,omitempty"` // realized Δ under θ₀ (all types)
+	PhiA       *ged.Features    `json:"phi_a,omitempty"`
+	PhiB       *ged.Features    `json:"phi_b,omitempty"`
+	RealizeA   *variantRecord   `json:"realization_a,omitempty"`
+	RealizeB   *variantRecord   `json:"realization_b,omitempty"`
+	Discarded  []discardedPlan  `json:"discarded_plans,omitempty"`
+	Infeasible []string         `json:"infeasible_reasons,omitempty"`
+	CohA       int              `json:"coh_a,omitempty"`
+	CohB       int              `json:"coh_b,omitempty"`
+	FluA       int              `json:"flu_a,omitempty"`
+	FluB       int              `json:"flu_b,omitempty"`
+	Judgments  []judgmentRecord `json:"judgments,omitempty"`
 	// Weight is the §0.1 reweighting weight (computed by the statistics side; nil here).
 	Weight *float64 `json:"weight,omitempty"`
 
@@ -311,8 +330,8 @@ func newTripletRecord(sr *sourceRecord, s slotSpec) *pilotTriplet {
 		Source: s.source, Type: s.typ, ID: fmt.Sprintf("%s-t%d", sr.SourceID, s.k), SourceID: sr.SourceID,
 		Seed: sr.Spec.Seed, Generator: sr.Generator, GeneratorFamily: sr.GeneratorFamily,
 		ExemplarPair: sr.ExemplarPair, Exemplars: sr.Exemplars, Domain: sr.Spec.Domain, Format: sr.Spec.Format,
-		TopicID: sr.Spec.TopicID, T1Planned: s.t1Stratum,
-		Flags: tripletFlags{QT30: sr.QT30, Episode: sr.Episode, Pilot: sr.Pilot, T3Ident: s.ident},
+		TopicID: sr.Spec.TopicID, SubPlanned: s.sub,
+		Flags: tripletFlags{QT30: sr.QT30, Episode: sr.Episode, Pilot: sr.Pilot},
 	}
 }
 
@@ -916,8 +935,12 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	}
 
 	// ---- G2–G4 plans, realization, verification ----
-	pp := &pipelineV2{ctx: ctx, gens: r.gens, mt: mt, emb: env.emb, sources: accepted, seed: o.seed, stats: newV2Stats()}
-	trips := pp.buildAll(rand.New(rand.NewPCG(o.seed, 0xb11d)))
+	pp := &pipelineV2{ctx: ctx, gens: r.gens, mt: mt, emb: env.emb, sources: accepted, seed: o.seed, stats: newV2Stats(),
+		catalogue: catalogueOptions(o.diagShare)}
+	trips, err := pp.buildAll(rand.New(rand.NewPCG(o.seed, 0xb11d)))
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "realized, cost $%.3f\n", mt.total())
 	var kept []*pilotTriplet
 	for _, t := range trips {
@@ -949,13 +972,13 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	writeCostTable(&b, mt, []string{"synth_topics", "synth_source", "verify_source", "realize", "verify", "judge"})
 	writeCostProjection(&b, mt, projectionFor(o, env.pricing))
 	writeSourceReport(&b, all)
-	ft, d0 := r.fitTriplets(kept, accepted)
+	ft, d0 := fitTriplets(kept, accepted)
 	writeVerifyReportV2(&b, pp.stats, kept, d0)
 	writeT1Report(&b, kept, js, o.judges)
 	if judgeErr != nil {
 		fmt.Fprintf(&b, "\n**判定の一部が失敗した**: %v\n", judgeErr)
 	}
-	if err := r.writeFitReport(&b, kept, ft, js, d0); err != nil {
+	if err := r.writeFitReport(&b, kept, ft, js, d0, pp.stats); err != nil {
 		fmt.Fprintf(&b, "\n（当てはめを行わなかった: %v）\n", err)
 	}
 	if err := os.WriteFile(filepath.Join(o.out, "pilot.md"), b.Bytes(), 0o644); err != nil {
@@ -1251,7 +1274,7 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 				rec.Answer = "same"
 			}
 			t.Judgments = append(t.Judgments, rec)
-			js = append(js, fit.Judgment{Triplet: it.t, Judge: j, Order: float64(it.order), Answer: a})
+			js = append(js, fit.Judgment{Triplet: it.t, Judge: j, Order: float64(it.order), Answer: a, Family: judge.Family})
 		}
 		if failed > 0 {
 			errs = append(errs, fmt.Errorf("judge %s: %d/%d judgments failed", judge.Model, failed, len(jr.results)))
@@ -1296,17 +1319,28 @@ func (r *v2run) projectBatch(judge synth.Judge, reqs []llm.Request) float64 {
 	return total
 }
 
-// fitTriplets builds the fit input of the kept triplets (sources are the accepted list).
-// TODO(integration): copy Type, Flags, Generator, VerifierFamily, ExemplarPair, Domain, Weight, CohA,
-// CohB and T1Delta0 into fit.Triplet (and Family into fit.Judgment) once those fields exist.
-func (r *v2run) fitTriplets(kept []*pilotTriplet, sources []*sourceRecord) ([]fit.Triplet, []float64) {
+// fitTriplets builds the fit input of the kept triplets (sources are the accepted list): every fit.Triplet
+// contract field is copied from the record (decisions-stats §16 #16–17), so a re-fit from the records needs no
+// other state than the cos tables.
+func fitTriplets(kept []*pilotTriplet, sources []*sourceRecord) ([]fit.Triplet, []float64) {
 	ft := make([]fit.Triplet, len(kept))
 	d0 := make([]float64, len(kept))
 	for i, t := range kept {
 		s := sources[t.Source].Discussion
 		ft[i] = fit.Triplet{Source: t.Source, Ref: s.Graph, A: t.TextA.Graph, B: t.TextB.Graph,
 			SimA: t.simA, SimB: t.simB,
-			NegDiff: float64(t.B.Neg - t.A.Neg)}
+			NegDiff: float64(t.Flags.PNegB - t.Flags.PNegA),
+			Type:    string(t.Type), Flags: t.fitFlagList(), Generator: t.Generator, VerifierFamily: t.VerifierFamily,
+			Domain: t.Domain, CohA: float64(t.CohA), CohB: float64(t.CohB)}
+		if t.ExemplarPair != 0 {
+			ft[i].ExemplarPair = strconv.Itoa(t.ExemplarPair)
+		}
+		if t.Weight != nil {
+			ft[i].Weight = *t.Weight
+		}
+		if t.T1Delta0 != nil {
+			ft[i].T1Delta0 = *t.T1Delta0
+		}
 		if t.Delta0 != nil {
 			d0[i] = *t.Delta0
 		}
@@ -1314,9 +1348,36 @@ func (r *v2run) fitTriplets(kept []*pilotTriplet, sources []*sourceRecord) ([]fi
 	return ft, d0
 }
 
-// writeFitReport fits the pairwise model. In P2 mode θ is fixed at θ₀ and only the auxiliary parameters
-// are reported (decisions-stats §16 #12); otherwise θ is estimated as in the PoC.
-func (r *v2run) writeFitReport(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.Triplet, js []fit.Judgment, d0 []float64) error {
+// pilotExclude is fit.DefaultExclude without "pilot": a pilot run fits its own (pilot-flagged) triplets, which the
+// main analysis drops by default; every other default exclusion (x_spk, diag_ca_type, qt30, del_add_cooccur) stays.
+func pilotExclude() []string {
+	return slices.DeleteFunc(slices.Clone(fit.DefaultExclude), func(f string) bool { return f == "pilot" })
+}
+
+// pilotFitOptions are the pre-registered fit settings of a run: the type tie (decisions-stats §12b), the default
+// exclusions (pilotExclude) and the three starts θ₀ / R1 / all-0.5 (§11.3). The P2 fit drops the starts (θ fixed).
+func (r *v2run) pilotFitOptions() fit.Options {
+	th0 := ged.Current()
+	starts, names := fit.DefaultStarts(th0)
+	return fit.Options{Judges: len(r.judges), Theta0: th0, Lambda: r.o.lambda, FitNeg: true, MaxOuter: 20,
+		Tie: fit.TypeTie(), Exclude: pilotExclude(), Starts: starts, StartNames: names}
+}
+
+// writeFitSet reports which triplets enter the fit.
+func writeFitSet(b *bytes.Buffer, ft []fit.Triplet, js []fit.Judgment, opts fit.Options) {
+	fs, fj, _ := fit.Filter(ft, js, opts)
+	var counts []string
+	for _, kv := range sortedKV(fit.ExclusionCounts(ft, opts)) {
+		counts = append(counts, kv[0]+" "+kv[1])
+	}
+	fmt.Fprintf(b, "\n- 当てはめに使う三つ組 %d / %d、判定 %d / %d（除いた三つ組: %s）。種別のタイ（RA↔CA、CA↔MA を RA↔MA に、決定文書 §12b）\n",
+		len(fs), len(ft), len(fj), len(js), strings.Join(counts, "、"))
+}
+
+// writeFitReport fits the pairwise model. In P2 mode θ is fixed at θ₀ and the P2 report of decisions-stats
+// §16 #12 is written (no θ); otherwise the confirmatory analysis (writeConfirmatory) and the untied diagnostic
+// fit of §12b run.
+func (r *v2run) writeFitReport(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.Triplet, js []fit.Judgment, d0 []float64, st *v2Stats) error {
 	if len(ft) < 10 || len(js) == 0 {
 		return fmt.Errorf("使える三つ組が %d、判定が %d しかない", len(ft), len(js))
 	}
@@ -1324,43 +1385,151 @@ func (r *v2run) writeFitReport(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.T
 	types, sign, neg := tripletMasks(kept, ft, d0)
 	judgeDiagnostics(b, o.judges, types, sign, js)
 	dNaive, _ := fit.Delta(ft, naiveTheta())
-	opts := fit.Options{Judges: len(r.judges), Theta0: ged.Current(), Lambda: o.lambda, FitNeg: true, MaxOuter: 20, AuxRidge: 0.5}
+	opts := r.pilotFitOptions()
 	writeICC(b, kept, js, d0)
 	if o.p2 {
-		opts.FixTheta = true
-		res, err := fit.Fit(ft, js, opts, nil)
+		// θ fixed at θ₀; the weak aux ridge of the pilots keeps β finite on ≈ 100 triplets.
+		opts.FixTheta, opts.AuxRidge, opts.Starts, opts.StartNames = true, 0.5, nil, nil
+		aux, err := fit.Fit(ft, js, opts, nil)
 		if err != nil {
 			return err
 		}
+		in := p2Input{Names: o.judges, Aux: aux.Params, Tie: opts.Tie, MinInf: fit.DefaultMinInformative(), Discards: st.discardRows()}
+		in.Trips, in.Js, _ = fit.Filter(ft, js, opts)
+		if mix, err := fit.FitMixed(ft, js, opts, nil); err == nil {
+			in.Mixed = &mix.Params
+		} else {
+			fmt.Fprintf(b, "\n（ランダム切片の当てはめに失敗した: %v）\n", err)
+		}
 		fmt.Fprintln(b, "\n## 補助パラメータ（θ = θ₀ に固定。P2 は θ を出さない）")
-		auxTable(b, o.judges, res.Params, nil)
+		writeFitSet(b, ft, js, opts)
+		if err := writeP2Report(b, in); err != nil {
+			return err
+		}
 		agreementTable(b, []agreeRow{{"R0 現行のコスト表", d0}, {"R1 素朴な一様コスト（種別違い・向き違い = 2.0）", dNaive}}, js, neg)
 		writeTypeBreakdown(b, kept, js, d0)
 		return nil
 	}
-	res, err := fit.Fit(ft, js, opts, nil)
-	if err != nil {
+	if err := r.writeConfirmatory(b, ft, js, opts); err != nil {
 		return err
 	}
-	boot, err := fit.Bootstrap(ft, js, opts, res.Params, o.boot, o.seed+100)
-	if err != nil {
-		return err
+	if err := r.writeDiagnosticFit(b, kept, ft, js, opts, st); err != nil {
+		fmt.Fprintf(b, "\n（診断用の当てはめに失敗した: %v）\n", err)
 	}
-	cv, err := fit.CrossValidate(ft, js, opts, 5, o.seed)
-	if err != nil {
-		return err
-	}
-	dEst, _ := fit.Delta(ft, res.Params.Theta)
-	agreementTable(b, []agreeRow{
-		{"R0 現行のコスト表", d0},
-		{"R1 素朴な一様コスト（種別違い・向き違い = 2.0）", dNaive},
-		{"R2 学習したコスト（学習に使ったデータ）", dEst},
-		{"R2 学習したコスト（5 分割交差検証）", cv},
-	}, js, neg)
-	paramTable(b, ged.Current(), nil, nil, res.Params, boot, o.m)
-	auxTable(b, o.judges, res.Params, nil)
+	agreementTable(b, []agreeRow{{"R0 現行のコスト表", d0}, {"R1 素朴な一様コスト（種別違い・向き違い = 2.0）", dNaive}}, js, neg)
 	writeTypeBreakdown(b, kept, js, d0)
-	return writeProfiles(filepath.Join(o.out, "profile.csv"), ft, js, opts, res.Params)
+	return nil
+}
+
+// writeConfirmatory is the θ analysis of a non-P2 run: fit.Confirmatory (judge QC before θ, the default filters
+// without "pilot", co-primary multi-start fits, paired bootstrap, §3 rule, §4 contrasts, D, verdict, LOJO) and its
+// only formatter WriteConfirmatory, then the profile likelihoods of the independence fit.
+func (r *v2run) writeConfirmatory(b *bytes.Buffer, ft []fit.Triplet, js []fit.Judgment, opts fit.Options) error {
+	o := r.o
+	co := fit.ConfirmOptions{Theta0: opts.Theta0, M: o.m, B: o.boot, DReps: o.dReps, Seed: o.seed, JudgeNames: o.judges, SkipExclusions: o.keepJudges}
+	res, err := fit.Confirmatory(ft, js, opts, co)
+	if err != nil {
+		if res.QC.Names != nil { // the QC ran before θ (e.g. every judge failed it): show why
+			writeJudgeQC(b, res.QC, res.Options)
+		}
+		return err
+	}
+	models := map[string]string{}
+	for _, m := range o.generators {
+		models["generator "+m] = m + "（" + r.gens[m].Writer().Setting() + "）"
+		if v := r.gens[m].Verifier; v != nil {
+			models["verifier of "+m] = v.Model + "（" + v.Setting() + "）"
+		}
+	}
+	for _, j := range r.judges {
+		models["judge "+j.Model] = j.Model + "（" + j.Setting() + "）"
+	}
+	WriteConfirmatory(b, res, provenance{Seeds: map[string]uint64{"pilot": o.seed}, PromptHashes: r.promptHashes(), ModelIDs: models,
+		M: res.Options.M, B: res.Options.B, U: res.Options.U, Extra: map[string]string{"sources": strconv.Itoa(o.sources), "qt30": strconv.FormatBool(o.withQT30)}})
+	single := opts
+	single.Starts, single.StartNames = nil, nil
+	return writeProfiles(filepath.Join(o.out, "profile.csv"), ft, js, single, res.Indep.Params)
+}
+
+// caPairOf maps a diagnostic relabel direction ("RA→CA" etc.) to its cost (RA↔CA or CA↔MA).
+func caPairOf(dir string) int {
+	if strings.Contains(dir, ged.RA) {
+		return ged.PTypeRACA
+	}
+	return ged.PTypeCAMA
+}
+
+// diagCounts are the accepted diagnostic relabels per CA pair among the kept triplets, and whether a pair is
+// reported as counts only (a direction's infeasibility rate > 60% in the realization attempts, decisions-stats §12b).
+func diagCounts(kept []*pilotTriplet, st *v2Stats) (feasible map[int]int, countsOnly map[int]bool) {
+	feasible, countsOnly = map[int]int{}, map[int]bool{}
+	for _, t := range kept {
+		if t.Plan == nil || !t.Plan.DiagCAType || t.Flags.QT30 {
+			continue
+		}
+		for _, e := range append(slices.Clone(t.EditsA), t.EditsB...) {
+			if e.Kind == perturb.RTypeCA {
+				feasible[caPairOf(e.Direction)]++
+			}
+		}
+	}
+	if st != nil {
+		for dir := range st.diagDir {
+			if st.diagInfeasibleRate(dir) > diagCountsOnly {
+				countsOnly[caPairOf(dir)] = true
+			}
+		}
+	}
+	return feasible, countsOnly
+}
+
+// writeDiagnosticFit is the pre-registered untied diagnostic fit (decisions-stats §12b; descriptive, no §3 label):
+// the type tie off and the diag_ca_type triplets included (the other exclusions kept), one start from θ₀, and a
+// cluster bootstrap of -boot replicates for the CA pairs' 90% intervals and their contrasts with θ̃_RA↔MA (the
+// two directions of a pair pooled; a pair whose direction is > 60% infeasible is reported as counts only).
+func (r *v2run) writeDiagnosticFit(b *bytes.Buffer, kept []*pilotTriplet, ft []fit.Triplet, js []fit.Judgment, base fit.Options, st *v2Stats) error {
+	od := base
+	od.Tie, od.Starts, od.StartNames = nil, nil, nil
+	od.Exclude = slices.DeleteFunc(slices.Clone(base.Exclude), func(f string) bool { return f == "diag_ca_type" })
+	feas, countsOnly := diagCounts(kept, st)
+	fmt.Fprintln(b, "\n## 種別のタイを外した診断用の当てはめ（決定文書 §12b、記述のみ）")
+	if feas[ged.PTypeRACA]+feas[ged.PTypeCAMA] == 0 {
+		fmt.Fprintln(b, "\n採用した t3_diag の付け替えが無いので当てはめない。")
+		return nil
+	}
+	res, err := fit.Fit(ft, js, od, nil)
+	if err != nil {
+		return err
+	}
+	est, _ := fit.NormalizeParams(res.Params, nil)
+	br, err := fit.BootstrapOpts(ft, js, od, res.Params, fit.BootOptions{Reps: r.o.boot, Seed: r.o.seed + 300})
+	if err != nil {
+		return err
+	}
+	boot, _ := fit.NormalizeRows(br.Theta, nil)
+	th0 := fit.Theta0Extended(base.Theta0)
+	fmt.Fprintf(b, "\nタイなし、diag_ca_type の三つ組を含める（ほかの除外は同じ）。三つ組 %d、収束 %v、循環 %v。自身の θ̃_RA↔MA = %.3f。区間はクラスタブートストラップ %d 回のパーセンタイル。\n",
+		res.Triplets, res.Converged, res.Cycled, est[ged.PTypeRAMA], len(br.Theta))
+	fmt.Fprintln(b, "\n| 種別の組 | θ₀ | 推定（固定尺度） | 推定（正規化） | 90% 区間 | θ̃_RA↔MA との差 | 95% 区間 | 採用した付け替え |")
+	fmt.Fprintln(b, "| --- | --: | --: | --: | --- | --: | --- | --: |")
+	for _, p := range []int{ged.PTypeRACA, ged.PTypeCAMA} {
+		col := sortedClean(fit.Column(boot, p))
+		var cb []float64
+		for _, row := range boot {
+			if row != nil {
+				cb = append(cb, row[p]-row[ged.PTypeRAMA])
+			}
+		}
+		con := stats.BootstrapContrast(est[p]-est[ged.PTypeRAMA], cb, 0, stats.TwoSided)
+		cell := fmt.Sprintf("%.3f | %.3f | [%s, %s] | %+.3f | %s", res.Params.Theta[p], est[p],
+			num(stats.Quantile(col, 0.05)), num(stats.Quantile(col, 0.95)), con.Est, ci(con.CI95))
+		if countsOnly[p] {
+			cell = "— | — | 件数のみ（infeasible の率 > 60%） | — | —"
+		}
+		fmt.Fprintf(b, "| %s | %s | %s | %d |\n", ged.ParamNames[p], num(th0[p]), cell, feas[p])
+	}
+	fmt.Fprintln(b, "\n診断セルは実現可能な（弱い関係の）付け替えだけなので、一般の符号反転の費用ではない（review m14）。m の帯による判断はしない。")
+	return nil
 }
 
 // writeProvenance is the provenance block of every v2 output (decisions-stats §16 #13).
@@ -1543,20 +1712,24 @@ func writeT1Report(b *bytes.Buffer, kept []*pilotTriplet, js []fit.Judgment, jud
 		}
 		n++
 		strata[t.T1Stratum]++
-		p := planned[t.T1Planned]
+		target := ""
+		if t.Plan != nil {
+			target = t.Plan.T1Target
+		}
+		p := planned[target]
 		p[0]++
-		if t.T1Planned == t.T1Stratum {
+		if target == t.T1Stratum {
 			p[1]++
 		}
-		planned[t.T1Planned] = p
+		planned[target] = p
 	}
-	fmt.Fprintf(b, "\n- T1 の三つ組 %d。実現後の層: [0.5,1) %d、[1,2) %d、≥2（関門集合）%d\n", n, strata[t1Low], strata[t1Mid], strata[t1Gate])
+	fmt.Fprintf(b, "\n- T1 の三つ組 %d。実現後の層: [0.5,1) %d、[1,2) %d、≥2（関門集合）%d\n", n, strata[perturb.T1Low], strata[perturb.T1Mid], strata[perturb.T1High])
 	for _, k := range sortedKeys(planned) {
 		fmt.Fprintf(b, "- 計画の層 %s: %d 件、うち実現後も同じ層 %d\n", k, planned[k][0], planned[k][1])
 	}
 	gate := map[int]bool{}
 	for i, t := range kept {
-		if t.Type == perturb.T1Monotone && t.T1Stratum == t1Gate {
+		if t.Type == perturb.T1Monotone && t.T1Stratum == perturb.T1High {
 			gate[i] = true
 		}
 	}
@@ -2115,7 +2288,7 @@ func auditEdit(e editRecord, g ged.Graph, read []ged.Edge, content map[string]st
 		return !related(e.Edge.From, e.Edge.To), true
 	case perturb.RAdd:
 		return has(e.Edge.From, e.Edge.To, e.Edge.Kind), true
-	case perturb.RType:
+	case perturb.RType, perturb.RTypeCA:
 		return has(e.Edge.From, e.Edge.To, e.NewKind), true
 	case perturb.RRev:
 		return has(e.Edge.To, e.Edge.From, e.Edge.Kind), true

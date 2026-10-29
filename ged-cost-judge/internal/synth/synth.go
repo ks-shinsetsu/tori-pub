@@ -474,6 +474,11 @@ func describe(e perturb.Edit) string {
 	case perturb.RType:
 		return fmt.Sprintf("Change the relation \"%s %s %s\" so that %s now %s %s, keeping what each proposition claims as far as possible.",
 			short(e.Edge.From), verbs[e.Edge.Kind], short(e.Edge.To), short(e.Edge.From), verbs[e.NewKind], short(e.Edge.To))
+	case perturb.RTypeCA:
+		// The diagnostic CA-involving relabel (dataset-spec §2.1–§2.2); only the v3 realizer is given it.
+		// New case, so the v1 wording (and cache keys) of the other kinds is unchanged.
+		return fmt.Sprintf("Change the relation \"%s %s %s\" so that %s now %s %s, keeping the wording of both propositions.",
+			short(e.Edge.From), verbs[e.Edge.Kind], short(e.Edge.To), short(e.Edge.From), verbs[e.NewKind], short(e.Edge.To))
 	case perturb.RRev:
 		return fmt.Sprintf("Reverse the relation \"%s %s %s\" so that %s now %s %s.",
 			short(e.Edge.From), verbs[e.Edge.Kind], short(e.Edge.To), short(e.Edge.To), verbs[e.Edge.Kind], short(e.Edge.From))

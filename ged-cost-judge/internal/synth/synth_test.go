@@ -125,6 +125,55 @@ func TestRealizeIncremental(t *testing.T) {
 	}
 }
 
+// The diagnostic CA relabel (dataset-spec §2.2): the v3 instruction names the direction in words and the signalling
+// of the new relation, says that infeasible is an expected answer, and the realizer may return it infeasible.
+func TestRealizeTypeCA(t *testing.T) {
+	for _, d := range perturb.TypeCADirections {
+		e := perturb.Edit{Kind: perturb.RTypeCA, Edge: &ged.Edge{From: "s0.p4", To: "s0.p3", Kind: d[0]}, NewKind: d[1], Direction: perturb.DirectionLabel(d[0], d[1])}
+		got := describeV3(e)
+		gloss := relationNoun[d[0]] + " becomes " + relationNoun[d[1]]
+		for _, want := range []string{`Change the relation "p4 ` + verbs[d[0]] + ` p3"`, "p4 now " + verbs[d[1]] + " p3", gloss, "expected answer for this edit"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s: %q lacks %q", e.Direction, got, want)
+			}
+		}
+		if hint := caDirectionHint(e); !strings.Contains(got, hint) {
+			t.Errorf("%s: no signalling hint in %q", e.Direction, got)
+		}
+		if describe(e) == "" {
+			t.Errorf("%s: no v1 wording", e.Direction)
+		}
+	}
+	// Edit.Direction is what the realizer is told, even if the edge were recorded after the relabel.
+	e := perturb.Edit{Kind: perturb.RTypeCA, Edge: &ged.Edge{From: "s0.p2", To: "s0.p1", Kind: ged.CA}, NewKind: ged.CA, Direction: "RA→CA"}
+	if g := caDirectionGloss(e); g != "a support becomes an attack" {
+		t.Errorf("gloss %q", g)
+	}
+	// The R-type (estimation) wording is unchanged by the new kind.
+	rt := perturb.Edit{Kind: perturb.RType, Edge: &ged.Edge{From: "s0.p2", To: "s0.p1", Kind: ged.RA}, NewKind: ged.MA}
+	if strings.Contains(describeV3(rt), "expected answer") || strings.Contains(describe(rt), "wording of both") {
+		t.Errorf("R-type wording changed: %q / %q", describeV3(rt), describe(rt))
+	}
+
+	base := baseDiscussion()
+	edge := base.Graph.Edges[1] // p4 attacks p3
+	g := base.Graph.Clone()
+	g.Edges[1].Kind = ged.RA
+	tv := perturb.Variant{Graph: g, Edits: []perturb.Edit{{Kind: perturb.RTypeCA, Edge: &edge, NewKind: ged.RA, Direction: "CA→RA"}}}
+	var user string
+	gen := &Generator{Model: "m", Version: V2, Client: &llm.FuncClient{Fn: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		user = req.Messages[len(req.Messages)-1].Content
+		return &llm.Response{Text: `{"infeasible": true, "reason": "p4 would have to be negated", "changes": [], "propositions": []}`, Model: req.Model}, nil
+	}}}
+	res, _, err := gen.Realize(context.Background(), RealizeInput{Base: base, Target: tv, Edits: tv.Edits, Prefix: "s0."})
+	if err != nil || !res.Infeasible || res.Reason != "p4 would have to be negated" {
+		t.Fatalf("infeasible R-type-CA: %+v %v", res, err)
+	}
+	if !strings.Contains(user, "an attack becomes a support") || !slices.Contains(InfeasibleKinds, perturb.RTypeCA) {
+		t.Fatalf("realize request lacks the CA instruction:\n%s", user)
+	}
+}
+
 func TestCheckUntouched(t *testing.T) {
 	base := baseDiscussion().Utterances
 	out := slices.Clone(base)

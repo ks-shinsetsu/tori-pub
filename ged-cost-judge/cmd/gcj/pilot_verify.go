@@ -25,45 +25,83 @@ import (
 //   - For T3, half the pairs have a difference near 0 under current prices and half a clear difference (plan §4.3).
 //     cos is unknown before realization, so selection predicts the difference from a cos estimated from edit strength
 //
-// v2 (dataset-spec §3.1, §4.2–§4.3): the writer realizes with realize_v3 (touched-proposition texts,
-// infeasible flag), the other-family verifier re-annotates the touched elements blind (verify_v2),
-// an infeasible return or a failed plan is redrawn (≤ 3 plans per slot) and kept as a discarded plan,
+// v2 (dataset-spec §2–§4): plans come from the catalogue (perturb.DrawTriplet with the source's prop→utterance
+// map, the embedding cos between source propositions, θ₀ and the strength-predicted cos); the writer realizes
+// with realize_v3 (touched-proposition texts, infeasible flag), the other-family verifier re-annotates the touched
+// elements blind (verify_v2), an infeasible return or a failed plan is redrawn (≤ 3 plans per slot) and kept as a
+// discarded plan; a t3_diag relabel returned infeasible is redrawn inside the slot (≤ 3, then an ordinary T3 slot);
 // T1's B is realized incrementally from A's realized text and must reach realized Δ(θ₀) ≥ 0.5.
 
 const nearThreshold = 0.3
 
 // ---------------------------------------------------------------------------------------------
-// Records (dataset-spec §6). Every value known here is stored so that the integration with the
-// revised perturb.Edit / fit.Triplet is a copy.
+// Records (dataset-spec §6). The plan metadata is perturb.PlanInfo verbatim (pilotTriplet.Plan); the
+// fields here are the pilot-only ones.
 
-// tripletFlags are the per-triplet flags of dataset-spec §6.
+// tripletFlags are the pilot-only flags of dataset-spec §6. The plan flags (x_spk, diag_ca_type, t3_ident,
+// t3_ident_cell, t3_diag, del_add_cooccur) are in the triplet's "plan" (perturb.PlanInfo).
 type tripletFlags struct {
-	QT30          bool   `json:"qt30,omitempty"`
-	Episode       string `json:"episode,omitempty"`
-	Pilot         bool   `json:"pilot,omitempty"`
-	XSpk          bool   `json:"x_spk,omitempty"`
-	DiagCAType    bool   `json:"diag_ca_type,omitempty"`
-	T3Ident       bool   `json:"t3_ident,omitempty"`
-	DelAddCooccur bool   `json:"del_add_cooccur,omitempty"`
-	PNegA         int    `json:"p_neg_a,omitempty"`
-	PNegB         int    `json:"p_neg_b,omitempty"`
+	QT30    bool   `json:"qt30,omitempty"`
+	Episode string `json:"episode,omitempty"`
+	Pilot   bool   `json:"pilot,omitempty"`
+	PNegA   int    `json:"p_neg_a,omitempty"`
+	PNegB   int    `json:"p_neg_b,omitempty"`
+	// Fit is the flag list handed to fit.Triplet.Flags (tripletFitFlags; decisions-stats §16 #16).
+	Fit []string `json:"fit,omitempty"`
 }
 
-// editRecord is one edit with the attributes dataset-spec §6 asks for.
-// TODO(integration): perturb.Edit gains Direction, Distance, Degree, EdgesRemoved and Infeasible; then
-// take them from the edit instead of computing them here (editRecords) and drop the duplicates.
+// tripletFitFlags is the fit.Triplet flag list (decisions-stats §16 #16). The first six follow
+// simulate.Meta.Flags exactly (TestFitFlagsMatchSimulator): x_spk, diag_ca_type, del_add_cooccur, t3_ident and
+// t3_diag from the plan, and t1_gate for a T1 triplet whose realized Δ(θ₀) is > 0 and in the ≥ 2 stratum (§9.1);
+// then the pilot-only qt30 and pilot.
+func tripletFitFlags(typ perturb.TripletType, info perturb.PlanInfo, delta0 float64, t1Stratum string, qt30, pilot bool) []string {
+	var f []string
+	add := func(name string, ok bool) {
+		if ok {
+			f = append(f, name)
+		}
+	}
+	add("x_spk", info.XSpk)
+	add("diag_ca_type", info.DiagCAType)
+	add("del_add_cooccur", info.DelAddCooccur)
+	add("t3_ident", info.T3Ident)
+	add("t3_diag", info.T3Diag)
+	add("t1_gate", typ == perturb.T1Monotone && delta0 > 1e-9 && t1Stratum == perturb.T1High)
+	add("qt30", qt30)
+	add("pilot", pilot)
+	return f
+}
+
+// editRecord is one planned edit as stored (dataset-spec §6): the catalogue's perturb.Edit (kind, targets,
+// direction, strength, new kind, utterance distance, degree, edges removed, infeasible reason) plus the
+// realized cos of a substitution edit.
 type editRecord struct {
 	perturb.Edit
-	// Direction is "RA→MA" etc. for R-type, the edge kind for the other relation edits.
-	Direction string `json:"direction,omitempty"`
-	// Distance is the utterance distance of the edge in S (relation edits, P-del+R: max over removed edges).
-	Distance *int `json:"distance,omitempty"`
-	// Degree is the degree in S of each touched source proposition.
-	Degree []int `json:"degree,omitempty"`
-	// EdgesRemoved is the number of edges removed with the proposition (P-del+R).
-	EdgesRemoved int `json:"edges_removed,omitempty"`
 	// RealizedCos is the embedding cos between the source and the realized proposition (P-para / P-shift / P-neg).
 	RealizedCos *float64 `json:"realized_cos,omitempty"`
+}
+
+// editRecords wraps the planned edits for the record.
+func editRecords(edits []perturb.Edit) []editRecord {
+	out := make([]editRecord, len(edits))
+	for i, e := range edits {
+		out[i] = editRecord{Edit: e}
+	}
+	return out
+}
+
+// planRecord is the plan metadata as stored: perturb.PlanInfo verbatim, except that a Δ(θ₀) that could not be
+// computed (NaN, only when ged.Compute fails) is stored as 0, since encoding/json cannot encode NaN.
+func planRecord(tp perturb.TripletPlan) *perturb.PlanInfo {
+	p := tp.PlanInfo
+	p.Infeasible = slices.Clone(p.Infeasible)
+	if math.IsNaN(p.PredDelta0) || math.IsInf(p.PredDelta0, 0) {
+		p.PredDelta0 = 0
+	}
+	if math.IsNaN(p.T1Delta0) || math.IsInf(p.T1Delta0, 0) {
+		p.T1Delta0 = 0
+	}
+	return &p
 }
 
 // attemptRecord is one realize (+ verify) attempt.
@@ -103,14 +141,20 @@ type variantRecord struct {
 
 // discardedPlan is a plan that was redrawn, with its reasons (dataset-spec §4.2, decisions-stats §15 item 7).
 type discardedPlan struct {
-	Plan   int          `json:"plan"`
+	Plan int `json:"plan"`
+	// Info is the plan's metadata (perturb.PlanInfo verbatim, as in pilotTriplet.Plan).
+	Info *perturb.PlanInfo `json:"plan_info,omitempty"`
+	// EditsA / EditsB are the planned edits; an edit the realizer returned infeasible carries the reason (Edit.Infeasible).
 	EditsA []editRecord `json:"edits_a"`
 	EditsB []editRecord `json:"edits_b"`
 	// Reason is "infeasible", "verification", "t1_delta" or "error".
-	Reason  string         `json:"reason"`
-	Details []string       `json:"details,omitempty"`
-	A       *variantRecord `json:"a,omitempty"`
-	B       *variantRecord `json:"b,omitempty"`
+	Reason  string   `json:"reason"`
+	Details []string `json:"details,omitempty"`
+	// DiagRedraw marks a t3_diag relabel returned infeasible: redrawn inside the slot, not counted against the
+	// plan cap (dataset-spec §2.2).
+	DiagRedraw bool           `json:"diag_redraw,omitempty"`
+	A          *variantRecord `json:"a,omitempty"`
+	B          *variantRecord `json:"b,omitempty"`
 }
 
 // judgmentRecord is one judgment (judge × presentation order).
@@ -216,9 +260,9 @@ func reasonOf(p string) string {
 type slotSpec struct {
 	source, k int
 	typ       perturb.TripletType
-	// v2: T3 identifiability sub-stratum and the planned T1 Δ stratum.
-	ident     bool
-	t1Stratum string
+	// sub is the T3 sub-stratum of a v2 slot, drawn once per slot (dataset-spec §2.2; the T1 Δ(θ₀) stratum is
+	// drawn by perturb.DrawTriplet).
+	sub perturb.T3Sub
 }
 
 type verifyPipeline struct {
@@ -473,197 +517,22 @@ func sortedKeys[K ~string, V any](m map[K]V) []K {
 // ---------------------------------------------------------------------------------------------
 // v2 slot pipeline.
 
-// t1Kinds are the kinds allowed as T1's extra edit (dataset-spec §3.1 item 2).
-func t1Allowed(e perturb.Edit) bool {
-	switch e.Kind {
-	case perturb.RDel, perturb.RAdd, perturb.RRev, perturb.PDel, perturb.PAdd, perturb.PDelR:
-		return true
-	case perturb.RType:
-		return !involvesCA(e)
-	case perturb.PShift:
-		return e.Strength == "medium" || e.Strength == "large"
-	}
-	return false
-}
-
-func involvesCA(e perturb.Edit) bool {
-	return e.Kind == perturb.RType && e.Edge != nil && (e.Edge.Kind == ged.CA || e.NewKind == ged.CA)
-}
-
-// T1 Δ(θ₀) strata (dataset-spec §3.1 item 3; the gate set is "≥2").
 const (
-	t1Low  = "[0.5,1)"
-	t1Mid  = "[1,2)"
-	t1Gate = ">=2"
+	// maxPlans is the number of plans a v2 slot may use (dataset-spec §4.2); in-slot t3_diag redraws do not count.
+	maxPlans = 3
+	// maxDiagInfeasible is the number of infeasible relabel returns on a source after which a t3_diag slot falls
+	// back to an ordinary T3 slot (dataset-spec §2.2).
+	maxDiagInfeasible = 3
+	// diagCountsOnly is the per-direction infeasibility rate above which a CA pair is reported as counts only
+	// (decisions-stats §12b).
+	diagCountsOnly = 0.6
 )
 
-func t1StratumOf(d float64) string {
-	switch {
-	case d >= 2:
-		return t1Gate
-	case d >= 1:
-		return t1Mid
-	case d >= 0.5:
-		return t1Low
-	case d > 0:
-		return "<0.5"
-	}
-	return "<=0"
-}
-
-// drawT1Stratum draws the planned stratum: ≈ 110 of 300 T1 slots go to the gate stratum (§3.1 item 3).
-func drawT1Stratum(rng *rand.Rand) string {
-	switch r := rng.Float64(); {
-	case r < 0.32:
-		return t1Low
-	case r < 0.64:
-		return t1Mid
-	}
-	return t1Gate
-}
-
-// delAddCooccur reports the m7 co-occurrence (P-add with P-del or P-del+R in one variant).
-func delAddCooccur(es []perturb.Edit) bool {
-	var add, del bool
-	for _, e := range es {
-		add = add || e.Kind == perturb.PAdd
-		del = del || e.Kind == perturb.PDel || e.Kind == perturb.PDelR
-	}
-	return add && del
-}
-
-// planT3Ident builds the node-only vs edge-only contrast of the t3_ident sub-stratum (dataset-spec §2.2):
-// side 1 from {P-del, P-para, X-surf} containing a P-del (P-add is excluded by the m7 ban), side 2 from
-// {R-del, R-add, R-rev, R-type} containing an R-del, 1–4 edits per side, sides randomized.
-// TODO(integration): replace with perturb.Plan's t3_ident once the revised perturb lands.
-func planT3Ident(rng *rand.Rand) (a, b []perturb.Kind) {
-	node := []perturb.Kind{perturb.PDel}
-	for range rng.IntN(4) {
-		node = append(node, []perturb.Kind{perturb.PDel, perturb.PPara, perturb.XSurf}[rng.IntN(3)])
-	}
-	edge := []perturb.Kind{perturb.RDel}
-	for range rng.IntN(4) {
-		edge = append(edge, []perturb.Kind{perturb.RDel, perturb.RAdd, perturb.RRev, perturb.RType}[rng.IntN(4)])
-	}
-	if rng.IntN(2) == 0 {
-		return node, edge
-	}
-	return edge, node
-}
-
-// drawPairV2 draws a plan for a v2 slot. T1: A's edits are a prefix of B's, the extra edits are of the
-// §3.1 kinds, and the predicted Δ(θ₀) falls into the planned stratum (best effort over 60 draws; at
-// least ≥ 0.5). T3: the m7 ban, the t3_ident sub-stratum, and near/clear targeting for the rest.
-func drawPairV2(rng *rand.Rand, src ged.Graph, s slotSpec) (a, b perturb.Variant, pred float64) {
-	near := s.k%2 == 0
-	var fallback *[2]perturb.Variant
-	fallbackPred := math.NaN()
-	for range 60 {
-		var ka, kb []perturb.Kind
-		if s.ident {
-			ka, kb = planT3Ident(rng)
-		} else {
-			ka, kb = perturb.Plan(rng, s.typ)
-		}
-		// TODO(integration): perturb.Build takes options (source-proposition Sim and the prop→utterance
-		// map, for the R-add distance strata and the cos ≥ 0.35 filter); pass the source's here (drawPairV2
-		// then needs the synth.Discussion and the embeddings of the source propositions).
-		if s.typ == perturb.T1Monotone {
-			steps := perturb.Build(rng, src, kb)
-			a, b = steps[min(len(ka), len(steps))-1], steps[len(steps)-1]
-			if len(b.Edits) <= len(a.Edits) || len(a.Edits) == 0 {
-				continue
-			}
-			ok := !delAddCooccur(a.Edits) && !delAddCooccur(b.Edits)
-			for _, e := range b.Edits[len(a.Edits):] {
-				ok = ok && t1Allowed(e)
-			}
-			if !ok {
-				continue
-			}
-			// TODO(integration): use perturb's Delta0 helper and its T1 strata once available.
-			pred = predictedDelta(src, a, b)
-			if pred >= 0.5 && fallback == nil {
-				fallback, fallbackPred = &[2]perturb.Variant{a, b}, pred
-			}
-			if t1StratumOf(pred) == s.t1Stratum {
-				return a, b, pred
-			}
-			continue
-		}
-		a, b = lastOf(perturb.Build(rng, src, ka)), lastOf(perturb.Build(rng, src, kb))
-		if delAddCooccur(a.Edits) || delAddCooccur(b.Edits) {
-			continue
-		}
-		if s.typ != perturb.T3Contrast || s.ident {
-			return a, b, math.NaN()
-		}
-		pred = predictedDelta(src, a, b)
-		if fallback == nil {
-			fallback, fallbackPred = &[2]perturb.Variant{a, b}, pred
-		}
-		if (math.Abs(pred) < nearThreshold) == near {
-			return a, b, pred
-		}
-	}
-	if fallback != nil {
-		return fallback[0], fallback[1], fallbackPred
-	}
-	return a, b, pred
-}
-
-// editRecords annotates edits with the §6 attributes, measured on the source.
-func editRecords(src synth.Discussion, edits []perturb.Edit) []editRecord {
-	deg := map[string]int{}
-	for _, e := range src.Graph.Edges {
-		deg[e.From]++
-		deg[e.To]++
-	}
-	dist := func(a, b string) *int {
-		ua, ok1 := src.PropUtterance[a]
-		ub, ok2 := src.PropUtterance[b]
-		if !ok1 || !ok2 {
-			return nil
-		}
-		d := ua - ub
-		if d < 0 {
-			d = -d
-		}
-		return &d
-	}
-	out := make([]editRecord, len(edits))
-	for i, e := range edits {
-		r := editRecord{Edit: e}
-		switch e.Kind {
-		case perturb.RType:
-			r.Direction = e.Edge.Kind + "→" + e.NewKind
-		case perturb.RRev, perturb.RAdd, perturb.RDel:
-			r.Direction = e.Edge.Kind
-		}
-		if e.Edge != nil {
-			r.Distance = dist(e.Edge.From, e.Edge.To)
-			for _, id := range []string{e.Edge.From, e.Edge.To} {
-				r.Degree = append(r.Degree, deg[id])
-			}
-		}
-		if e.Prop != "" {
-			if _, inSrc := src.PropUtterance[e.Prop]; inSrc {
-				r.Degree = append(r.Degree, deg[e.Prop])
-			}
-		}
-		if e.Kind == perturb.PDelR {
-			r.EdgesRemoved = deg[e.Prop]
-			for _, x := range src.Graph.Edges {
-				if x.From == e.Prop || x.To == e.Prop {
-					if d := dist(x.From, x.To); d != nil && (r.Distance == nil || *d > *r.Distance) {
-						r.Distance = d
-					}
-				}
-			}
-		}
-		out[i] = r
-	}
-	return out
+// catalogueOptions are the catalogue options of a v2 run: the dataset-spec §2–§3 defaults with θ₀ = ged.Current()
+// and the strength-predicted cos for the Δ(θ₀) targeting; diagShare overrides the t3_diag share when non-zero.
+func catalogueOptions(diagShare float64) perturb.BuildOptions {
+	th0 := ged.Current()
+	return perturb.BuildOptions{Theta0: &th0, CosPred: perturb.PredictedCos, DiagShare: diagShare}
 }
 
 // statKeys are the kind × direction × edit-count cells of the first-pass gate (dataset-spec §7).
@@ -678,7 +547,7 @@ func statKeys(recs []editRecord, qt30 bool) []string {
 		}
 		k := string(r.Kind)
 		switch r.Kind {
-		case perturb.RType:
+		case perturb.RType, perturb.RTypeCA:
 			k += " " + r.Direction
 		case perturb.RAdd:
 			if r.Distance != nil && *r.Distance >= 5 {
@@ -715,11 +584,57 @@ type v2Stats struct {
 	// infeasible per kind × direction (redraws).
 	infeasible map[string]int
 	t1Dropped  int
+	// t3_diag (dataset-spec §2.2): slots planned in the sub-stratum, accepted with the relabel, fallen back to an
+	// ordinary T3 slot; diagDir counts relabel realizations and infeasible returns per direction.
+	diagSlots, diagAccepted, diagFallback int
+	diagDir                               map[string]*[2]int
+	// discards counts plans and discarded plans per edit kind × generator (decisions-stats §15 item 8).
+	discards map[[2]string]*[2]int
 }
 
 func newV2Stats() *v2Stats {
 	return &v2Stats{cells: map[string]*[5]int{}, reasons: map[string]int{}, confusions: map[string]int{},
-		byPair: map[string]*[2]int{}, infeasible: map[string]int{}}
+		byPair: map[string]*[2]int{}, infeasible: map[string]int{}, diagDir: map[string]*[2]int{}, discards: map[[2]string]*[2]int{}}
+}
+
+// countPlan adds one realized plan (its edit kinds, once each) to the discard table of generator gen.
+func (s *v2Stats) countPlan(gen string, edits []editRecord, discarded bool) {
+	seen := map[perturb.Kind]bool{}
+	for _, e := range edits {
+		if seen[e.Kind] {
+			continue
+		}
+		seen[e.Kind] = true
+		k := [2]string{string(e.Kind), gen}
+		c := s.discards[k]
+		if c == nil {
+			c = &[2]int{}
+			s.discards[k] = c
+		}
+		c[0]++
+		if discarded {
+			c[1]++
+		}
+	}
+}
+
+// discardRows is the discard-rate table (edit kind × generator) for the P2 report: plans containing the kind,
+// discarded plans and the rate.
+func (s *v2Stats) discardRows() [][]string {
+	if len(s.discards) == 0 {
+		return nil
+	}
+	keys := make([][2]string, 0, len(s.discards))
+	for k := range s.discards {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b [2]string) int { return strings.Compare(a[0]+"\x00"+a[1], b[0]+"\x00"+b[1]) })
+	rows := [][]string{{"編集", "生成モデル", "計画", "破棄した計画", "破棄率"}}
+	for _, k := range keys {
+		c := s.discards[k]
+		rows = append(rows, []string{k[0], k[1], fmt.Sprint(c[0]), fmt.Sprint(c[1]), fmt.Sprintf("%.0f%%", pct(c[1], c[0]))})
+	}
+	return rows
 }
 
 func (s *v2Stats) record(recs []editRecord, rec *variantRecord, infeasible, qt30 bool, pair string) {
@@ -744,6 +659,20 @@ func (s *v2Stats) record(recs []editRecord, rec *variantRecord, infeasible, qt30
 			c[2]++
 		default:
 			c[3]++
+		}
+	}
+	for _, r := range recs {
+		if r.Kind != perturb.RTypeCA || qt30 {
+			continue
+		}
+		c := s.diagDir[r.Direction]
+		if c == nil {
+			c = &[2]int{}
+			s.diagDir[r.Direction] = c
+		}
+		c[0]++
+		if infeasible {
+			c[1]++
 		}
 	}
 	if infeasible {
@@ -777,6 +706,15 @@ func (s *v2Stats) record(recs []editRecord, rec *variantRecord, infeasible, qt30
 	}
 }
 
+// diagInfeasibleRate is the infeasibility rate of the relabels in direction dir (NaN if none was realized).
+func (s *v2Stats) diagInfeasibleRate(dir string) float64 {
+	c := s.diagDir[dir]
+	if c == nil || c[0] == 0 {
+		return math.NaN()
+	}
+	return float64(c[1]) / float64(c[0])
+}
+
 type pipelineV2 struct {
 	ctx     context.Context
 	gens    map[string]*synth.Generator // by generator model id
@@ -785,6 +723,9 @@ type pipelineV2 struct {
 	sources []*sourceRecord
 	seed    uint64
 	stats   *v2Stats
+	// catalogue are the run's catalogue options; srcOpts adds each source's utterance map and proposition cos.
+	catalogue perturb.BuildOptions
+	srcOpts   []perturb.BuildOptions
 }
 
 // realizeOutcome is the result of realizing one variant.
@@ -871,35 +812,140 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 	return synth.Discussion{}, rec, outcomeFailed
 }
 
-// slot builds one v2 triplet (≤ 3 plans).
+// sourceOptions fills the per-source catalogue options: the prop→utterance map (R-add distance strata and the
+// recorded utterance distances) and the embedding cos between source propositions (the R-add cos floor).
+func (pp *pipelineV2) sourceOptions() error {
+	var texts []string
+	seen := map[string]bool{}
+	for _, sr := range pp.sources {
+		for _, p := range sr.Discussion.Graph.Props {
+			if p.Text != "" && !seen[p.Text] {
+				seen[p.Text] = true
+				texts = append(texts, p.Text)
+			}
+		}
+	}
+	vec := map[string][]float32{}
+	if len(texts) > 0 {
+		vs, err := pp.emb.Embed(pp.ctx, texts)
+		if err != nil {
+			return fmt.Errorf("pilot: embed source propositions: %w", err)
+		}
+		for i, s := range texts {
+			vec[s] = vs[i]
+		}
+	}
+	pp.srcOpts = make([]perturb.BuildOptions, len(pp.sources))
+	for i, sr := range pp.sources {
+		o := pp.catalogue
+		if len(sr.Discussion.PropUtterance) > 0 {
+			o.Utterance = sr.Discussion.PropUtterance
+		}
+		o.Cos = propCos(sr.Discussion.Graph, vec)
+		pp.srcOpts[i] = o
+	}
+	return nil
+}
+
+// propCos is the embedding cos between two propositions of g by id (1 for identical text). The table is filled up
+// front, so the slots, which run in parallel, only read it.
+func propCos(g ged.Graph, vec map[string][]float32) func(a, b string) float64 {
+	table := map[[2]string]float64{}
+	for i, p := range g.Props {
+		for _, q := range g.Props[i+1:] {
+			c := 1.0
+			if p.Text != q.Text {
+				c = synth.Cosine(vec[p.Text], vec[q.Text])
+			}
+			table[[2]string{p.ID, q.ID}], table[[2]string{q.ID, p.ID}] = c, c
+		}
+	}
+	return func(a, b string) float64 { return table[[2]string{a, b}] }
+}
+
+// drawPlan draws the plan of slot s from the catalogue (perturb.DrawTriplet). A T3 slot keeps the sub-stratum
+// sub (drawn once per slot); an ordinary T3 slot is redrawn until the predicted Δ(θ₀) hits the slot's near /
+// clear target (≤ 50 redraws, plan §4.3), as the simulator does with its simulated cos.
+func (pp *pipelineV2) drawPlan(rng *rand.Rand, s slotSpec, sub perturb.T3Sub) perturb.TripletPlan {
+	o := pp.srcOpts[s.source]
+	src := pp.sources[s.source].Discussion.Graph
+	if s.typ != perturb.T3Contrast {
+		return perturb.DrawTriplet(rng, src, s.typ, o)
+	}
+	o.Sub = &sub
+	near := s.k%2 == 0
+	for attempt := 0; ; attempt++ {
+		tp := perturb.DrawTriplet(rng, src, s.typ, o)
+		if tp.T3Ident || tp.T3Diag || (math.Abs(tp.PredDelta0) < nearThreshold) == near || attempt >= 50 {
+			return tp
+		}
+	}
+}
+
+// setPlan makes tp the plan being realized.
+func (t *pilotTriplet) setPlan(tp perturb.TripletPlan, k int) {
+	t.A, t.B, t.EditsA, t.EditsB = tp.A, tp.B, tp.A.Edits, tp.B.Edits
+	t.Plan = planRecord(tp)
+	t.PlanA, t.PlanB = editRecords(tp.A.Edits), editRecords(tp.B.Edits)
+	t.NearTarget = nil
+	if tp.Type == perturb.T3Contrast && !tp.T3Ident && !tp.T3Diag {
+		v := k%2 == 0
+		t.NearTarget = &v
+	}
+}
+
+// failPlan keeps dp as a discarded plan after outcome o of the variant with edits side (recs: their records in
+// dp; the kinds the realizer may refuse get the infeasible reason). It reports whether the failure is a t3_diag
+// relabel returned infeasible, which is redrawn inside the slot (dataset-spec §2.2).
+func (t *pilotTriplet) failPlan(dp discardedPlan, o realizeOutcome, rec *variantRecord, side []perturb.Edit, recs []editRecord) bool {
+	dp.Reason, dp.Details = outcomeReason(o), lastProblems(rec)
+	if o == outcomeInfeasible {
+		reason := infeasibleReason(rec)
+		t.Infeasible = append(t.Infeasible, reason)
+		for i := range recs {
+			if slices.Contains(synth.InfeasibleKinds, recs[i].Kind) {
+				recs[i].Infeasible = reason
+			}
+		}
+		dp.DiagRedraw = dp.Info != nil && dp.Info.T3Diag && hasKind(side, perturb.RTypeCA)
+	}
+	t.Discarded = append(t.Discarded, dp)
+	return dp.DiagRedraw
+}
+
+// slot builds one v2 triplet: ≤ 3 plans, plus ≤ 3 in-slot redraws of an infeasible t3_diag relabel.
 func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 	rng := rand.New(rand.NewPCG(pp.seed^0xc0ffee, uint64(s.source*4+s.k)))
 	sr := pp.sources[s.source]
 	src := sr.Discussion
 	g := pp.gens[sr.Generator]
 	t := newTripletRecord(sr, s)
-	if s.typ == perturb.T3Contrast && !s.ident {
-		v := s.k%2 == 0
-		t.NearTarget = &v
-	}
 	prefix := sr.prefix()
 	pair := g.Writer().Family + "→" + g.Writer().Family
 	if g.Verifier != nil {
 		pair = g.Writer().Family + "→" + g.Verifier.Family
 	}
+	sub := s.sub
 	var lastReason string
-	for plan := range 3 {
+	plans := 0
+	for attempt := 0; plans < maxPlans; attempt++ {
 		if err := pp.mt.check(); err != nil {
 			t.Err = err.Error()
 			return t
 		}
-		t.Replans = plan
-		a, b, pred := drawPairV2(rng, src.Graph, s)
-		t.A, t.B, t.EditsA, t.EditsB, t.PredDelta = a, b, a.Edits, b.Edits, finite(pred)
-		t.PlanA, t.PlanB = editRecords(src, a.Edits), editRecords(src, b.Edits)
-		dp := discardedPlan{Plan: plan, EditsA: t.PlanA, EditsB: t.PlanB}
+		t.Replans = attempt
+		tp := pp.drawPlan(rng, s, sub)
+		t.setPlan(tp, s.k)
+		dp := discardedPlan{Plan: attempt, Info: t.Plan, EditsA: slices.Clone(t.PlanA), EditsB: slices.Clone(t.PlanB)}
+		// diagRedraw counts an infeasible t3_diag relabel; after the third on this source the slot is ordinary T3.
+		diagRedraw := func() {
+			t.DiagInfeasible++
+			if t.DiagInfeasible >= maxDiagInfeasible {
+				sub, t.DiagFallback = perturb.T3Plain, true
+			}
+		}
 
-		da, recA, oa := pp.realizeVerifiedV2(g, synth.RealizeInput{Base: src, Target: a, Edits: a.Edits, Prefix: prefix}, rng)
+		da, recA, oa := pp.realizeVerifiedV2(g, synth.RealizeInput{Base: src, Target: tp.A, Edits: tp.A.Edits, Prefix: prefix}, rng)
 		pp.stats.record(t.PlanA, recA, oa == outcomeInfeasible, sr.QT30, pair)
 		dp.A = recA
 		if oa == outcomeBudget {
@@ -907,21 +953,21 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 			return t
 		}
 		if oa != outcomeOK {
-			dp.Reason, dp.Details = outcomeReason(oa), lastProblems(recA)
-			t.Discarded = append(t.Discarded, dp)
-			lastReason = dp.Reason
-			if oa == outcomeInfeasible {
-				t.Infeasible = append(t.Infeasible, infeasibleReason(recA))
+			lastReason = outcomeReason(oa)
+			if t.failPlan(dp, oa, recA, tp.A.Edits, dp.EditsA) {
+				diagRedraw()
+				continue
 			}
+			plans++
 			continue
 		}
-		inB := synth.RealizeInput{Base: src, Target: b, Edits: b.Edits, Prefix: prefix}
-		var extraRecs []editRecord
+		inB := synth.RealizeInput{Base: src, Target: tp.B, Edits: tp.B.Edits, Prefix: prefix}
+		sideB, extraRecs, dpRecsB := tp.B.Edits, t.PlanB, dp.EditsB
 		if s.typ == perturb.T1Monotone {
-			inB = synth.RealizeInput{Base: da, Target: b, Edits: b.Edits[len(a.Edits):], Incremental: true, Prefix: prefix}
-			extraRecs = t.PlanB[len(t.PlanA):]
-		} else {
-			extraRecs = t.PlanB
+			// B = A plus the extra edits, realized from A's realized text (dataset-spec §3.1 item 1).
+			n := len(tp.A.Edits)
+			inB = synth.RealizeInput{Base: da, Target: tp.B, Edits: tp.B.Edits[n:], Incremental: true, Prefix: prefix}
+			sideB, extraRecs, dpRecsB = tp.B.Edits[n:], t.PlanB[n:], dp.EditsB[n:]
 		}
 		db, recB, ob := pp.realizeVerifiedV2(g, inB, rng)
 		pp.stats.record(extraRecs, recB, ob == outcomeInfeasible, sr.QT30, pair)
@@ -931,12 +977,12 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 			return t
 		}
 		if ob != outcomeOK {
-			dp.Reason, dp.Details = outcomeReason(ob), lastProblems(recB)
-			t.Discarded = append(t.Discarded, dp)
-			lastReason = dp.Reason
-			if ob == outcomeInfeasible {
-				t.Infeasible = append(t.Infeasible, infeasibleReason(recB))
+			lastReason = outcomeReason(ob)
+			if t.failPlan(dp, ob, recB, sideB, dpRecsB) {
+				diagRedraw()
+				continue
 			}
+			plans++
 			continue
 		}
 		t.TextA, t.TextB, t.RealizeA, t.RealizeB = da, db, recA, recB
@@ -958,16 +1004,16 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 				pp.stats.t1Dropped++
 				pp.stats.mu.Unlock()
 				t.TextA, t.TextB, t.RealizeA, t.RealizeB, t.Delta0 = synth.Discussion{}, synth.Discussion{}, nil, nil, nil
+				plans++
 				continue
 			}
+			// Realized re-stratification (dataset-spec §3.1 item 3): the stratum of the realized Δ(θ₀).
 			t.T1Delta0 = t.Delta0
-			t.T1Stratum = t1StratumOf(*t.Delta0)
+			t.T1Stratum = perturb.T1StratumOf(*t.Delta0)
 		}
 		t.Err = ""
-		t.Flags.XSpk = hasKind(a.Edits, perturb.XSpk) || hasKind(b.Edits, perturb.XSpk)
-		t.Flags.DiagCAType = slices.ContainsFunc(append(slices.Clone(a.Edits), b.Edits...), involvesCA)
-		t.Flags.DelAddCooccur = delAddCooccur(a.Edits) || delAddCooccur(b.Edits)
-		t.Flags.PNegA, t.Flags.PNegB = a.Neg, b.Neg
+		t.Flags.PNegA, t.Flags.PNegB = tp.A.Neg, tp.B.Neg
+		t.Flags.Fit = t.fitFlagList()
 		if recB.Verifier != nil {
 			t.VerifierFamily, t.VerifierModel = recB.Verifier.Family, recB.Verifier.Model
 		} else if recA.Verifier != nil {
@@ -980,6 +1026,19 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 	}
 	t.Err = "discarded: 3 回の編集計画とも使えなかった（最後の理由: " + lastReason + "）"
 	return t
+}
+
+// fitFlagList is the fit.Triplet flag list of the triplet (tripletFitFlags on its plan and realized Δ(θ₀)).
+func (t *pilotTriplet) fitFlagList() []string {
+	var info perturb.PlanInfo
+	if t.Plan != nil {
+		info = *t.Plan
+	}
+	d0 := math.NaN()
+	if t.Delta0 != nil {
+		d0 = *t.Delta0
+	}
+	return tripletFitFlags(t.Type, info, d0, t.T1Stratum, t.Flags.QT30, t.Flags.Pilot)
 }
 
 func outcomeReason(o realizeOutcome) string {
@@ -1027,8 +1086,10 @@ func hasKind(es []perturb.Edit, k perturb.Kind) bool {
 	return slices.ContainsFunc(es, func(e perturb.Edit) bool { return e.Kind == k })
 }
 
-// measure embeds the propositions of S, A and B and fills cos, realized substitution cos, lengths and
-// the realized Δ under θ₀ (Delta0).
+// measure embeds the propositions of S, A and B and fills cos, realized substitution cos, lengths and the
+// realized Δ under θ₀ (Delta0). The variant graphs are the frozen plan graphs (Realize copies Target.Graph), so
+// Delta0 is Δ(θ₀) on the frozen graphs with the realized cos (dataset-spec §3.1, decisions-stats §9.1): the
+// value fit.Delta gives at θ₀, and what the simulator computes with its simulated cos.
 func (pp *pipelineV2) measure(t *pilotTriplet, src synth.Discussion) error {
 	var texts []string
 	for _, d := range []synth.Discussion{src, t.TextA, t.TextB} {
@@ -1077,7 +1138,6 @@ func (pp *pipelineV2) measure(t *pilotTriplet, src synth.Discussion) error {
 	if errA != nil || errB != nil {
 		return fmt.Errorf("ged: %v %v", errA, errB)
 	}
-	// TODO(integration): perturb.Delta0 on the frozen graphs with the realized cos.
 	t.Delta0 = finite(fb.Cost(th) - fa.Cost(th))
 	t.PhiA, t.PhiB = &fa, &fb
 	t.simA, t.simB = simA, simB
@@ -1099,17 +1159,18 @@ func simFromVec(src, v ged.Graph, vec map[string][]float32) ged.Sim {
 	return func(a, b string) float64 { return table[[2]string{a, b}] }
 }
 
-// buildVerifiedV2 runs every slot of the accepted sources.
-func (pp *pipelineV2) buildAll(rng *rand.Rand) []*pilotTriplet {
+// buildAll runs every slot of the accepted sources. The T3 sub-stratum is drawn once per slot here
+// (BuildOptions.DrawSub), so plan redraws stay inside it (dataset-spec §2.2).
+func (pp *pipelineV2) buildAll(rng *rand.Rand) ([]*pilotTriplet, error) {
+	if err := pp.sourceOptions(); err != nil {
+		return nil, err
+	}
 	var slots []slotSpec
 	for i := range pp.sources {
 		for k := range 4 {
 			s := slotSpec{source: i, k: k, typ: perturb.DrawType(rng)}
-			switch s.typ {
-			case perturb.T3Contrast:
-				s.ident = rng.Float64() < 0.1
-			case perturb.T1Monotone:
-				s.t1Stratum = drawT1Stratum(rng)
+			if s.typ == perturb.T3Contrast {
+				s.sub = pp.catalogue.DrawSub(rng)
 			}
 			slots = append(slots, s)
 		}
@@ -1120,19 +1181,35 @@ func (pp *pipelineV2) buildAll(rng *rand.Rand) []*pilotTriplet {
 		return nil
 	})
 	pp.stats.slots = len(slots)
-	for _, t := range trips {
+	for i, t := range trips {
+		gen := pp.sources[slots[i].source].Generator
+		for _, dp := range t.Discarded {
+			pp.stats.countPlan(gen, append(slices.Clone(dp.EditsA), dp.EditsB...), true)
+		}
+		if t.Err == "" {
+			pp.stats.countPlan(gen, append(slices.Clone(t.PlanA), t.PlanB...), false)
+		}
 		pp.stats.replans += t.Replans
+		if slots[i].sub == perturb.T3Diag {
+			pp.stats.diagSlots++
+		}
+		if t.DiagFallback {
+			pp.stats.diagFallback++
+		}
 		if t.Err == "" {
 			pp.stats.accepted++
 			pp.stats.fluency[t.FluA]++
 			pp.stats.fluency[t.FluB]++
 			pp.stats.coherence[t.CohA]++
 			pp.stats.coherence[t.CohB]++
+			if t.Plan != nil && t.Plan.T3Diag {
+				pp.stats.diagAccepted++
+			}
 		} else {
 			pp.stats.discarded++
 		}
 	}
-	return trips
+	return trips, nil
 }
 
 // writeVerifyReportV2 writes the G3/G4 summary (dataset-spec §7 first-pass gate per kind × direction × edit count).
@@ -1156,6 +1233,7 @@ func writeVerifyReportV2(b *bytes.Buffer, s *v2Stats, kept []*pilotTriplet, d0 [
 			fmt.Fprintf(b, "| %s | %d |\n", k, s.infeasible[k])
 		}
 	}
+	writeDiagStratum(b, s)
 	writeReasons(b, s.reasons)
 	if len(s.confusions) > 0 {
 		fmt.Fprintln(b, "\n検証者の RA↔MA の読み違い（意図→読み）:")
@@ -1173,4 +1251,25 @@ func writeVerifyReportV2(b *bytes.Buffer, s *v2Stats, kept []*pilotTriplet, d0 [
 	fmt.Fprintf(b, "\n採用した変種の流暢さ: 5 = %d、4 = %d、3 = %d。整合性: 5 = %d、4 = %d、3 = %d、2 = %d、1 = %d（LLM を使わない変種は 0: %d）\n",
 		s.fluency[5], s.fluency[4], s.fluency[3], s.coherence[5], s.coherence[4], s.coherence[3], s.coherence[2], s.coherence[1], s.fluency[0])
 	writeNearClear(b, kept, d0)
+}
+
+// writeDiagStratum reports the t3_diag sub-stratum (dataset-spec §2.2): slots, accepted relabels, fallbacks and
+// the infeasibility rate per direction from the realization attempts (no θ; decisions-stats §12b).
+func writeDiagStratum(b *bytes.Buffer, s *v2Stats) {
+	fmt.Fprintln(b, "\n## 診断層 t3_diag（CA を含む種別の付け替え、dataset-spec §2.2）")
+	fmt.Fprintf(b, "\n- 計画した枠 %d、付け替えを含んで採用 %d、通常の T3 への切り替え %d（同じ元の議論で infeasible が %d 回）。当てはめからは既定で除く（diag_ca_type）\n",
+		s.diagSlots, s.diagAccepted, s.diagFallback, maxDiagInfeasible)
+	if len(s.diagDir) == 0 {
+		return
+	}
+	fmt.Fprintln(b, "\n| 向き | 書き下し | infeasible | infeasible の率 |")
+	fmt.Fprintln(b, "| --- | --: | --: | --: |")
+	for _, k := range sortedKeys(s.diagDir) {
+		c := s.diagDir[k]
+		flag := ""
+		if r := s.diagInfeasibleRate(k); r > diagCountsOnly {
+			flag = "（> 60%: この組は件数のみ、§12b）"
+		}
+		fmt.Fprintf(b, "| %s | %d | %d | %.0f%%%s |\n", k, c[0], c[1], pct(c[1], c[0]), flag)
+	}
 }

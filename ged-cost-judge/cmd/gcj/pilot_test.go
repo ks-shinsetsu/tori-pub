@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -16,9 +17,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/fit"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/llm"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/perturb"
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/simulate"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/synth"
 )
 
@@ -45,7 +48,7 @@ func TestPilotTripletJSON(t *testing.T) {
 		if _, ok := back[0]["pred_delta"]; ok != (c.near != nil) {
 			t.Errorf("%s: pred_delta present = %v", c.typ, ok)
 		}
-		for _, k := range []string{"flags", "plan_a", "judgments", "t1_delta0"} {
+		for _, k := range []string{"flags", "plan", "plan_a", "judgments", "t1_delta0"} {
 			if _, ok := back[0][k]; ok {
 				t.Errorf("%s: v1 record carries v2 field %q", c.typ, k)
 			}
@@ -53,44 +56,81 @@ func TestPilotTripletJSON(t *testing.T) {
 	}
 }
 
-// The v2 record (§6) round-trips through JSON with every field the statistics side reads.
+// The v2 record (§6) round-trips through JSON with every field the statistics side reads: a T1 triplet and a
+// t3_diag triplet whose first relabel was returned infeasible and redrawn inside the slot.
 func TestPilotTripletV2RoundTrip(t *testing.T) {
-	d0, five := 2.25, 5
+	d0, five, one := 2.25, 5, 1
 	cos := 0.71
-	tr := pilotTriplet{
+	t1 := pilotTriplet{
 		Type: perturb.T1Monotone, ID: "s0003-t1", SourceID: "s0003", Generator: "claude-sonnet-5-5", GeneratorFamily: "anthropic",
 		VerifierFamily: "openai", VerifierModel: "gpt-5.6-luna-2026-07-01", ExemplarPair: 7, Exemplars: []string{"ex03-meeting", "ex01-debate-small"},
 		Domain: "economy", Format: "meeting", TopicID: "d02-t004",
-		Flags:    tripletFlags{Pilot: true, DiagCAType: true, PNegB: 1},
-		PlanA:    []editRecord{{Edit: perturb.Edit{Kind: perturb.RAdd, Edge: &ged.Edge{From: "s3.p1", To: "s3.p4", Kind: ged.RA}}, Direction: "RA", Distance: &five, Degree: []int{1, 2}}},
-		PlanB:    []editRecord{{Edit: perturb.Edit{Kind: perturb.PShift, Prop: "s3.p2", Strength: "large"}, RealizedCos: &cos}},
-		T1Delta0: &d0, T1Stratum: t1Gate, T1Planned: t1Gate, CohA: 4, CohB: 2, FluA: 5, FluB: 4,
+		Flags: tripletFlags{Pilot: true, PNegB: 1, Fit: []string{"t1_gate", "pilot"}},
+		Plan: &perturb.PlanInfo{Type: perturb.T1Monotone, T1Target: perturb.T1High, T1Stratum: perturb.T1High, T1Delta0: 2.1, T1Extra: 2,
+			PredDelta0: 2.1, EditsA: 1, EditsB: 3, Redraws: 4, Infeasible: []perturb.Edit{{Kind: perturb.PDel, Infeasible: "no untouched isolated proposition"}}},
+		PlanA: []editRecord{{Edit: perturb.Edit{Kind: perturb.RAdd, Edge: &ged.Edge{From: "s3.p1", To: "s3.p4", Kind: ged.RA}, Direction: "RA", Distance: &five, Degree: []int{1, 2}}}},
+		PlanB: []editRecord{{Edit: perturb.Edit{Kind: perturb.PShift, Prop: "s3.p2", Strength: "large", Degree: []int{1}}, RealizedCos: &cos},
+			{Edit: perturb.Edit{Kind: perturb.PDelR, Prop: "s3.p5", Degree: []int{2}, EdgesRemoved: 2}}},
+		T1Delta0: &d0, T1Stratum: perturb.T1High, CohA: 4, CohB: 2, FluA: 5, FluB: 4,
 		Discarded:  []discardedPlan{{Plan: 0, Reason: "infeasible", Details: []string{"infeasible: needs a negation"}}},
 		Infeasible: []string{"needs a negation"},
 		Judgments: []judgmentRecord{{Judge: "claude-haiku-5-5", Family: "anthropic", Setting: "effort=low,thinking=adaptive", Order: -1,
 			Raw: "2", Answer: "A", CacheKey: "k", PromptHash: "h", Batch: true}},
 	}
-	b, err := json.Marshal(tr)
-	if err != nil {
-		t.Fatal(err)
+	diagInfo := &perturb.PlanInfo{Type: perturb.T3Contrast, T3Diag: true, DiagCAType: true, Swapped: true, PredDelta0: -0.4, EditsA: 1, EditsB: 1}
+	relabel := func(dir, reason string) editRecord {
+		from, to, _ := strings.Cut(dir, "→")
+		return editRecord{Edit: perturb.Edit{Kind: perturb.RTypeCA, Edge: &ged.Edge{From: "s3.p3", To: "s3.p1", Kind: from}, NewKind: to,
+			Direction: dir, Distance: &one, Degree: []int{1, 3}, Infeasible: reason}}
 	}
-	var back pilotTriplet
-	if err := json.Unmarshal(b, &back); err != nil {
-		t.Fatal(err)
+	diag := pilotTriplet{
+		Type: perturb.T3Contrast, ID: "s0003-t2", SourceID: "s0003", Generator: "gpt-5.6-luna", VerifierFamily: "anthropic",
+		Flags: tripletFlags{Pilot: true, Fit: []string{"diag_ca_type", "t3_diag", "pilot"}},
+		Plan:  diagInfo, SubPlanned: perturb.T3Diag, DiagInfeasible: 1, Replans: 1,
+		PlanA: []editRecord{{Edit: perturb.Edit{Kind: perturb.RDel, Edge: &ged.Edge{From: "s3.p2", To: "s3.p1", Kind: ged.RA}, Distance: &one, Degree: []int{1, 3}}}},
+		PlanB: []editRecord{relabel("RA→CA", "")},
+		Discarded: []discardedPlan{{Plan: 0, Info: diagInfo, Reason: "infeasible", DiagRedraw: true, Details: []string{"infeasible: would negate p3"},
+			EditsA: []editRecord{{Edit: perturb.Edit{Kind: perturb.PAdd, Prop: "n1", Degree: []int{0}}}}, EditsB: []editRecord{relabel("CA→RA", "would negate p3")}}},
+		Infeasible: []string{"would negate p3"},
 	}
-	b2, _ := json.Marshal(back)
-	if string(b) != string(b2) {
-		t.Fatalf("round trip differs:\n%s\n%s", b, b2)
-	}
-	var m map[string]any
-	_ = json.Unmarshal(b, &m)
-	for _, k := range []string{"t1_delta0", "t1_stratum", "verifier_family", "verifier_model", "exemplar_pair", "domain", "flags", "coh_a", "discarded_plans", "infeasible_reasons", "judgments"} {
-		if _, ok := m[k]; !ok {
-			t.Errorf("record lacks %q", k)
+	for _, tr := range []pilotTriplet{t1, diag} {
+		b, err := json.Marshal(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back pilotTriplet
+		if err := json.Unmarshal(b, &back); err != nil {
+			t.Fatal(err)
+		}
+		b2, _ := json.Marshal(back)
+		if string(b) != string(b2) {
+			t.Fatalf("round trip differs:\n%s\n%s", b, b2)
+		}
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		for _, k := range []string{"plan", "plan_a", "plan_b", "verifier_family", "flags", "discarded_plans", "infeasible_reasons"} {
+			if _, ok := m[k]; !ok {
+				t.Errorf("%s: record lacks %q", tr.ID, k)
+			}
+		}
+		if f := m["flags"].(map[string]any); f["pilot"] != true || f["fit"] == nil {
+			t.Errorf("%s: flags %v", tr.ID, f)
 		}
 	}
-	if !strings.Contains(string(b), `"diag_ca_type":true`) || !strings.Contains(string(b), `"distance":5`) || !strings.Contains(string(b), `"realized_cos":0.71`) {
-		t.Errorf("record: %s", b)
+	b1, _ := json.Marshal(t1)
+	for _, want := range []string{`"t1_delta0":2.25`, `"t1_stratum":"\u003e=2"`, `"t1_target":"\u003e=2"`, `"exemplar_pair":7`, `"coh_a":4`,
+		`"distance":5`, `"degree":[1,2]`, `"edges_removed":2`, `"realized_cos":0.71`, `"infeasible":[{"kind":"P-del","infeasible":"no untouched isolated proposition"}]`,
+		`"pred_delta0":2.1`, `"n_edits_b":3`, `"judgments"`} {
+		if !strings.Contains(string(b1), want) {
+			t.Errorf("T1 record lacks %s: %s", want, b1)
+		}
+	}
+	b2, _ := json.Marshal(diag)
+	for _, want := range []string{`"t3_diag":true`, `"diag_ca_type":true`, `"swapped":true`, `"t3_sub_planned":"diag"`, `"diag_infeasible":1`,
+		`"diag_redraw":true`, `"plan_info":{`, `"direction":"CA→RA","distance":1,"degree":[1,3],"infeasible":"would negate p3"`, `"new_kind":"CA","direction":"RA→CA"`} {
+		if !strings.Contains(string(b2), want) {
+			t.Errorf("t3_diag record lacks %s: %s", want, b2)
+		}
 	}
 }
 
@@ -125,10 +165,13 @@ type fakeLLM struct {
 	variants map[string]*fakeVariant
 	calls    map[string]int
 	batches  int
+	// caSeen marks the sources (by first utterance) whose first CA relabel was declared infeasible.
+	caSeen       map[string]bool
+	caInfeasible int
 }
 
 func newFakeLLM() *fakeLLM {
-	return &fakeLLM{sources: map[string][][3]string{}, variants: map[string]*fakeVariant{}, calls: map[string]int{}}
+	return &fakeLLM{sources: map[string][][3]string{}, variants: map[string]*fakeVariant{}, calls: map[string]int{}, caSeen: map[string]bool{}}
 }
 
 var (
@@ -182,13 +225,41 @@ func (f *fakeLLM) complete(_ context.Context, req llm.Request) (*llm.Response, e
 		}
 		out = map[string]any{"questions": qs}
 	case "judge":
-		h := sha256.Sum256([]byte(user))
-		out = map[string]string{"answer": []string{"1", "2", "same", "1"}[h[0]%4]}
+		out = map[string]string{"answer": fakeJudge(user)}
 	default:
 		return nil, fmt.Errorf("fake: unexpected tag %q", req.Tag)
 	}
 	b, _ := json.Marshal(out)
 	return &llm.Response{Text: string(b), Model: req.Model + "-test", Usage: llm.Usage{InputTokens: int64(len(user) / 4), OutputTokens: int64(len(b) / 4)}}, nil
+}
+
+// fakeJudge prefers the version with fewer lines changed from S, so the T1 superset is mostly judged farther
+// (the judge QC of decisions-stats §9.1 passes); ties and one answer in eight are pseudo-random.
+func fakeJudge(user string) string {
+	h := sha256.Sum256([]byte(user))
+	rest, v2, _ := strings.Cut(user, "\nVersion 2:\n")
+	s, v1, _ := strings.Cut(rest, "\nVersion 1:\n")
+	orig := map[string]bool{}
+	for _, l := range strings.Split(s, "\n") {
+		orig[l] = true
+	}
+	changed := func(v string) int {
+		n := 0
+		for _, l := range strings.Split(v, "\n") {
+			if l != "" && !orig[l] {
+				n++
+			}
+		}
+		return n
+	}
+	c1, c2 := changed(v1), changed(v2)
+	switch {
+	case h[1]%8 == 0 || c1 == c2:
+		return []string{"1", "2", "same", "1"}[h[0]%4]
+	case c1 < c2:
+		return "1"
+	}
+	return "2"
 }
 
 func (f *fakeLLM) source(user string) any {
@@ -331,8 +402,20 @@ func (f *fakeLLM) realize(user string) any {
 		}
 	}
 	nonce := f.next()
-	// every third realization with a relabel declares it infeasible (exercises the plan redraw)
-	if nonce%3 == 0 && strings.Contains(user, "Change the relation") && !strings.Contains(user, "was rejected") {
+	// The first diagnostic CA relabel on each source is declared infeasible, later ones are feasible (exercises the
+	// in-slot t3_diag redraw); every third other realization with a relabel declares it infeasible (the plan redraw).
+	if strings.Contains(user, "expected answer for this edit") && len(utts) > 0 {
+		f.mu.Lock()
+		first := !f.caSeen[utts[0].Text]
+		f.caSeen[utts[0].Text] = true
+		if first {
+			f.caInfeasible++
+		}
+		f.mu.Unlock()
+		if first {
+			return map[string]any{"infeasible": true, "reason": "the CA relabel would negate a proposition", "changes": []any{}, "propositions": []any{}}
+		}
+	} else if nonce%3 == 0 && strings.Contains(user, "Change the relation") && !strings.Contains(user, "was rejected") {
 		return map[string]any{"infeasible": true, "reason": "the relabel needs a negation", "changes": []any{}, "propositions": []any{}}
 	}
 	newText := map[string]string{}
@@ -498,6 +581,7 @@ func testOptions(t *testing.T) pilotOptions {
 func TestPilotV2Offline(t *testing.T) {
 	f := newFakeLLM()
 	o := testOptions(t)
+	o.diagShare = 0.5 // enough t3_diag slots to see the in-slot redraw
 	env := testEnv(f, o.allModels())
 	null, _ := os.Open(os.DevNull)
 	stdout := os.Stdout
@@ -536,8 +620,15 @@ func TestPilotV2Offline(t *testing.T) {
 			continue
 		}
 		ok++
-		if tr.VerifierFamily == "" || tr.VerifierFamily == tr.GeneratorFamily || tr.RealizeA == nil || tr.Delta0 == nil || !tr.Flags.Pilot {
+		if tr.VerifierFamily == "" || tr.VerifierFamily == tr.GeneratorFamily || tr.RealizeA == nil || tr.Delta0 == nil || !tr.Flags.Pilot || tr.Plan == nil {
 			t.Errorf("%s: %+v", tr.ID, tr)
+			continue
+		}
+		if want := tripletFitFlags(tr.Type, *tr.Plan, *tr.Delta0, tr.T1Stratum, tr.Flags.QT30, tr.Flags.Pilot); !slices.Equal(tr.Flags.Fit, want) {
+			t.Errorf("%s: fit flags %v, want %v", tr.ID, tr.Flags.Fit, want)
+		}
+		if tr.Plan.Type != tr.Type || tr.Plan.EditsA != len(tr.PlanA) || tr.Plan.EditsB != len(tr.PlanB) || (tr.SubPlanned != "" && tr.Type != perturb.T3Contrast) {
+			t.Errorf("%s: plan %+v vs %d/%d edits, sub %q", tr.ID, tr.Plan, len(tr.PlanA), len(tr.PlanB), tr.SubPlanned)
 		}
 		if len(tr.Judgments) == 6 {
 			judged++
@@ -549,7 +640,7 @@ func TestPilotV2Offline(t *testing.T) {
 		}
 		if tr.Type == perturb.T1Monotone {
 			t1++
-			if tr.T1Delta0 == nil || *tr.T1Delta0 < 0.5 || tr.T1Stratum == "" || tr.RealizeB.Base != "A" {
+			if tr.T1Delta0 == nil || *tr.T1Delta0 < 0.5 || tr.T1Stratum != perturb.T1StratumOf(*tr.T1Delta0) || tr.Plan.T1Target == "" || tr.RealizeB.Base != "A" {
 				t.Errorf("%s: T1 record %+v", tr.ID, tr)
 			}
 			// B's untouched utterances equal A's (B is A plus the extra edit, dataset-spec §3.1)
@@ -564,6 +655,35 @@ func TestPilotV2Offline(t *testing.T) {
 	if ok < len(trips)/2 {
 		t.Fatalf("only %d of %d slots realized", ok, len(trips))
 	}
+	// t3_diag (dataset-spec §2.2): a relabel returned infeasible is redrawn inside the slot, and the redraw succeeds.
+	diagOK := 0
+	for _, tr := range trips {
+		if tr.Err != "" || tr.Plan == nil || !tr.Plan.T3Diag || tr.DiagInfeasible == 0 {
+			continue
+		}
+		var redraw *discardedPlan
+		for i := range tr.Discarded {
+			if tr.Discarded[i].DiagRedraw {
+				redraw = &tr.Discarded[i]
+			}
+		}
+		if redraw == nil || redraw.Reason != "infeasible" || redraw.Info == nil || !redraw.Info.T3Diag || tr.DiagFallback || tr.SubPlanned != perturb.T3Diag {
+			t.Errorf("%s: t3_diag redraw %+v (fallback %v, sub %q)", tr.ID, redraw, tr.DiagFallback, tr.SubPlanned)
+			continue
+		}
+		refused := false
+		for _, e := range append(slices.Clone(redraw.EditsA), redraw.EditsB...) {
+			refused = refused || (e.Kind == perturb.RTypeCA && e.Infeasible != "" && e.Direction != "" && e.Distance != nil)
+		}
+		if !refused || !slices.Contains(tr.Flags.Fit, "diag_ca_type") || !slices.Contains(tr.Flags.Fit, "t3_diag") || !hasKind(append(slices.Clone(tr.EditsA), tr.EditsB...), perturb.RTypeCA) {
+			t.Errorf("%s: refused relabel not recorded or flags %v", tr.ID, tr.Flags.Fit)
+			continue
+		}
+		diagOK++
+	}
+	if diagOK == 0 {
+		t.Fatalf("no t3_diag slot with an infeasible relabel return followed by a successful redraw (CA infeasible returns %d)", f.caInfeasible)
+	}
 	if judged != ok {
 		t.Errorf("%d of %d triplets have 6 judgments", judged, ok)
 	}
@@ -571,7 +691,8 @@ func TestPilotV2Offline(t *testing.T) {
 		t.Errorf("%d judge batches, want 2 (one per Anthropic judge)", f.batches)
 	}
 	md, _ := os.ReadFile(filepath.Join(o.out, "pilot.md"))
-	for _, want := range []string{"## 来歴", "## 元の議論（G1）", "級内相関", "補助パラメータ", "単段（750 件 = 3,300 三つ組）"} {
+	for _, want := range []string{"## 来歴", "## 元の議論（G1）", "級内相関", "補助パラメータ", "単段（750 件 = 3,300 三つ組）",
+		"## 診断層 t3_diag", "P2 報告", "φ の情報量", "合格確率", "当てはめに使う三つ組", "破棄率"} {
 		if !strings.Contains(string(md), want) {
 			t.Errorf("report lacks %q", want)
 		}
@@ -579,7 +700,132 @@ func TestPilotV2Offline(t *testing.T) {
 	if strings.Contains(string(md), "## パラメータ") {
 		t.Error("P2 report prints θ")
 	}
-	t.Logf("sources %d/%d, triplets %d/%d (T1 %d), calls %v", acc, len(srcs), ok, len(trips), t1, f.calls)
+	if strings.Contains(string(md), "種別のタイを外した診断用の当てはめ") {
+		t.Error("P2 report prints the untied diagnostic fit (θ)")
+	}
+	t.Logf("sources %d/%d, triplets %d/%d (T1 %d, t3_diag redrawn %d), calls %v", acc, len(srcs), ok, len(trips), t1, diagOK, f.calls)
+}
+
+// The non-P2 run reports the confirmatory analysis (fit.Confirmatory + WriteConfirmatory) and the untied
+// diagnostic fit of the t3_diag triplets; the run's triplets are not pilot-flagged.
+func TestPilotV2OfflineConfirmatory(t *testing.T) {
+	f := newFakeLLM()
+	o := testOptions(t)
+	// keepJudges: a single gate triplet would make every judge fail §9.1 (Clopper–Pearson bound at n_T = 1).
+	o.p2, o.boot, o.dReps, o.diagShare, o.keepJudges = false, 2, 2, 0.5, true
+	null, _ := os.Open(os.DevNull)
+	stdout := os.Stdout
+	os.Stdout = null
+	defer func() { os.Stdout = stdout }()
+	if err := runPilotV2(context.Background(), o, testEnv(f, o.allModels())); err != nil {
+		t.Fatal(err)
+	}
+	trips, err := readJSONL[pilotTriplet](filepath.Join(o.out, "pilot_triplets.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range trips {
+		if tr.Flags.Pilot || slices.Contains(tr.Flags.Fit, "pilot") {
+			t.Fatalf("%s: non-P2 triplet flagged pilot", tr.ID)
+		}
+	}
+	md, _ := os.ReadFile(filepath.Join(o.out, "pilot.md"))
+	for _, want := range []string{"確認的分析", "パラメータの判断", "外挿、較正なし", "種別のタイを外した診断用の当てはめ", "RA↔CA", "CA↔MA"} {
+		if !strings.Contains(string(md), want) {
+			t.Errorf("report lacks %q", want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(o.out, "profile.csv")); err != nil {
+		t.Error(err)
+	}
+}
+
+// parityGraph is a small source with every relation kind and three isolated propositions.
+func parityGraph() ged.Graph {
+	var g ged.Graph
+	for i := range 14 {
+		g.Props = append(g.Props, ged.Prop{ID: fmt.Sprintf("p%d", i)})
+	}
+	for i, k := range []string{ged.RA, ged.RA, ged.CA, ged.MA, ged.RA, ged.MA, ged.CA, ged.RA, ged.RA, ged.MA} {
+		g.Edges = append(g.Edges, ged.Edge{From: fmt.Sprintf("p%d", i+1), To: fmt.Sprintf("p%d", i/2), Kind: k})
+	}
+	return g
+}
+
+// The pilot's fit flags equal the simulator's on the same plan and realized Δ(θ₀) (decisions-stats §16 #16), with
+// the pilot-only qt30 and pilot appended; every flag is exercised.
+func TestFitFlagsMatchSimulator(t *testing.T) {
+	src := parityGraph()
+	rng := rand.New(rand.NewPCG(7, 8))
+	opts := catalogueOptions(0)
+	seen := map[string]bool{}
+	deltas := []float64{math.NaN(), -0.5, 0, 1e-12, 0.7, 1.5, 2, 3.4}
+	for i := range 3000 {
+		typ := perturb.DrawType(rng)
+		o := opts
+		if typ == perturb.T3Contrast {
+			sub := []perturb.T3Sub{perturb.T3Plain, perturb.T3Ident, perturb.T3Diag}[i%3]
+			o.Sub = &sub
+		}
+		info := perturb.DrawTriplet(rng, src, typ, o).PlanInfo
+		if i%7 == 0 {
+			info.DelAddCooccur = true // never drawn by the catalogue; set by hand
+		}
+		d0 := deltas[i%len(deltas)]
+		stratum := ""
+		switch {
+		case typ == perturb.T1Monotone && i%5 == 0:
+			stratum = info.T1Stratum // a stale (planned) stratum: t1_gate must still need Δ > 0
+		case typ == perturb.T1Monotone:
+			stratum = perturb.T1StratumOf(d0)
+		}
+		want := simulate.Meta{Type: typ, Info: info, Delta0: d0, T1Stratum: stratum}.Flags()
+		if got := tripletFitFlags(typ, info, d0, stratum, false, false); !slices.Equal(got, want) {
+			t.Fatalf("plan %d (%s, Δ %v, %q): pilot %v, simulator %v (%+v)", i, typ, d0, stratum, got, want, info)
+		}
+		if got := tripletFitFlags(typ, info, d0, stratum, true, true); !slices.Equal(got, append(slices.Clone(want), "qt30", "pilot")) {
+			t.Fatalf("plan %d: with qt30/pilot %v", i, got)
+		}
+		for _, f := range want {
+			seen[f] = true
+		}
+	}
+	for _, f := range []string{"x_spk", "diag_ca_type", "del_add_cooccur", "t3_ident", "t3_diag", "t1_gate"} {
+		if !seen[f] {
+			t.Errorf("flag %s never exercised", f)
+		}
+	}
+}
+
+// The pilot fit drops what the main analysis drops except its own pilot flag.
+func TestPilotExclude(t *testing.T) {
+	ex := pilotExclude()
+	if slices.Contains(ex, "pilot") || len(ex) != len(fit.DefaultExclude)-1 {
+		t.Fatalf("pilotExclude %v (default %v)", ex, fit.DefaultExclude)
+	}
+	trips := []fit.Triplet{{Flags: []string{"pilot"}}, {Flags: []string{"pilot", "diag_ca_type"}}, {Flags: []string{"pilot", "x_spk"}}, {}}
+	if kept, _, _ := fit.Filter(trips, nil, fit.Options{Exclude: ex}); len(kept) != 2 {
+		t.Errorf("pilot exclusion keeps %d, want 2", len(kept))
+	}
+	if kept, _, _ := fit.Filter(trips, nil, fit.Options{}); len(kept) != 1 {
+		t.Errorf("default exclusion keeps %d, want 1", len(kept))
+	}
+}
+
+// fitTriplets copies every fit.Triplet contract field from the record.
+func TestFitTripletsCopiesContract(t *testing.T) {
+	w, d0, t1 := 0.8, 2.4, 2.4
+	src := &sourceRecord{Discussion: synth.Discussion{Graph: ged.Graph{Props: []ged.Prop{{ID: "s0.p1", Text: "a"}}}}}
+	tr := &pilotTriplet{Source: 0, Type: perturb.T1Monotone, Generator: "claude-sonnet-5-5", VerifierFamily: "openai", ExemplarPair: 7,
+		Domain: "economy", CohA: 4, CohB: 2, Weight: &w, Delta0: &d0, T1Delta0: &t1, T1Stratum: perturb.T1High,
+		Plan: &perturb.PlanInfo{Type: perturb.T1Monotone}, Flags: tripletFlags{Pilot: true, PNegB: 1}}
+	ft, dd := fitTriplets([]*pilotTriplet{tr}, []*sourceRecord{src})
+	got := ft[0]
+	if got.Type != "T1" || !slices.Equal(got.Flags, []string{"t1_gate", "pilot"}) || got.Generator != tr.Generator || got.VerifierFamily != "openai" ||
+		got.ExemplarPair != "7" || got.Domain != "economy" || got.Weight != 0.8 || got.CohA != 4 || got.CohB != 2 || got.T1Delta0 != 2.4 ||
+		got.NegDiff != 1 || dd[0] != 2.4 || len(got.Ref.Props) != 1 {
+		t.Fatalf("fit.Triplet %+v", got)
+	}
 }
 
 // Stage 0 and the QC audits run offline on the fake (the QC reads the records of an offline pilot).
