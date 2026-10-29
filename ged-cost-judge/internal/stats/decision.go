@@ -46,6 +46,8 @@ type DecisionInput struct {
 	NInformative, MinInformative int
 	// BoundaryShare is the share of replicates with the anchored θ_p < 10⁻³; DivergentShare the share at the upper bound.
 	BoundaryShare, DivergentShare float64
+	// TotalReps is B, the number of replicates attempted; fewer than MinRepsShare·B valid replicates is "not estimable" (0 disables).
+	TotalReps int
 	// AnchoredIQR is the IQR of the parameter's own anchored replicates (before the sum normalization). The
 	// normalization spreads the other costs' variation onto a frozen coordinate, so the information floor must be
 	// checked on the anchored column too. It is used only when CheckAnchored is true.
@@ -61,8 +63,8 @@ type ParamDecision struct {
 	M      float64
 	CI90   Interval
 	CI95   Interval
-	// Upper90 is the one-sided 90% upper bound (q₀.₉₀); it replaces the interval when OneSided.
-	Upper90  float64
+	// Upper is the one-sided 95% upper bound (q₀.₉₅, α = 0.05 like the two-sided rule); it replaces the interval when OneSided.
+	Upper    float64
 	OneSided bool
 	// SD = (q₀.₈₄₁₃ − q₀.₁₅₈₇)/2; Bias = mean(replicates) − Est; IQR = q₀.₇₅ − q₀.₂₅.
 	SD, Bias, IQR  float64
@@ -71,6 +73,7 @@ type ParamDecision struct {
 	BoundaryShare  float64
 	DivergentShare float64
 	Reps           int
+	TotalReps      int
 	Reason         string
 }
 
@@ -78,6 +81,7 @@ type ParamDecision struct {
 const (
 	IQRFloor           = 1e-6
 	BoundaryOneSided   = 0.10
+	MinRepsShare       = 0.95
 	BoundaryNotEstim   = 0.50
 	DivergentReport    = 0.02
 	BiasFlagMultiple   = 0.5
@@ -121,10 +125,10 @@ func mean(v []float64) float64 {
 func Summary(in DecisionInput) ParamDecision {
 	col := cleanSorted(in.Boot)
 	d := ParamDecision{Est: in.Est, Theta0: in.Theta0, M: in.M, N: in.NInformative, MinN: in.MinInformative,
-		BoundaryShare: in.BoundaryShare, DivergentShare: in.DivergentShare, Reps: len(col)}
+		BoundaryShare: in.BoundaryShare, DivergentShare: in.DivergentShare, Reps: len(col), TotalReps: in.TotalReps}
 	d.CI90 = Interval{Quantile(col, 0.05), Quantile(col, 0.95)}
 	d.CI95 = Interval{Quantile(col, 0.025), Quantile(col, 0.975)}
-	d.Upper90 = Quantile(col, 0.90)
+	d.Upper = Quantile(col, 0.95)
 	d.SD = (Quantile(col, 0.8413) - Quantile(col, 0.1587)) / 2
 	d.IQR = Quantile(col, 0.75) - Quantile(col, 0.25)
 	d.Bias = mean(col) - in.Est
@@ -136,13 +140,16 @@ func Summary(in DecisionInput) ParamDecision {
 // not estimable (information floor: n_p below the minimum, IQR < 10⁻⁶, boundary share > 50%, or no replicates),
 // keep (TOST: 90% CI inside [θ₀ − m, θ₀ + m]), change (90% CI entirely outside), otherwise undecided
 // (different if the 95% CI excludes θ₀, imprecise otherwise). With boundary share in (10%, 50%] the one-sided
-// 90% upper bound replaces the interval and only "change" (bound ≤ θ₀ − m) and "undecided (imprecise)" are available.
+// 95% upper bound (q₀.₉₅) replaces the interval and only "change" (bound ≤ θ₀ − m) and "undecided (imprecise)" are available.
 // A zero-width interval can never be "keep": it fails the IQR floor.
 func Decide(in DecisionInput) ParamDecision {
 	d := Summary(in)
 	switch {
 	case d.Reps == 0:
 		d.Label, d.Reason = NotEstimable, "no bootstrap replicates"
+		return d
+	case in.TotalReps > 0 && float64(d.Reps) < MinRepsShare*float64(in.TotalReps):
+		d.Label, d.Reason = NotEstimable, "fewer than 95% of the replicates are valid"
 		return d
 	case in.MinInformative > 0 && in.NInformative < in.MinInformative:
 		d.Label, d.Reason = NotEstimable, "informative triplets below the minimum"
@@ -162,8 +169,8 @@ func Decide(in DecisionInput) ParamDecision {
 	}
 	if in.BoundaryShare > BoundaryOneSided {
 		d.OneSided = true
-		if d.Upper90 <= in.Theta0-in.M {
-			d.Label, d.Reason = Change, "one-sided 90% bound below θ₀ − m"
+		if d.Upper <= in.Theta0-in.M {
+			d.Label, d.Reason = Change, "one-sided 95% bound below θ₀ − m"
 		} else {
 			d.Label, d.Reason = UndecidedImprecise, "boundary parameter: one-sided bound only"
 		}

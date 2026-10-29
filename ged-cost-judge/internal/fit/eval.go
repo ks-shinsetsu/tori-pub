@@ -60,20 +60,28 @@ func Agreement(delta []float64, js []Judgment, only []bool) (rate float64, n int
 	return hit / float64(n), n
 }
 
-// Correct returns, per triplet, whether sign(Δ) matches the clear A/B majority (eligible[t] false when there is
-// no clear A/B majority or only[t] is false). Δ = 0 counts as wrong here (no half credit), for McNemar-type counts.
-func Correct(delta []float64, js []Judgment, only []bool) (right, eligible []bool) {
+// Score returns, per triplet, the agreement score of sign(Δ) with the clear A/B majority: 1 if it matches,
+// 0.5 if Δ = 0, 0 otherwise (the same scoring as Agreement); eligible[t] is false when there is no clear A/B
+// majority (plurality with ties excluded) or only[t] is false. Zero[t] marks Δ = 0.
+func Score(delta []float64, js []Judgment, only []bool) (score []float64, eligible, zero []bool) {
 	maj, ok := Majority(len(delta), js)
-	right = make([]bool, len(delta))
+	score = make([]float64, len(delta))
 	eligible = make([]bool, len(delta))
+	zero = make([]bool, len(delta))
 	for t, d := range delta {
+		zero[t] = math.Abs(d) < 1e-9
 		if !ok[t] || maj[t] == AnswerTie || (only != nil && !only[t]) {
 			continue
 		}
 		eligible[t] = true
-		right[t] = math.Abs(d) >= 1e-9 && (d > 0) == (maj[t] == AnswerA)
+		switch {
+		case zero[t]:
+			score[t] = 0.5
+		case (d > 0) == (maj[t] == AnswerA):
+			score[t] = 1
+		}
 	}
-	return right, eligible
+	return score, eligible, zero
 }
 
 // subset rebuilds triplets and judgments from a list of source argument indices (duplicates allowed).
@@ -90,6 +98,9 @@ func subset(trips []Triplet, js []Judgment, sources []int) (ot []Triplet, oj []J
 	for c, s := range sources {
 		for _, i := range bySource[s] {
 			t := trips[i]
+			if !t.hasOrig {
+				t.orig, t.hasOrig = t.Source, true // remembered so CV folds keep every copy of a source together
+			}
 			t.Source = c // an argument drawn more than once is treated as a separate cluster
 			idx := len(ot)
 			ot = append(ot, t)
@@ -182,16 +193,17 @@ type BootOptions struct {
 
 // RepMeta is the per-replicate record of decisions §6.
 type RepMeta struct {
-	Outer     int
-	Converged bool
-	Cycled    bool
-	Capped    bool
-	Cold      bool
-	Boundary  [ged.NumParams]bool
-	Divergent [ged.NumParams]bool
-	NegLogLik float64
-	Sigma     float64
-	Err       string
+	Outer          int
+	Converged      bool
+	InnerConverged bool
+	Cycled         bool
+	Capped         bool
+	Cold           bool
+	Boundary       [ged.NumParams]bool
+	Divergent      [ged.NumParams]bool
+	NegLogLik      float64
+	Sigma          float64
+	Err            string
 }
 
 // BootResult holds the replicates of the paired bootstrap.
@@ -204,6 +216,8 @@ type BootResult struct {
 	MixedMeta  []RepMeta
 	// Draws[r] is the resampled source list of replicate r.
 	Draws [][]int
+	// Failed is the number of replicates whose fit failed (their rows are nil and Meta[r].Err is set).
+	Failed int
 }
 
 // Shares summarises the replicate metadata per cost: boundary and divergent shares, and overall cycled/capped/non-converged shares.
@@ -238,7 +252,7 @@ func Summarise(meta []RepMeta) Shares {
 		if m.Capped {
 			s.Capped++
 		}
-		if !m.Converged {
+		if !m.Converged || !m.InnerConverged {
 			s.NotConverged++
 		}
 		if m.Cold {
@@ -256,7 +270,7 @@ func Summarise(meta []RepMeta) Shares {
 }
 
 func metaOf(r Result, cold bool) RepMeta {
-	return RepMeta{Outer: r.Outer, Converged: r.Converged, Cycled: r.Cycled, Capped: r.Capped, Cold: cold,
+	return RepMeta{Outer: r.Outer, Converged: r.Converged, InnerConverged: r.InnerConverged, Cycled: r.Cycled, Capped: r.Capped, Cold: cold,
 		Boundary: r.Boundary, Divergent: r.Divergent, NegLogLik: r.NegLogLik, Sigma: r.Params.Sigma}
 }
 
@@ -354,23 +368,32 @@ func BootstrapOpts(trips []Triplet, js []Judgment, opts Options, est Params, bo 
 		go func(r int) {
 			defer func() { <-sem; wg.Done() }()
 			bt, bj, _ := subset(trips, js, out.Draws[r])
-			o := opts
+			// A cold replicate starts from Init (β = 1, τ = 0.5, π = 0) at θ₀ and at all-0.5 and keeps the better
+			// objective; the warm estimate is not among its starts (review-fit-impl M1).
+			var res Result
+			var err error
 			if isCold[r] {
-				o = coldOpts
+				res, err = Fit(bt, bj, coldOpts, nil)
+			} else {
+				res, err = Fit(bt, bj, opts, &warm)
 			}
-			res, err := Fit(bt, bj, o, &warm)
 			if err != nil {
 				errs[r] = err
-				out.Meta[r].Err = err.Error()
+				out.Meta[r] = RepMeta{Err: err.Error(), Cold: isCold[r]}
 				return
 			}
 			out.Theta[r] = ThetaVec(res.Params)
 			out.Meta[r] = metaOf(res, isCold[r])
 			if bo.Mixed {
-				mr, err := FitMixed(bt, bj, o, &warmMixed)
+				var mr Result
+				if isCold[r] {
+					mr, err = FitMixed(bt, bj, coldOpts, nil)
+				} else {
+					mr, err = FitMixed(bt, bj, opts, &warmMixed)
+				}
 				if err != nil {
 					errs[r] = err
-					out.MixedMeta[r].Err = err.Error()
+					out.MixedMeta[r] = RepMeta{Err: err.Error(), Cold: isCold[r]}
 					return
 				}
 				out.MixedTheta[r] = ThetaVec(mr.Params)
@@ -381,10 +404,43 @@ func BootstrapOpts(trips []Triplet, js []Judgment, opts Options, est Params, bo 
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			return out, err
+			out.Failed++
 		}
 	}
+	if float64(out.Failed) > MaxFailShare*float64(bo.Reps) {
+		var first error
+		for _, err := range errs {
+			if err != nil {
+				first = err
+				break
+			}
+		}
+		return out, fmt.Errorf("bootstrap: %d of %d replicates failed (> %.0f%%): %w", out.Failed, bo.Reps, 100*MaxFailShare, first)
+	}
 	return out, nil
+}
+
+// MaxFailShare is the pre-registered share of failed bootstrap replicates above which the bootstrap is an error;
+// below it the failed replicates are left out (nil rows) and their share is reported (decisions §6).
+const MaxFailShare = 0.01
+
+// WarmCold splits the replicates of column i (anchored ThetaVec index, after normalization if norm is given)
+// into warm and cold starts and returns the 5%/95% quantiles of each (NaN when a group is empty); decisions §6, review m6.
+func (b BootResult) WarmCold(rows [][]float64, meta []RepMeta, i int) (warm, cold [2]float64) {
+	var w, c []float64
+	for r, row := range rows {
+		if row == nil || r >= len(meta) || i >= len(row) {
+			continue
+		}
+		if meta[r].Cold {
+			c = append(c, row[i])
+		} else {
+			w = append(w, row[i])
+		}
+	}
+	slices.Sort(w)
+	slices.Sort(c)
+	return [2]float64{Quantile(w, 0.05), Quantile(w, 0.95)}, [2]float64{Quantile(c, 0.05), Quantile(c, 0.95)}
 }
 
 // CVOptions configures cross-validation (decisions §7).
@@ -422,17 +478,46 @@ func (r CVResult) MeanLogLoss(rep int) float64 {
 	return s / float64(n)
 }
 
-// assignFolds assigns every source to a fold, stratified by generator (shuffled within stratum).
+// assignFolds assigns every source to a fold, stratified by generator (shuffled within stratum). Bootstrap copies
+// of one original source share a fold (grouping by foldKey, review-fit-impl M2).
 func assignFolds(trips []Triplet, k int, rng *rand.Rand) map[int]int {
-	fold := map[int]int{}
+	// Group by original key, stratified by generator.
+	gen := map[int]string{}
+	keyOfSource := map[int]int{}
+	for _, t := range trips {
+		keyOfSource[t.Source] = t.foldKey()
+		if g, ok := gen[t.foldKey()]; !ok || g == "" {
+			gen[t.foldKey()] = t.Generator
+		}
+	}
+	byGen := map[string][]int{}
+	seen := map[int]bool{}
+	for _, t := range trips {
+		key := t.foldKey()
+		if !seen[key] {
+			seen[key] = true
+			byGen[gen[key]] = append(byGen[gen[key]], key)
+		}
+	}
+	names := make([]string, 0, len(byGen))
+	for g := range byGen {
+		names = append(names, g)
+	}
+	sort.Strings(names)
+	foldOfKey := map[int]int{}
 	offset := 0
-	for _, s := range sourceStrata(trips) {
-		ids := slices.Clone(s.ids)
+	for _, g := range names {
+		ids := byGen[g]
+		slices.Sort(ids)
 		rng.Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
 		for i, id := range ids {
-			fold[id] = (i + offset) % k
+			foldOfKey[id] = (i + offset) % k
 		}
 		offset = (offset + len(ids)) % k
+	}
+	fold := map[int]int{}
+	for s, key := range keyOfSource {
+		fold[s] = foldOfKey[key]
 	}
 	return fold
 }
@@ -455,6 +540,11 @@ func CrossValidateOpts(trips []Triplet, js []Judgment, opts Options, cvo CVOptio
 	}
 	if cvo.Repeats <= 0 {
 		cvo.Repeats = 1
+	}
+	if cvo.Mixed {
+		// The per-judgment OOF predictive of the random-intercept model is its marginal, not the conditional
+		// formula LogLik applies (review-fit-impl m24); R2 in §7 is the working-independence fit.
+		return CVResult{}, errors.New("cv: Mixed is not supported (OOF log loss would be miscalibrated)")
 	}
 	if opts.Weights != nil {
 		if len(opts.Weights) != len(trips) {
@@ -568,29 +658,34 @@ func filterMasks(trips []Triplet, js []Judgment, opts Options) (keepT, keepJ []b
 
 // DOptions configures the nested bootstrap for the D criterion (decisions §7).
 type DOptions struct {
-	Reps    int    // 0 → 200
+	Reps    int    // bootstrap replicates (0 → 200)
 	Seed    uint64 // seed of the point CV and of the replicates
 	K       int    // folds (0 → 5)
+	Repeats int    // CV repeats averaged for the point estimate (0 → 4); replicates use one partition each
 	Workers int    // 0 → GOMAXPROCS
 }
 
-// DResult is the D criterion with its nested-bootstrap distribution.
+// DResult is the D criterion with its nested-bootstrap distribution. Both forms are computed on the same
+// estimation set: the triplets and judgments that survive the filters of the R2 options (review-fit-impl M7).
 type DResult struct {
-	// Agree is agree(R2 OOF) − agree(R0) in percentage points on non-P-neg triplets with a clear A/B majority.
+	// Agree is agree(R2 OOF) − agree(R0) in percentage points on non-P-neg triplets with a clear A/B majority
+	// (plurality, ties excluded; Δ = 0 scores ½), averaged over the CV repeats.
 	Agree     float64
 	AgreeBoot []float64
 	// LogLoss is mean OOF log loss(R0, aux fitted in-fold) − mean OOF log loss(R2), nats per judgment (positive favours R2).
 	LogLoss     float64
 	LogLossBoot []float64
-	// Strata holds the agreement form of D per triplet stratum label (when strata labels are given).
+	// Strata holds the agreement form of D per triplet stratum label (when strata labels are given); a stratum
+	// absent from a replicate is NaN there.
 	Strata     map[string]float64
 	StrataBoot map[string][]float64
-	// N is the number of eligible triplets at the point estimate.
-	N int
+	// N is the number of eligible triplets at the point estimate; Triplets/Judgments the size of the estimation set.
+	N                   int
+	Triplets, Judgments int
 }
 
 // dStats computes the agreement and log-loss forms of D on one dataset given the OOF Δ of R2, Δ at R0, and the OOF log losses.
-func dStats(trips []Triplet, js []Judgment, d2, d0, ll2, ll0 []float64, labels []string) (agree, logLoss float64, n int, strata map[string]float64) {
+func dStats(trips []Triplet, js []Judgment, d2, d0, ll2, ll0 []float64, labels []string, allLabels map[string]bool) (agree, logLoss float64, n int, strata map[string]float64) {
 	nonNeg := make([]bool, len(trips))
 	for i, t := range trips {
 		nonNeg[i] = t.NegDiff == 0
@@ -614,18 +709,18 @@ func dStats(trips []Triplet, js []Judgment, d2, d0, ll2, ll0 []float64, labels [
 	}
 	if labels != nil {
 		strata = map[string]float64{}
-		set := map[string]bool{}
-		for _, l := range labels {
-			set[l] = true
-		}
-		for l := range set {
+		for l := range allLabels {
 			mask := make([]bool, len(trips))
 			for i := range trips {
 				mask[i] = nonNeg[i] && labels[i] == l
 			}
-			x2, _ := Agreement(d2, js, mask)
-			x0, _ := Agreement(d0, js, mask)
-			strata[l] = 100 * (x2 - x0)
+			x2, n2 := Agreement(d2, js, mask)
+			x0, n0 := Agreement(d0, js, mask)
+			if n2 == 0 || n0 == 0 {
+				strata[l] = math.NaN()
+			} else {
+				strata[l] = 100 * (x2 - x0)
+			}
 		}
 	}
 	return agree, logLoss, n, strata
@@ -633,7 +728,8 @@ func dStats(trips []Triplet, js []Judgment, d2, d0, ll2, ll0 []float64, labels [
 
 // NestedD computes D = agree(R2 OOF) − agree(R0) with a source-level, generator-stratified bootstrap in which the
 // k-fold CV of R2 (opts) and the in-fold auxiliary fit of R0 (rule0, FixTheta) are repeated inside every replicate
-// (review M7). labels, if non-nil, gives a stratum name per triplet for the per-stratum D.
+// (review M7). The filters of opts are applied once, up front, so both forms of D use the estimation set.
+// labels, if non-nil, gives a stratum name per (unfiltered) triplet for the per-stratum D.
 func NestedD(trips []Triplet, js []Judgment, opts Options, rule0 ged.Theta, labels []string, do DOptions) (DResult, error) {
 	if do.Reps <= 0 {
 		do.Reps = 200
@@ -641,18 +737,31 @@ func NestedD(trips []Triplet, js []Judgment, opts Options, rule0 ged.Theta, labe
 	if do.K <= 1 {
 		do.K = 5
 	}
+	if do.Repeats <= 0 {
+		do.Repeats = 4
+	}
 	if labels != nil && len(labels) != len(trips) {
 		return DResult{}, fmt.Errorf("nested D: len(labels) = %d, want %d", len(labels), len(trips))
 	}
-	if opts.Weights != nil {
-		if len(opts.Weights) != len(trips) {
-			return DResult{}, fmt.Errorf("nested D: len(Weights) = %d, want %d", len(opts.Weights), len(trips))
+	if opts.Weights != nil && len(opts.Weights) != len(trips) {
+		return DResult{}, fmt.Errorf("nested D: len(Weights) = %d, want %d", len(opts.Weights), len(trips))
+	}
+	if err := checkWeights(trips, opts); err != nil {
+		return DResult{}, err
+	}
+	var kept []int
+	trips, js, kept = Filter(trips, js, opts)
+	opts.Weights, opts.IncludeAll, opts.Exclude, opts.ExcludeSameFamily, opts.CohZeroOnly = nil, true, nil, false, false
+	if labels != nil {
+		lab := make([]string, len(trips))
+		for i, o := range kept {
+			lab[i] = labels[o]
 		}
-		trips = slices.Clone(trips)
-		for i := range trips {
-			trips[i].Weight = opts.Weights[i]
-		}
-		opts.Weights = nil
+		labels = lab
+	}
+	allLabels := map[string]bool{}
+	for _, l := range labels {
+		allLabels[l] = true
 	}
 	opts0 := opts
 	opts0.FixTheta, opts0.Theta0, opts0.Starts, opts0.Lambda = true, rule0, nil, 0
@@ -669,14 +778,31 @@ func NestedD(trips []Triplet, js []Judgment, opts Options, rule0 ged.Theta, labe
 		if err != nil {
 			return 0, 0, 0, nil, err
 		}
-		a, l, n, s := dStats(tr, j, cv2.Delta[0], d0, cv2.LogLoss[0], cv0.LogLoss[0], lab)
+		a, l, n, s := dStats(tr, j, cv2.Delta[0], d0, cv2.LogLoss[0], cv0.LogLoss[0], lab, allLabels)
 		return a, l, n, s, nil
 	}
-	var out DResult
-	var err error
-	out.Agree, out.LogLoss, out.N, out.Strata, err = one(trips, js, labels, do.Seed)
-	if err != nil {
-		return out, err
+	out := DResult{Triplets: len(trips), Judgments: len(js)}
+	// Point estimate: mean over the CV repeats (review-fit-impl m23).
+	sumA, sumL := 0.0, 0.0
+	sumS := map[string]float64{}
+	for rep := range do.Repeats {
+		a, l, n, s, err := one(trips, js, labels, do.Seed+uint64(rep))
+		if err != nil {
+			return out, err
+		}
+		sumA += a
+		sumL += l
+		out.N = n
+		for k, v := range s {
+			sumS[k] += v
+		}
+	}
+	out.Agree, out.LogLoss = sumA/float64(do.Repeats), sumL/float64(do.Repeats)
+	if labels != nil {
+		out.Strata = map[string]float64{}
+		for k, v := range sumS {
+			out.Strata[k] = v / float64(do.Repeats)
+		}
 	}
 	strata := sourceStrata(trips)
 	draws := make([][]int, do.Reps)
@@ -723,10 +849,14 @@ func NestedD(trips []Triplet, js []Judgment, opts Options, rule0 ged.Theta, labe
 	}
 	if labels != nil {
 		out.StrataBoot = map[string][]float64{}
-		for l := range out.Strata {
+		for l := range allLabels {
 			col := make([]float64, do.Reps)
 			for r := range do.Reps {
-				col[r] = perRep[r][l]
+				if v, ok := perRep[r][l]; ok {
+					col[r] = v
+				} else {
+					col[r] = math.NaN()
+				}
 			}
 			out.StrataBoot[l] = col
 		}

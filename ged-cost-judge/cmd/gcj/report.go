@@ -18,298 +18,289 @@ import (
 )
 
 // ---------------------------------------------------------------------------------------------------------------
-// Decision table (decisions-stats §2, §3, §6, §16 #5, #19)
+// Confirmatory report (decisions-stats §2–§4, §6, §7, §9, §9.1, §12b, §16 #5, #10, #13, #19)
+//
+// WriteConfirmatory formats a fit.ConfirmResult. It is the only place that prints §3 labels, and
+// fit.Confirmatory is the only function that produces them. simulate.go and pilot.go must call
+// fit.Confirmatory + WriteConfirmatory for any decision output; paramTable prints intervals only.
 // ---------------------------------------------------------------------------------------------------------------
 
-// fitSummary is one co-primary fit with its bootstrap replicates (anchored scale).
-type fitSummary struct {
-	Name string
-	Res  fit.Result
-	Boot [][]float64 // [rep] → ThetaVec (θ_0..θ_10, θ_neg)
-	Meta []fit.RepMeta
-}
+// WriteConfirmatory writes the complete confirmatory report.
+func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
+	co := r.Options
+	fmt.Fprintln(w, "\n# 確認的分析（決定文書 §2–§7、`fit.Confirmatory` の出力）")
+	fmt.Fprintln(w, "\nこの節の判断は `fit.Confirmatory` だけが作る。`simulate` / `pilot` の他の表は参考値であり、§3 の規則ではない。")
+	writeProvenance(w, prov)
 
-// decisionInput gathers what the §3 rule needs.
-type decisionInput struct {
-	Theta0 ged.Theta
-	M      float64
-	U      []int // nil → fit.DefaultU
-	Indep  fitSummary
-	Mixed  *fitSummary // nil → single-fit labels (reported as such)
-	// NInf[p] is the number of triplets with Δφ_p ≠ 0 at θ₀ (index fit.NormEdgeExtra = edge-extra); nil → no floor.
-	NInf *[ged.NumParams + 1]int
-	// MinInf maps a normalized index to its §15.3 minimum (nil → no count floor; defaultMinInformative() for the final analysis).
-	MinInf  map[int]int
-	Truth   *ged.Theta
-	TrueNeg *float64
-	Tie     map[int]int
-	// DiagCA holds the diagnostic free-fit estimates (normalized) of the CA pairs with CIs, if the sensitivity fit was run.
-	DiagCA *diagCA
-}
-
-// diagCA is the diagnostic free fit of §12b (descriptive).
-type diagCA struct {
-	RACA, CAMA     stats.ParamDecision
-	ContrastRACA   stats.ContrastResult // θ_RA↔CA − θ_type
-	ContrastCAMA   stats.ContrastResult
-	FeasibleRACA   int
-	FeasibleCAMA   int
-	CountsOnlyRACA bool
-	CountsOnlyCAMA bool
-}
-
-// defaultMinInformative are the §15.3 minimum informative counts at 3,000 triplets (normalized indices).
-func defaultMinInformative() map[int]int {
-	return map[int]int{
-		ged.PNodeMissing: 650, ged.PNodeExtra: 650, ged.PEdgeMissing: 650, fit.NormEdgeExtra: 650,
-		ged.PTypeRAMA: 450, ged.PDirection: 650, fit.NormNeg: 300,
+	// Judge QC first (it ran before θ).
+	writeJudgeQC(w, r.QC, co)
+	if len(r.ExcludedJudges) > 0 {
+		fmt.Fprintf(w, "\n**除外した判定者: %s。θ は残りの判定者で当てはめた（§9）。**\n", strings.Join(r.ExcludedJudges, "、"))
 	}
-}
 
-// paramRow is one line of the decision table.
-type paramRow struct {
-	Index    int
-	Name     string
-	Indep    stats.ParamDecision
-	Mixed    *stats.ParamDecision
-	Combined stats.Label
-	// Margin is true for the six margin-judged parameters; knots and θ_neg get intervals only.
-	Margin bool
-	// Anchored estimate and ŝ are kept for the descriptive table.
-	Anchored float64
-}
+	// Filters.
+	fmt.Fprintln(w, "\n## 推定集合（決定文書 #15、§12b、§13）")
+	fmt.Fprintf(w, "\n三つ組 %d、判定 %d（判定者 %s）。", r.Triplets, r.Judgments, strings.Join(r.JudgeNames, "、"))
+	if r.JudgmentsDropped > 0 {
+		fmt.Fprintf(w, " 判定者の系列 = 検証者の系列で除いた判定 %d。", r.JudgmentsDropped)
+	}
+	fmt.Fprintln(w, "\n\n除外して数えた三つ組:")
+	fmt.Fprintln(w, "\n| フラグ | 除外数 |")
+	fmt.Fprintln(w, "| --- | --: |")
+	for _, kv := range sortedKV(r.Exclusions) {
+		fmt.Fprintf(w, "| %s | %s |\n", kv[0], kv[1])
+	}
 
-// decide computes the per-parameter decisions on the normalized scale for both fits.
-func decide(in decisionInput) ([]paramRow, float64, []float64) {
-	U := in.U
-	if U == nil {
-		U = fit.DefaultU
-	}
-	estN, sHat := fit.NormalizeParams(in.Indep.Res.Params, U)
-	bootN, sBoot := fit.NormalizeRows(in.Indep.Boot, U)
-	sharesI := fit.Summarise(in.Indep.Meta)
-	var estM []float64
-	var bootM [][]float64
-	var sharesM fit.Shares
-	if in.Mixed != nil {
-		estM, _ = fit.NormalizeParams(in.Mixed.Res.Params, U)
-		bootM, _ = fit.NormalizeRows(in.Mixed.Boot, U)
-		sharesM = fit.Summarise(in.Mixed.Meta)
-	}
-	th0 := fit.Theta0Extended(in.Theta0)
-	margin := map[int]bool{}
-	for _, p := range fit.MarginJudged {
-		margin[p] = true
-	}
-	var rows []paramRow
-	for i := range fit.NormLen {
-		if _, tied := in.Tie[i]; tied {
-			continue // reported in the "extrapolated" rows
+	// Information.
+	fmt.Fprintln(w, "\n## 情報量（Δφ_p ≠ 0 の三つ組数、θ₀ で、決定文書 §15.3）")
+	fmt.Fprintln(w, "\n| パラメータ | n_p | 下限 |")
+	fmt.Fprintln(w, "| --- | --: | --: |")
+	for p := 0; p <= fit.NormEdgeExtra; p++ {
+		if isTied(r, p) {
+			continue
 		}
-		row := paramRow{Index: i, Name: fit.NormName(i), Margin: margin[i]}
-		if i < ged.NumParams {
-			row.Anchored = in.Indep.Res.Params.Theta[i]
-		} else if i == fit.NormEdgeExtra {
-			row.Anchored = ged.EdgeExtraCost
+		fmt.Fprintf(w, "| %s | %d | %s |\n", fit.NormName(p), r.Informative[p], minCell(co.MinInformative, p))
+	}
+	fmt.Fprintf(w, "| θ_neg | %d | %s |\n", r.NegInformative, minCell(co.MinInformative, fit.NormNeg))
+
+	// Fits.
+	fmt.Fprintln(w, "\n## 当てはめ（決定文書 §11）")
+	fmt.Fprintf(w, "\n- 作業独立: 交互最適化 %d 回（収束 %v、循環 %v、上限 %v、内側の収束 %v）、NLL = %.2f、多点開始 %d 点の最大のずれ %.3f%s\n",
+		r.Indep.Outer, r.Indep.Converged, r.Indep.Cycled, r.Indep.Capped, r.Indep.InnerConverged, r.Indep.NegLogLik, len(r.Indep.Starts), r.Indep.StartSpread, spreadFlag(r.Indep.StartSpread))
+	for _, st := range r.Indep.Starts {
+		fmt.Fprintf(w, "  - %s: 目的関数 %.2f（収束 %v、循環 %v）\n", st.Name, st.Objective, st.Converged, st.Cycled)
+	}
+	if r.Mixed.Params.Beta != nil {
+		fmt.Fprintf(w, "- ランダム切片（適応ガウス–エルミート %d 点）: %d 回（収束 %v、循環 %v）、NLL = %.2f、σ̂ = %.3f、多点開始の最大のずれ %.3f%s\n",
+			defaultI(co.HighNodes/4, 20), r.Mixed.Outer, r.Mixed.Converged, r.Mixed.Cycled, r.Mixed.NegLogLik, r.Mixed.Params.Sigma, r.Mixed.StartSpread, spreadFlag(r.Mixed.StartSpread))
+		if r.MixedCheck != nil {
+			fmt.Fprintf(w, "  - σ̂ > %.1f なので %d 点で再当てはめ: θ の最大の変化 %.4f、σ̂ の変化 %+.4f\n", co.HighNodesSigma, co.HighNodes, r.MixedCheckMaxDiff, r.MixedCheckSigmaDiff)
+		}
+	} else {
+		fmt.Fprintln(w, "- **ランダム切片の当てはめは省略（共主要の一致が取れないので「妥当」にはならない）**")
+	}
+	fmt.Fprintf(w, "- 対応付けの安定性: θ̂ ± 3 SD の箱（軸上 22 点 + 無作為な角 64 点）で対応付けが変わる三つ組 %.1f%%（§11.6）\n", 100*r.Stability)
+
+	// Decision table.
+	fmt.Fprintln(w, "\n## パラメータの判断（決定文書 §2–§3、和で正規化した尺度）")
+	fmt.Fprintf(w, "\n判断の幅 m = ±%.2f。尺度は U = {%s} の 6 費用の和が現行表の和（%.2f）に一致するよう正規化した θ̃ = θ̂ / ŝ（辺の余分は 1/ŝ）。ŝ = %.3f（90%% 区間 [%.3f, %.3f]）。",
+		co.M, uNames(co.U), sumU(co.Theta0, co.U), r.SHat, r.SHatCI[0], r.SHatCI[1])
+	fmt.Fprintf(w, " 区間は生成モデルで層化したクラスタブートストラップ B = %d（失敗 %d）のパーセンタイル。SD = (84%% 点 − 16%% 点)/2。\n", co.B, r.Boot.Failed)
+	fmt.Fprintln(w, "\n規則: 90% 区間が [θ₀ − m, θ₀ + m] に入れば「維持」（TOST）、全体が外なら「変更」、「推定不能」は n_p が下限未満・固定尺度の反復の IQR < 1e-6・有効な反復 < 95%・境界率 > 50% のいずれか、それ以外は「未決」。境界率 10–50% は片側 95% 上限のみ（「変更」か「未決（精度不足）」）。共主要の 2 つの当てはめのラベルが一致したときだけ判断が立つ。U の費用が 1 つでも推定不能なら ŝ が同定されず、正規化した判断はすべて「推定不能」。")
+	if !r.ScaleIdentified {
+		fmt.Fprintln(w, "\n**正規化の尺度が同定できない（U の費用に推定不能がある）。以下のラベルはすべて「推定不能」。固定尺度の表を参照。**")
+	}
+	head := "| パラメータ | θ₀ |"
+	sep := "| --- | --: |"
+	if co.Truth != nil {
+		head += " 真の値（正規化） |"
+		sep += " --: |"
+	}
+	head += " θ̃ | SD | 90% 区間 | 95% 区間 | n_p | 境界率 | 判断（独立）"
+	sep += " --: | --: | --- | --- | --: | --: | ---"
+	if r.Mixed.Params.Beta != nil {
+		head += " | θ̃（切片） | 90%（切片） | 判断（切片） | **判断**"
+		sep += " | --: | --- | --- | ---"
+	}
+	fmt.Fprintln(w, "\n"+head+" |")
+	fmt.Fprintln(w, sep+" |")
+	for _, p := range r.Params {
+		d := p.Indep
+		label := d.Label.JA()
+		if !p.Margin {
+			label = "—（区間のみ）"
+		}
+		line := fmt.Sprintf("| %s | %s |", p.Name, num(p.Theta0))
+		if co.Truth != nil {
+			line += fmt.Sprintf(" %s |", num(p.Truth))
+		}
+		line += fmt.Sprintf(" %.2f | %.3f | %s | %s | %s | %.0f%% | %s", d.Est, d.SD, intervalCell(d), ci(d.CI95), nCell(d), 100*d.BoundaryShare, label)
+		if p.Mixed != nil {
+			m := *p.Mixed
+			ml, cl := m.Label.JA(), p.Combined.JA()
+			if !p.Margin {
+				ml, cl = "—", "—"
+			}
+			line += fmt.Sprintf(" | %.2f | %s | %s | **%s** |", m.Est, intervalCell(m), ml, cl)
 		} else {
-			row.Anchored = in.Indep.Res.Params.ThetaNeg
+			line += " |"
 		}
-		mk := func(est []float64, boot [][]float64, anchored [][]float64, sh fit.Shares) stats.ParamDecision {
-			di := stats.DecisionInput{Est: est[i], Boot: fit.Column(boot, i), Theta0: th0[i], M: in.M}
-			if i != fit.NormEdgeExtra {
-				ai := i
-				if i == fit.NormNeg {
-					ai = ged.NumParams // ThetaVec layout: θ_neg follows the 11 costs
-				}
-				col := fit.Column(anchored, ai)
-				di.AnchoredIQR = stats.Quantile(col, 0.75) - stats.Quantile(col, 0.25)
-				di.CheckAnchored = true
-			}
-			if in.NInf != nil && i <= fit.NormEdgeExtra {
-				di.NInformative = in.NInf[i]
-			} else if in.NInf != nil && i == fit.NormNeg {
-				di.NInformative = -1
-			}
-			if in.MinInf != nil {
-				di.MinInformative = in.MinInf[i]
-			}
-			if i < ged.NumParams {
-				di.BoundaryShare, di.DivergentShare = sh.Boundary[i], sh.Divergent[i]
-			}
-			if di.NInformative < 0 {
-				di.NInformative, di.MinInformative = 0, 0
-			}
-			return stats.Decide(di)
-		}
-		row.Indep = mk(estN, bootN, in.Indep.Boot, sharesI)
-		row.Combined = row.Indep.Label
-		if in.Mixed != nil {
-			d := mk(estM, bootM, in.Mixed.Boot, sharesM)
-			row.Mixed = &d
-			row.Combined = stats.Combine(row.Indep.Label, d.Label)
-		}
-		rows = append(rows, row)
+		fmt.Fprintln(w, line)
 	}
-	return rows, sHat, sBoot
+	if len(r.Extrapolated) > 0 {
+		fmt.Fprintln(w, "\n判断なしの行（決定文書 §12b）:")
+		fmt.Fprintln(w, "\n| 種別の組 | 扱い |")
+		fmt.Fprintln(w, "| --- | --- |")
+		for _, e := range r.Extrapolated {
+			fmt.Fprintf(w, "| %s | **%s から外挿、較正なし** |\n", ged.ParamNames[e.Index], ged.ParamNames[e.Master])
+		}
+		fmt.Fprintln(w, "\n使途の 81 件の種別誤りのうち 14 件（17%）は CA を含み、仮定で値を置いている。診断セルの自由推定（§12b）は別の感度分析として報告する。")
+	}
+
+	// Anchored table and bootstrap diagnostics.
+	fmt.Fprintln(w, "\n### 固定尺度（辺の余分 = 1）の推定値とブートストラップの診断")
+	fmt.Fprintln(w, "\n| パラメータ | 固定尺度の推定値 | 偏り（正規化） | 偏りの警告 | 境界率 | 発散率 | IQR | 有効な反復 | ウォーム 5–95% | コールド 5–95% |")
+	fmt.Fprintln(w, "| --- | --: | --: | --- | --: | --: | --: | --: | --- | --- |")
+	for _, p := range r.Params {
+		d := p.Indep
+		flag := ""
+		if d.BiasFlag {
+			flag = "|偏り| > 0.5 SD"
+		}
+		fmt.Fprintf(w, "| %s | %.3f | %+.3f | %s | %.1f%% | %.1f%% | %.2e | %d/%d | [%s, %s] | [%s, %s] |\n", p.Name, p.Anchored, d.Bias, flag,
+			100*d.BoundaryShare, 100*d.DivergentShare, d.IQR, d.Reps, d.TotalReps, num(p.WarmCI[0]), num(p.WarmCI[1]), num(p.ColdCI[0]), num(p.ColdCI[1]))
+	}
+	sh := fit.Summarise(r.Boot.Meta)
+	fmt.Fprintf(w, "\n反復の内訳（作業独立）: 循環 %.1f%%、上限到達 %.1f%%、非収束 %.1f%%、コールドスタート %d 回（θ₀ と全 0.5 から、ウォームの推定値は使わない）。", 100*sh.Cycled, 100*sh.Capped, 100*sh.NotConverged, sh.Cold)
+	if r.Boot.MixedMeta != nil {
+		shm := fit.Summarise(r.Boot.MixedMeta)
+		fmt.Fprintf(w, " ランダム切片: 循環 %.1f%%、上限到達 %.1f%%、非収束 %.1f%%。", 100*shm.Cycled, 100*shm.Capped, 100*shm.NotConverged)
+	}
+	fmt.Fprintln(w)
+	for _, p := range r.Params {
+		if p.Indep.DivergentShare > stats.DivergentReport {
+			fmt.Fprintf(w, "- %s: 発散した反復が %.1f%% > 2%%（発散を除いた区間は固定尺度の列から再計算すること）\n", p.Name, 100*p.Indep.DivergentShare)
+		}
+	}
+
+	// Hypotheses.
+	fmt.Fprintln(w, "\n## 確認的仮説（決定文書 §4、正規化した尺度、ブートストラップ対比）")
+	fmt.Fprintf(w, "\n帰無値を検定ごとに明示。片側 p は帰無値の反対側にある反復の割合、両側は 2 倍。族は Holm で α = 0.05（2 つの当てはめのうち大きい p を使う）。「支持」は両方の当てはめで支持されたときだけ。H1・H2 は判定には無調整の α で入る（交差–和集合検定）。H3 は計画 v4 からの逸脱として取り下げ。C 族は Δ = 0 を ½ 点とするクラスタ版 McNemar、正確 McNemar は両規則で Δ ≠ 0 の三つ組のみ。B = %d。\n", co.B)
+	fmt.Fprintln(w, "\n| ID | 対比 | 帰無値 | 推定値 | 95% 区間 | p | p（Holm） | 支持 | 備考 |")
+	fmt.Fprintln(w, "| --- | --- | --: | --: | --- | --: | --: | --- | --- |")
+	for _, h := range r.Hypotheses {
+		sup := "いいえ"
+		if h.Supported {
+			sup = "はい"
+		}
+		cell := fmt.Sprintf("%.3f", h.Indep.Est)
+		ciCell := ci(h.Indep.CI95)
+		if h.Mixed != nil {
+			cell += fmt.Sprintf(" / %.3f", h.Mixed.Est)
+			ciCell += " / " + ci(h.Mixed.CI95)
+		}
+		note := ""
+		if h.Eligible > 0 {
+			note = fmt.Sprintf("不一致 %d / %d、正確 p = %.3f、Δ = 0 で除外 %d / %d", h.Discordant[0], h.Discordant[1], h.ExactP, h.ZeroDropped, h.Eligible)
+		}
+		fmt.Fprintf(w, "| %s | %s | %.2f | %s | %s | %.3f | %.3f | %s | %s |\n", h.ID, h.Name, h.Indep.Null, cell, ciCell, h.Indep.P, h.PHolm, sup, note)
+	}
+	fmt.Fprintln(w, "\nH4 は非対称性の主張であり表の妥当性の主張ではない: 「H4b 支持」と「辺の欠落: 維持」は両立しうる。")
+
+	// D and verdict.
+	fmt.Fprintln(w, "\n## 現行表の判定（決定文書 §3・§7）")
+	if r.D != nil {
+		lo, hi := r.D.DBounds()
+		fmt.Fprintf(w, "\n- D = agree(R2, OOF) − agree(R0) = %.2f pt（CV %d 回の平均、対象 %d 組）、片側 95%% 下限 %.2f、上限 %.2f（元の議論のネストしたブートストラップ %d 回、各反復で 5 分割 CV を再学習）。妥当の条件は上限 < 2 pt、否定は下限 ≥ 2 pt。対数損失の形: %.4f nats/判定（正なら R2 が良い）。両方とも推定集合（三つ組 %d、判定 %d）で計算。\n",
+			r.D.Agree, co.DRepeats, r.D.N, lo, hi, len(r.D.AgreeBoot), r.D.LogLoss, r.D.Triplets, r.D.Judgments)
+		if len(r.D.Strata) > 0 {
+			fmt.Fprintln(w, "\n| 層 | D（pt） | 片側 95% 下限 / 上限 |")
+			fmt.Fprintln(w, "| --- | --: | --- |")
+			keys := make([]string, 0, len(r.D.Strata))
+			for k := range r.D.Strata {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				col := sortedClean(r.D.StrataBoot[k])
+				fmt.Fprintf(w, "| %s | %s | %s / %s |\n", k, num(r.D.Strata[k]), num(stats.Quantile(col, 0.05)), num(stats.Quantile(col, 0.95)))
+			}
+		}
+	} else {
+		fmt.Fprintln(w, "\n- **D は省略（「妥当」にはならない）**")
+	}
+	fmt.Fprintf(w, "\n**判定: %s（%s）**\n", r.Verdict.JA(), r.Verdict)
+	if len(r.Missing) > 0 {
+		fmt.Fprintln(w, "\n欠けている要素:")
+		for _, m := range r.Missing {
+			fmt.Fprintf(w, "- %s\n", m)
+		}
+	}
+	fmt.Fprintln(w, "\n「否定されず」は現行表を続ける許可ではない: データが決めなかったという意味。")
+
+	// LOJO.
+	if len(r.LOJO) > 0 {
+		fmt.Fprintln(w, "\n## 判定者を 1 人ずつ除いた判断（決定文書 §9）")
+		head := "| パラメータ | 全員 |"
+		sep := "| --- | --- |"
+		for _, l := range r.LOJO {
+			head += fmt.Sprintf(" %s を除く |", l.Judge)
+			sep += " --- |"
+		}
+		fmt.Fprintln(w, "\n"+head)
+		fmt.Fprintln(w, sep)
+		changed := 0
+		for i, p := range r.Params {
+			if !p.Margin {
+				continue
+			}
+			line := fmt.Sprintf("| %s | %s |", p.Name, p.Combined.JA())
+			for _, l := range r.LOJO {
+				if i >= len(l.Params) {
+					line += " — |"
+					continue
+				}
+				cell := l.Params[i].Combined.JA()
+				if l.Params[i].Combined != p.Combined {
+					cell = "**" + cell + "**"
+					changed++
+				}
+				line += fmt.Sprintf(" %s（%.2f） |", cell, l.Params[i].Indep.Est)
+			}
+			fmt.Fprintln(w, line)
+		}
+		fmt.Fprintf(w, "\n太字 = 全員での判断と異なる（%d 箇所、各 B = %d）。\n", changed, co.LOJOReps)
+	}
+}
+
+func isTied(r fit.ConfirmResult, p int) bool {
+	for _, e := range r.Extrapolated {
+		if e.Index == p {
+			return true
+		}
+	}
+	return false
+}
+
+func minCell(m map[int]int, p int) string {
+	if v, ok := m[p]; ok && v > 0 {
+		return fmt.Sprintf("≥ %d", v)
+	}
+	return "—"
+}
+
+func nCell(d stats.ParamDecision) string {
+	if d.N == 0 && d.MinN == 0 {
+		return "—"
+	}
+	s := fmt.Sprintf("%d", d.N)
+	if d.MinN > 0 {
+		s += fmt.Sprintf(" (≥%d)", d.MinN)
+	}
+	return s
+}
+
+func spreadFlag(s float64) string {
+	if s > 0.05 {
+		return "（**0.05 を超える: 開始点で結果が変わる**）"
+	}
+	return ""
+}
+
+func defaultI(v, d int) int {
+	if v <= 0 {
+		return d
+	}
+	return v
 }
 
 func ci(iv stats.Interval) string { return fmt.Sprintf("[%.2f, %.2f]", iv.Lo, iv.Hi) }
 
 func intervalCell(d stats.ParamDecision) string {
 	if d.OneSided {
-		return fmt.Sprintf("片側 90%% 上限 %.2f", d.Upper90)
+		return fmt.Sprintf("片側 95%% 上限 %.2f", d.Upper)
 	}
 	return ci(d.CI90)
-}
-
-// decisionReport writes the §3 decision table (normalized scale), the anchored descriptive table, the bootstrap
-// diagnostics and the two "extrapolated" rows (§12b). It returns the rows for the verdict and the LOJO table.
-func decisionReport(w io.Writer, in decisionInput) []paramRow {
-	rows, sHat, sBoot := decide(in)
-	fmt.Fprintln(w, "\n## パラメータの判断（決定文書 §2–§3、和で正規化した尺度）")
-	fmt.Fprintf(w, "\n判断の幅 m = ±%.2f。尺度は U = {%s} の 6 費用の和が現行表の和（%.2f）に一致するよう正規化した θ̃ = θ̂ / ŝ（辺の余分は 1/ŝ）。", in.M, uNames(in.U), sumU(in.Theta0, in.U))
-	fmt.Fprintf(w, " ŝ = %.3f", sHat)
-	if col := sortedClean(sBoot); len(col) > 0 {
-		fmt.Fprintf(w, "（90%% 区間 [%.3f, %.3f]）", stats.Quantile(col, 0.05), stats.Quantile(col, 0.95))
-	}
-	fmt.Fprintf(w, "。区間はクラスタブートストラップ %d 回のパーセンタイル（生成モデルで層化、元の議論を単位）。", len(in.Indep.Boot))
-	fmt.Fprint(w, "SD = (84% 点 − 16% 点)/2。規則: 90% 区間が [θ₀ − m, θ₀ + m] に入れば「維持」（TOST）、全体が外なら「変更」、推定に情報がなければ「推定不能」（n_p が下限未満、固定尺度の反復の IQR < 1e-6、境界率 > 50%）、それ以外は「未決」。境界率 10–50% は片側 90% 上限のみ。")
-	if in.Mixed != nil {
-		fmt.Fprint(w, "共主要の 2 つの当てはめ（作業独立・ランダム切片）のラベルが一致したときだけ判断が立つ。\n")
-	} else {
-		fmt.Fprint(w, "**注意: 作業独立の当てはめだけで判断している（ランダム切片の当てはめなし）。**\n")
-	}
-	head := "| パラメータ | θ₀ |"
-	sep := "| --- | --: |"
-	if in.Truth != nil {
-		head += " 真の値（正規化） |"
-		sep += " --: |"
-	}
-	head += " θ̃ 推定値 | SD | 90% 区間 | 95% 区間 | n_p | 境界率 | 判断"
-	sep += " --: | --: | --- | --- | --: | --: | ---"
-	if in.Mixed != nil {
-		head += " | θ̃（切片） | 90%（切片） | 判断（切片） | 判断（共通）"
-		sep += " | --: | --- | --- | ---"
-	}
-	fmt.Fprintln(w, "\n"+head+" |")
-	fmt.Fprintln(w, sep+" |")
-	th0 := fit.Theta0Extended(in.Theta0)
-	var truthN []float64
-	if in.Truth != nil {
-		v := append(slices.Clone(in.Truth[:]), 0)
-		if in.TrueNeg != nil {
-			v[ged.NumParams] = *in.TrueNeg
-		}
-		truthN, _ = fit.Normalize(v, in.U)
-	}
-	for _, r := range rows {
-		d := r.Indep
-		label := d.Label.JA()
-		if !r.Margin {
-			label = "—（区間のみ）"
-		}
-		line := fmt.Sprintf("| %s | %s |", r.Name, num(th0[r.Index]))
-		if truthN != nil {
-			line += fmt.Sprintf(" %.2f |", truthN[r.Index])
-		}
-		nCell := "—"
-		if d.N > 0 || d.MinN > 0 {
-			nCell = fmt.Sprintf("%d", d.N)
-			if d.MinN > 0 {
-				nCell += fmt.Sprintf(" (≥%d)", d.MinN)
-			}
-		}
-		line += fmt.Sprintf(" %.2f | %.3f | %s | %s | %s | %.0f%% | %s", d.Est, d.SD, intervalCell(d), ci(d.CI95), nCell, 100*d.BoundaryShare, label)
-		if r.Mixed != nil {
-			m := *r.Mixed
-			ml, cl := m.Label.JA(), r.Combined.JA()
-			if !r.Margin {
-				ml, cl = "—", "—"
-			}
-			line += fmt.Sprintf(" | %.2f | %s | %s | %s", m.Est, intervalCell(m), ml, cl)
-		}
-		fmt.Fprintln(w, line+" |")
-	}
-	// Extrapolated rows (§12b).
-	if len(in.Tie) > 0 {
-		fmt.Fprintln(w, "\n判断なしの行（決定文書 §12b）:")
-		fmt.Fprintln(w, "\n| 種別の組 | 扱い | 診断用の自由推定（正規化） | θ_type との差（95% 区間） | 実現可能な編集数 |")
-		fmt.Fprintln(w, "| --- | --- | --- | --- | --: |")
-		for p, master := range in.Tie {
-			name := ged.ParamNames[p]
-			diag, contrast, feas, countsOnly := "—", "—", "—", false
-			if in.DiagCA != nil {
-				var d stats.ParamDecision
-				var c stats.ContrastResult
-				switch p {
-				case ged.PTypeRACA:
-					d, c, feas, countsOnly = in.DiagCA.RACA, in.DiagCA.ContrastRACA, fmt.Sprint(in.DiagCA.FeasibleRACA), in.DiagCA.CountsOnlyRACA
-				case ged.PTypeCAMA:
-					d, c, feas, countsOnly = in.DiagCA.CAMA, in.DiagCA.ContrastCAMA, fmt.Sprint(in.DiagCA.FeasibleCAMA), in.DiagCA.CountsOnlyCAMA
-				}
-				if !countsOnly && d.Reps > 0 {
-					diag = fmt.Sprintf("%.2f %s", d.Est, ci(d.CI90))
-					contrast = fmt.Sprintf("%.2f %s", c.Est, ci(c.CI95))
-				} else if countsOnly {
-					diag = "件数のみ（実現不能率 > 60%）"
-				}
-			}
-			fmt.Fprintf(w, "| %s | **%s から外挿、較正なし** | %s | %s | %s |\n", name, ged.ParamNames[master], diag, contrast, feas)
-		}
-		fmt.Fprintln(w, "\n使途の 81 件の種別誤りのうち 14 件（17%）は CA を含み、仮定で値を置いている。診断セルは実現可能な（弱い関係の）付け替えだけなので、一般の符号反転の費用ではない。")
-	}
-	// Anchored descriptive table and bootstrap diagnostics.
-	fmt.Fprintln(w, "\n### 固定尺度（辺の余分 = 1）の推定値とブートストラップの診断")
-	fmt.Fprintln(w, "\n| パラメータ | 固定尺度の推定値 | ブートストラップの偏り（正規化） | 偏りの警告 | 境界率 | 発散率 | IQR |")
-	fmt.Fprintln(w, "| --- | --: | --: | --- | --: | --: | --: |")
-	for _, r := range rows {
-		d := r.Indep
-		flag := ""
-		if d.BiasFlag {
-			flag = "|偏り| > 0.5 SD"
-		}
-		fmt.Fprintf(w, "| %s | %.3f | %+.3f | %s | %.1f%% | %.1f%% | %.2e |\n", r.Name, r.Anchored, d.Bias, flag, 100*d.BoundaryShare, 100*d.DivergentShare, d.IQR)
-	}
-	sh := fit.Summarise(in.Indep.Meta)
-	fmt.Fprintf(w, "\n反復の内訳（作業独立）: 循環 %.1f%%、上限到達 %.1f%%、非収束 %.1f%%、コールドスタート %d 回。", 100*sh.Cycled, 100*sh.Capped, 100*sh.NotConverged, sh.Cold)
-	if in.Mixed != nil {
-		shm := fit.Summarise(in.Mixed.Meta)
-		fmt.Fprintf(w, " ランダム切片: 循環 %.1f%%、上限到達 %.1f%%、非収束 %.1f%%、σ̂ = %.3f。", 100*shm.Cycled, 100*shm.Capped, 100*shm.NotConverged, in.Mixed.Res.Params.Sigma)
-	}
-	fmt.Fprintln(w)
-	for _, r := range rows {
-		if r.Indep.DivergentShare > stats.DivergentReport {
-			fmt.Fprintf(w, "- %s: 発散した反復が %.1f%% > 2%%。発散を除いた区間: %s\n", r.Name, 100*r.Indep.DivergentShare, ci(intervalWithout(in, r.Index)))
-		}
-	}
-	if s := in.Indep.Res; len(s.Starts) > 0 {
-		fmt.Fprintf(w, "- 多点開始（%d 点）の最良の開始点からの最大のずれ: %.3f", len(s.Starts), s.StartSpread)
-		if s.StartSpread > 0.05 {
-			fmt.Fprint(w, "（**0.05 を超える: 開始点で結果が変わる**）")
-		}
-		fmt.Fprintln(w)
-		for _, st := range s.Starts {
-			fmt.Fprintf(w, "  - %s: 目的関数 %.2f（収束 %v、循環 %v）\n", st.Name, st.Objective, st.Converged, st.Cycled)
-		}
-	}
-	return rows
-}
-
-// intervalWithout recomputes the 90% interval of normalized index i without the divergent replicates.
-func intervalWithout(in decisionInput, i int) stats.Interval {
-	var rows [][]float64
-	for r, m := range in.Indep.Meta {
-		div := false
-		for p := range ged.NumParams {
-			div = div || m.Divergent[p]
-		}
-		if !div && r < len(in.Indep.Boot) {
-			rows = append(rows, in.Indep.Boot[r])
-		}
-	}
-	n, _ := fit.NormalizeRows(rows, in.U)
-	col := fit.Column(n, i)
-	return stats.Interval{Lo: stats.Quantile(col, 0.05), Hi: stats.Quantile(col, 0.95)}
 }
 
 func uNames(U []int) string {
@@ -346,466 +337,69 @@ func sortedClean(v []float64) []float64 {
 	return out
 }
 
-// paramTable keeps the first-version entry point: the §3 rule on the normalized scale with the independence fit only
-// (no information floor, no mixed fit). The pilot and the simulation call it; the final analysis uses decisionReport.
-func paramTable(w io.Writer, th0 ged.Theta, truth *ged.Theta, trueNeg *float64, est fit.Params, boot [][]float64, m float64) {
-	in := decisionInput{Theta0: th0, M: m, Indep: fitSummary{Name: "作業独立", Res: fit.Result{Params: est}, Boot: boot}, Truth: truth, TrueNeg: trueNeg}
-	decisionReport(w, in)
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Confirmatory hypotheses (§4) and verdict (§3)
-// ---------------------------------------------------------------------------------------------------------------
-
-// ruleContrast is a rule comparison for C1/C4: Δ of the two rules on every triplet.
-type ruleContrast struct {
-	ID, Name string
-	D0, D1   []float64 // D0 = R0; D1 = the comparator (R1 or B1)
-}
-
-// hypothesesInput gathers the inputs of the six confirmatory tests.
-type hypothesesInput struct {
-	M     float64
-	U     []int
-	Indep fitSummary
-	Mixed *fitSummary
-	// Trips/Js for the C1/C4 clustered McNemar; Contrasts lists C1 (R0 vs R1) and C4 (R0 vs B1).
-	Trips     []fit.Triplet
-	Js        []fit.Judgment
-	Contrasts []ruleContrast
-	Reps      int
-	Seed      uint64
-}
-
-type hypothesisResult struct {
-	ID, Name  string
-	Indep     stats.ContrastResult
-	Mixed     *stats.ContrastResult
-	Supported bool // under both fits when the mixed fit is present
-	PHolm     float64
-	Reject    bool
-}
-
-// contrastBoot computes a contrast f on the estimate and on every normalized replicate.
-func contrastBoot(s fitSummary, U []int, f func(v []float64) float64) (float64, []float64) {
-	est, _ := fit.NormalizeParams(s.Res.Params, U)
-	rows, _ := fit.NormalizeRows(s.Boot, U)
-	var b []float64
-	for _, r := range rows {
-		if r != nil {
-			b = append(b, f(r))
-		}
-	}
-	return f(est), b
-}
-
-// hypothesesTable runs H1, H2, H4a, H4b, C1, C4 with their stated null values, Holm over the six, and writes the table.
-func hypothesesTable(w io.Writer, in hypothesesInput) []hypothesisResult {
-	type spec struct {
-		id, name string
-		f        func(v []float64) float64
-		null     float64
-		side     stats.Side
-	}
-	specs := []spec{
-		{"H1", "θ̃_type − (θ̃_辺の欠落 + θ̃_辺の余分) < 0", func(v []float64) float64 { return v[ged.PTypeRAMA] - (v[ged.PEdgeMissing] + v[fit.NormEdgeExtra]) }, 0, stats.Less},
-		{"H2", "θ̃_向き − θ̃_辺の欠落 ≥ −m（非劣性）", func(v []float64) float64 { return v[ged.PDirection] - v[ged.PEdgeMissing] }, -in.M, stats.Greater},
-		{"H4a", "θ̃_I欠落 − θ̃_I余分 ≠ 0", func(v []float64) float64 { return v[ged.PNodeMissing] - v[ged.PNodeExtra] }, 0, stats.TwoSided},
-		{"H4b", "θ̃_辺の欠落 − θ̃_辺の余分 ≠ 0", func(v []float64) float64 { return v[ged.PEdgeMissing] - v[fit.NormEdgeExtra] }, 0, stats.TwoSided},
-	}
-	var res []hypothesisResult
-	for _, s := range specs {
-		est, b := contrastBoot(in.Indep, in.U, s.f)
-		h := hypothesisResult{ID: s.id, Name: s.name, Indep: stats.BootstrapContrast(est, b, s.null, s.side)}
-		h.Supported = h.Indep.Supported
-		if in.Mixed != nil {
-			estM, bM := contrastBoot(*in.Mixed, in.U, s.f)
-			m := stats.BootstrapContrast(estM, bM, s.null, s.side)
-			h.Mixed = &m
-			h.Supported = h.Supported && m.Supported
-		}
-		res = append(res, h)
-	}
-	nonNeg := make([]bool, len(in.Trips))
-	cluster := make([]int, len(in.Trips))
-	strata := make([]string, len(in.Trips))
-	for i, t := range in.Trips {
-		nonNeg[i], cluster[i], strata[i] = t.NegDiff == 0, t.Source, t.Generator
-	}
-	for _, c := range in.Contrasts {
-		r0, elig := fit.Correct(c.D0, in.Js, nonNeg)
-		r1, _ := fit.Correct(c.D1, in.Js, nonNeg)
-		cr := stats.ClusteredMcNemar(r0, r1, elig, cluster, strata, in.Reps, in.Seed)
-		b, cc := stats.DiscordantCounts(r0, r1, elig)
-		h := hypothesisResult{ID: c.ID, Name: fmt.Sprintf("agree(R0) − agree(%s) > 0（不一致 %d / %d、正確 McNemar 片側 p = %.3f）", c.Name, b, cc, stats.McNemarExact(b, cc, true)), Indep: cr, Supported: cr.Supported}
-		res = append(res, h)
-	}
-	ps := make([]float64, len(res))
-	for i, h := range res {
-		ps[i] = h.Indep.P
-		if h.Mixed != nil {
-			ps[i] = math.Max(ps[i], h.Mixed.P)
-		}
-		if math.IsNaN(ps[i]) {
-			ps[i] = 1
-		}
-	}
-	adj, rej := stats.Holm(ps, 0.05)
-	for i := range res {
-		res[i].PHolm, res[i].Reject = adj[i], rej[i]
-	}
-	fmt.Fprintln(w, "\n## 確認的仮説（決定文書 §4、正規化した尺度、ブートストラップ対比）")
-	fmt.Fprintf(w, "\n帰無値を検定ごとに明示。片側 p は帰無値の反対側にある反復の割合、両側は 2 倍。族（6 検定）は Holm で α = 0.05。H1・H2 は判定には無調整の α で入る（交差–和集合検定）。H3 は計画 v4 からの逸脱として取り下げ（RA↔CA は内容を変えずに実現できない）。B = %d。\n", len(in.Indep.Boot))
-	fmt.Fprintln(w, "\n| ID | 対比 | 帰無値 | 推定値 | 95% 区間 | p | p（Holm） | 支持 |")
-	fmt.Fprintln(w, "| --- | --- | --: | --: | --- | --: | --: | --- |")
-	for _, h := range res {
-		sup := "いいえ"
-		if h.Supported {
-			sup = "はい"
-		}
-		cell := fmt.Sprintf("%.3f", h.Indep.Est)
-		ciCell := ci(h.Indep.CI95)
-		if h.Mixed != nil {
-			cell += fmt.Sprintf(" / %.3f", h.Mixed.Est)
-			ciCell += " / " + ci(h.Mixed.CI95)
-		}
-		fmt.Fprintf(w, "| %s | %s | %.2f | %s | %s | %.3f | %.3f | %s |\n", h.ID, h.Name, h.Indep.Null, cell, ciCell, h.Indep.P, h.PHolm, sup)
-	}
-	if in.Mixed != nil {
-		fmt.Fprintln(w, "\n推定値と区間は「作業独立 / ランダム切片」。「支持」は両方の当てはめで支持されたときだけ「はい」。")
-	}
-	fmt.Fprintln(w, "\nH4 は非対称性の主張であり表の妥当性の主張ではない: 「H4b 支持」と「辺の欠落: 維持」は両立しうる。")
-	return res
-}
-
-// verdictReport writes the verdict of §3.
-func verdictReport(w io.Writer, rows []paramRow, hyps []hypothesisResult, d *fit.DResult) stats.VerdictLabel {
-	var labels []stats.Label
-	var names []string
-	for _, r := range rows {
-		if r.Margin {
-			labels = append(labels, r.Combined)
-			names = append(names, r.Name)
-		}
-	}
-	in := stats.VerdictInput{Labels: labels, Names: names, DLower95: math.NaN(), DUpper95: math.NaN()}
-	for _, h := range hyps {
-		switch h.ID {
-		case "H1":
-			in.H1 = h.Supported
-		case "H2":
-			in.H2 = h.Supported
-		}
-	}
-	if d != nil && len(d.AgreeBoot) > 0 {
-		col := sortedClean(d.AgreeBoot)
-		in.DLower95, in.DUpper95 = stats.Quantile(col, 0.025), stats.Quantile(col, 0.975)
-	}
-	v, missing := stats.Verdict(in)
-	fmt.Fprintln(w, "\n## 現行表の判定（決定文書 §3）")
-	fmt.Fprintf(w, "\n**%s（%s）**\n", v.JA(), v)
-	if d != nil {
-		fmt.Fprintf(w, "\n- D = agree(R2, OOF) − agree(R0) = %.2f pt、95%% 区間 [%.2f, %.2f]（元の議論のネストしたブートストラップ %d 回、各反復で 5 分割 CV を再学習）。妥当の条件は上限 < 2 pt。対数損失の形: %.4f nats/判定（正なら R2 が良い）。\n", d.Agree, in.DLower95, in.DUpper95, len(d.AgreeBoot), d.LogLoss)
-		if len(d.Strata) > 0 {
-			fmt.Fprintln(w, "\n| 層 | D（pt） | 95% 区間 |")
-			fmt.Fprintln(w, "| --- | --: | --- |")
-			keys := make([]string, 0, len(d.Strata))
-			for k := range d.Strata {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				col := sortedClean(d.StrataBoot[k])
-				fmt.Fprintf(w, "| %s | %.2f | [%.2f, %.2f] |\n", k, d.Strata[k], stats.Quantile(col, 0.025), stats.Quantile(col, 0.975))
-			}
-		}
-	}
-	if len(missing) > 0 {
-		fmt.Fprintln(w, "\n欠けている要素:")
-		for _, m := range missing {
-			fmt.Fprintf(w, "- %s\n", m)
-		}
-	}
-	fmt.Fprintln(w, "\n「否定されず」は現行表を続ける許可ではない: データが決めなかったという意味。")
-	return v
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Leave-one-judge-out (§9)
-// ---------------------------------------------------------------------------------------------------------------
-
-// leaveOneJudgeOut refits (and bootstraps) with each judge removed and returns the decision rows per dropped judge.
-func leaveOneJudgeOut(trips []fit.Triplet, js []fit.Judgment, opts fit.Options, bo fit.BootOptions, in decisionInput) ([][]paramRow, error) {
-	var out [][]paramRow
-	for j := range opts.Judges {
-		o := opts
-		o.Judges--
-		if o.Judges == 0 {
-			return nil, fmt.Errorf("leave-one-judge-out needs at least 2 judges")
-		}
-		dj := fit.DropJudge(js, j)
-		res, err := fit.FitMulti(trips, dj, o, nil)
-		if err != nil {
-			return nil, err
-		}
-		b := bo
-		var mixedRes fit.Result
-		if in.Mixed != nil {
-			mixedRes, err = fit.FitMixed(trips, dj, o, nil)
-			if err != nil {
-				return nil, err
-			}
-			b.Mixed, b.MixedInit = true, &mixedRes.Params
-		}
-		br, err := fit.BootstrapOpts(trips, dj, o, res.Params, b)
-		if err != nil {
-			return nil, err
-		}
-		sub := in
-		sub.Indep = fitSummary{Name: in.Indep.Name, Res: res, Boot: br.Theta, Meta: br.Meta}
-		if in.Mixed != nil {
-			sub.Mixed = &fitSummary{Name: in.Mixed.Name, Res: mixedRes, Boot: br.MixedTheta, Meta: br.MixedMeta}
-		}
-		rows, _, _ := decide(sub)
-		out = append(out, rows)
-	}
-	return out, nil
-}
-
-// lojoTable writes the leave-one-judge-out decision table and flags labels that change.
-func lojoTable(w io.Writer, names []string, full []paramRow, dropped [][]paramRow) {
-	fmt.Fprintln(w, "\n## 判定者を 1 人ずつ除いた判断（決定文書 §9）")
-	head := "| パラメータ | 全員 |"
-	sep := "| --- | --- |"
-	for _, n := range names {
-		head += fmt.Sprintf(" %s を除く |", n)
-		sep += " --- |"
-	}
-	fmt.Fprintln(w, "\n"+head)
-	fmt.Fprintln(w, sep)
-	changed := 0
-	for i, r := range full {
-		if !r.Margin {
-			continue
-		}
-		line := fmt.Sprintf("| %s | %s |", r.Name, r.Combined.JA())
-		for _, d := range dropped {
-			if i >= len(d) {
-				line += " — |"
-				continue
-			}
-			cell := d[i].Combined.JA()
-			if d[i].Combined != r.Combined {
-				cell = "**" + cell + "**"
-				changed++
-			}
-			line += fmt.Sprintf(" %s（%.2f） |", cell, d[i].Indep.Est)
-		}
-		fmt.Fprintln(w, line)
-	}
-	fmt.Fprintf(w, "\n太字 = 全員での判断と異なる（%d 箇所）。\n", changed)
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Judge QC (§9, §9.1, §16 #10)
-// ---------------------------------------------------------------------------------------------------------------
-
-// judgeQCInput is the material for the mechanical judge QC, evaluated before θ is fitted.
-type judgeQCInput struct {
-	Names []string
-	Trips []fit.Triplet
-	Js    []fit.Judgment
-	// GateDelta is the Δ(θ₀) floor of the gate stratum (0 → 2); RMax, Conf the gate (0 → 0.20, 0.90).
-	GateDelta, RMax, Conf float64
-}
-
-// judgeQC writes the T1 reversal gate, the reversal rate by Δ(θ₀) stratum, order consistency, tie share and
-// Krippendorff's α per judge pair, and returns the gate results.
-func judgeQC(w io.Writer, in judgeQCInput) []stats.GateResult {
-	gd := in.GateDelta
-	if gd <= 0 {
-		gd = 2
-	}
-	J := len(in.Names)
-	isT1 := func(t fit.Triplet) bool { return t.Type == "T1" || t.HasFlag("t1_gate") }
-	stratumOf := func(d float64) string {
-		switch {
-		case d <= 0:
-			return "≤ 0（除外）"
-		case d < 0.5:
-			return "(0, 0.5)"
-		case d < 1:
-			return "[0.5, 1)"
-		case d < 2:
-			return "[1, 2)"
-		}
-		return "≥ 2（ゲート）"
-	}
-	type cnt struct{ rev, tie, n int }
-	gate := make([]cnt, J)
-	byStratum := make([]map[string]*cnt, J)
-	tieAll := make([]cnt, J)
-	nT := 0
-	seenGate := map[int]bool{}
-	pairs := make([]map[int][2]int, J)
-	for j := range J {
-		byStratum[j] = map[string]*cnt{}
-		pairs[j] = map[int][2]int{}
-	}
-	for _, k := range in.Js {
-		if k.Judge >= J {
-			continue
-		}
-		t := in.Trips[k.Triplet]
-		c := &tieAll[k.Judge]
-		c.n++
-		if k.Answer == fit.AnswerTie {
-			c.tie++
-		}
-		p := pairs[k.Judge][k.Triplet]
-		if k.Order > 0 {
-			p[0] = int(k.Answer) + 1
-		} else {
-			p[1] = int(k.Answer) + 1
-		}
-		pairs[k.Judge][k.Triplet] = p
-		if !isT1(t) {
-			continue
-		}
-		s := stratumOf(t.T1Delta0)
-		sc := byStratum[k.Judge][s]
-		if sc == nil {
-			sc = &cnt{}
-			byStratum[k.Judge][s] = sc
-		}
-		sc.n++
-		if k.Answer == fit.AnswerB {
-			sc.rev++
-		}
-		if k.Answer == fit.AnswerTie {
-			sc.tie++
-		}
-		if t.T1Delta0 >= gd {
-			g := &gate[k.Judge]
-			g.n++
-			if k.Answer == fit.AnswerB {
-				g.rev++
-			}
-			if k.Answer == fit.AnswerTie {
-				g.tie++
-			}
-			if !seenGate[k.Triplet] {
-				seenGate[k.Triplet] = true
-				nT++
-			}
-		}
-	}
+// writeJudgeQC formats the mechanical judge QC of fit.JudgeQCStats.
+func writeJudgeQC(w io.Writer, q fit.JudgeQCResult, co fit.ConfirmOptions) {
 	fmt.Fprintln(w, "\n## 判定者の品質管理（決定文書 §9・§9.1、θ の当てはめ前に機械的に評価）")
-	fmt.Fprintf(w, "\nT1 反転率 r_j = 「上位集合 B が近い」と答えた判定 / ゲート三つ組（Δ(θ₀) ≥ %.1f、n_T = %d）での判定。「同程度」は分母のみ。二項の参照は k_eff = r_j·n_T、n_eff = n_T（設計効果 2）。片側 90%% Clopper–Pearson 上限が r_max = %.2f を超えると不合格。\n", gd, nT, defaultF(in.RMax, stats.GateRMax))
-	fmt.Fprintln(w, "\n| 判定者 | 判定数 | 同程度の割合 | 提示順の一致 | ゲート判定数 | 反転 | r_j | 上限（90%） | ゲート |")
-	fmt.Fprintln(w, "| --- | --: | --: | --: | --: | --: | --: | --: | --- |")
-	var out []stats.GateResult
-	for j, name := range in.Names {
-		g := stats.ReversalGate(gate[j].rev, gate[j].tie, gate[j].n, nT, in.RMax, in.Conf)
-		out = append(out, g)
-		var pp [][2]int
-		for _, p := range pairs[j] {
-			if p[0] > 0 && p[1] > 0 {
-				pp = append(pp, p)
-			}
+	fmt.Fprintf(w, "\nT1 反転率 r_j = 「上位集合 B が近い」と答えた判定 / ゲート三つ組（Δ(θ₀) ≥ %.1f、n_T = %d、Δ(θ₀) ≤ 0 で除外 %d）での判定。「同程度」は分母のみ。二項の参照は k_eff = r_j·n_T、n_eff = n_T。片側 %.0f%% Clopper–Pearson 上限が r_max = %.2f を超えると不合格。機械的な基準: ゲート、同程度の割合 ≤ %.0f%%、他の各判定者との Krippendorff α ≥ %.1f（評価不能は数えない）。提示順の一致は記述のみ（§9 改訂: 参照判定者の値が 0.50–0.60 で、80%% の基準は想定する判定者をすべて除外する）。\n",
+		co.GateDelta, q.NT, q.GateExcluded, 100*co.GateConf, co.RMax, 100*q.MaxTieShare, q.MinAlpha)
+	fmt.Fprintln(w, "\n| 判定者 | 判定数 | 同程度の割合 | 提示順の一致（全体） | 提示順の一致（ゲート層） | ゲート判定数 | 反転 | r_j | 上限 | 除外？（理由） |")
+	fmt.Fprintln(w, "| --- | --: | --: | --: | --: | --: | --: | --: | --: | --- |")
+	for j, name := range q.Names {
+		g := q.Gates[j]
+		verdict := "いいえ"
+		if q.Excluded[j] {
+			verdict = "**はい**（" + q.Reasons[j] + "）"
 		}
-		oc, on := stats.OrderConsistency(pp)
-		verdict := "合格"
-		if g.Fail {
-			verdict = "**不合格**"
-		}
-		if gate[j].n == 0 {
-			verdict = "—（ゲート三つ組なし）"
-		}
-		fmt.Fprintf(w, "| %s | %d | %.1f%% | %s | %d | %d | %s | %s | %s |\n", name, tieAll[j].n, pct(tieAll[j].tie, tieAll[j].n), ratioF(oc, on), gate[j].n, gate[j].rev, num(g.R), num(g.Upper), verdict)
+		fmt.Fprintf(w, "| %s | %d | %.1f%% | %s | %s | %d | %d | %s | %s | %s |\n", name, q.Judgments[j], 100*q.TieShare[j],
+			ratioF(q.OrderConsistency[j], int(q.OrderN[j])), ratioF(q.GateOrderConsistency[j], int(q.GateOrderN[j])), g.Judgments, g.Reversals, num(g.R), num(g.Upper), verdict)
 	}
-	// By Δ stratum (descriptive).
-	strata := map[string]bool{}
-	for j := range J {
-		for s := range byStratum[j] {
-			strata[s] = true
-		}
-	}
-	if len(strata) > 0 {
-		keys := make([]string, 0, len(strata))
-		for s := range strata {
-			keys = append(keys, s)
-		}
-		sort.Strings(keys)
+	if len(q.Strata) > 0 {
 		fmt.Fprintln(w, "\n反転率の Δ(θ₀) 層別（記述）:")
 		head := "| 判定者 |"
 		sep := "| --- |"
-		for _, s := range keys {
+		for _, s := range q.Strata {
 			head += " " + s + " |"
 			sep += " --- |"
 		}
 		fmt.Fprintln(w, "\n"+head)
 		fmt.Fprintln(w, sep)
-		for j, name := range in.Names {
+		for j, name := range q.Names {
 			line := "| " + name + " |"
-			for _, s := range keys {
-				c := byStratum[j][s]
-				if c == nil || c.n == 0 {
+			for _, s := range q.Strata {
+				c := q.ByStratum[j][s]
+				if c.Judgments == 0 {
 					line += " — |"
 				} else {
-					line += fmt.Sprintf(" %.1f%%（%d/%d） |", pct(c.rev, c.n), c.rev, c.n)
+					line += fmt.Sprintf(" %.1f%%（%d/%d） |", pct(c.Reversals, c.Judgments), c.Reversals, c.Judgments)
 				}
 			}
 			fmt.Fprintln(w, line)
 		}
 	}
-	// Krippendorff's α per pair (units = triplet × order).
-	if J >= 2 {
-		fmt.Fprintln(w, "\nKrippendorff の α（名義、単位 = 三つ組 × 提示順）、基準 ≥ 0.4:")
-		fmt.Fprintln(w, "\n| 判定者 | "+strings.Join(in.Names, " | ")+" |")
-		fmt.Fprintln(w, "| --- |"+strings.Repeat(" --: |", J))
-		for a := range J {
-			line := "| " + in.Names[a] + " |"
-			for b := range J {
+	if len(q.Names) >= 2 {
+		fmt.Fprintln(w, "\nKrippendorff の α（名義、単位 = 三つ組 × 提示順）:")
+		fmt.Fprintln(w, "\n| 判定者 | "+strings.Join(q.Names, " | ")+" |")
+		fmt.Fprintln(w, "| --- |"+strings.Repeat(" --: |", len(q.Names)))
+		for a := range q.Names {
+			line := "| " + q.Names[a] + " |"
+			for b := range q.Names {
 				if a == b {
 					line += " — |"
-					continue
+				} else {
+					line += fmt.Sprintf(" %s |", num3(q.Alpha[a][b]))
 				}
-				line += fmt.Sprintf(" %.3f |", pairAlpha(in.Js, len(in.Trips), a, b))
 			}
 			fmt.Fprintln(w, line)
 		}
 	}
 	fmt.Fprintln(w, "\n編集種別ごとの反転率は三つ組の記録（dataset-spec §6）から別途集計する（fit.Triplet は編集種別を持たない）。")
-	return out
 }
 
-// pairAlpha is Krippendorff's α between judges a and b over (triplet, order) units.
-func pairAlpha(js []fit.Judgment, nTrips int, a, b int) float64 {
-	vals := make([][]int, 2*nTrips)
-	for i := range vals {
-		vals[i] = []int{-1, -1}
+func num3(v float64) string {
+	if math.IsNaN(v) {
+		return "評価不能"
 	}
-	for _, k := range js {
-		u := 2 * k.Triplet
-		if k.Order < 0 {
-			u++
-		}
-		switch k.Judge {
-		case a:
-			vals[u][0] = int(k.Answer)
-		case b:
-			vals[u][1] = int(k.Answer)
-		}
-	}
-	return stats.KrippendorffAlpha(vals)
-}
-
-func defaultF(v, d float64) float64 {
-	if v <= 0 {
-		return d
-	}
-	return v
+	return fmt.Sprintf("%.3f", v)
 }
 
 func ratioF(v float64, n int) string {
@@ -815,18 +409,77 @@ func ratioF(v float64, n int) string {
 	return fmt.Sprintf("%.1f%%（n=%d）", 100*v, n)
 }
 
-// judgeDiagnostics keeps the first-version entry point (pilot and simulation): the T1 column is now the reversal rate
-// with the §9.1 gate on all T1 triplets with a known correct side (the simulation has no Δ(θ₀) strata), and the
-// accuracy statistic is retired (§16 #10).
+// ---------------------------------------------------------------------------------------------------------------
+// Reference tables (not the §3 rule): kept for the simulation and the pilot
+// ---------------------------------------------------------------------------------------------------------------
+
+// paramTable prints the anchored and normalized estimates with percentile intervals and no decision labels.
+// It is NOT the §3 rule: the information floor, the boundary rule, the replicate floor and the model agreement
+// are applied only by fit.Confirmatory / WriteConfirmatory.
+func paramTable(w io.Writer, th0 ged.Theta, truth *ged.Theta, trueNeg *float64, est fit.Params, boot [][]float64, m float64) {
+	fmt.Fprintln(w, "\n## パラメータの推定（参考: 区間のみ。§3 の判断は `fit.Confirmatory` の報告だけが出す）")
+	fmt.Fprintf(w, "\n判断の幅 m = ±%.2f は参考として帯を示すだけ。区間はクラスタブートストラップ %d 回のパーセンタイル、SD = (84%% 点 − 16%% 点)/2。正規化は U = {%s}。\n", m, len(boot), uNames(nil))
+	estN, sHat := fit.NormalizeParams(est, nil)
+	bootN, _ := fit.NormalizeRows(boot, nil)
+	th0x := fit.Theta0Extended(th0)
+	var truthN []float64
+	if truth != nil {
+		v := append(slices.Clone(truth[:]), 0)
+		if trueNeg != nil {
+			v[ged.NumParams] = *trueNeg
+		}
+		truthN, _ = fit.Normalize(v, nil)
+	}
+	fmt.Fprintf(w, "\nŝ = %.3f\n", sHat)
+	head := "| パラメータ | θ₀ |"
+	sep := "| --- | --: |"
+	if truth != nil {
+		head += " 真の値（正規化） |"
+		sep += " --: |"
+	}
+	fmt.Fprintln(w, "\n"+head+" 固定尺度 θ̂ | θ̃ | SD | 90% 区間 | 95% 区間 | 帯 [θ₀−m, θ₀+m] に入るか（参考） |")
+	fmt.Fprintln(w, sep+" --: | --: | --: | --- | --- | --- |")
+	for i := range fit.NormLen {
+		col := fit.Column(bootN, i)
+		anchored := math.NaN()
+		switch {
+		case i < ged.NumParams:
+			anchored = est.Theta[i]
+		case i == fit.NormEdgeExtra:
+			anchored = ged.EdgeExtraCost
+		default:
+			anchored = est.ThetaNeg
+		}
+		lo90, hi90 := stats.Quantile(col, 0.05), stats.Quantile(col, 0.95)
+		lo95, hi95 := stats.Quantile(col, 0.025), stats.Quantile(col, 0.975)
+		sd := (stats.Quantile(col, 0.8413) - stats.Quantile(col, 0.1587)) / 2
+		band := "—"
+		if slices.Contains(fit.MarginJudged, i) && len(col) > 0 {
+			if lo90 >= th0x[i]-m && hi90 <= th0x[i]+m {
+				band = "入る（参考）"
+			} else {
+				band = "入らない（参考）"
+			}
+		}
+		line := fmt.Sprintf("| %s | %s |", fit.NormName(i), num(th0x[i]))
+		if truthN != nil {
+			line += fmt.Sprintf(" %.2f |", truthN[i])
+		}
+		fmt.Fprintf(w, "%s %.3f | %.2f | %.3f | [%.2f, %.2f] | [%.2f, %.2f] | %s |\n", line, anchored, estN[i], sd, lo90, hi90, lo95, hi95, band)
+	}
+}
+
+// judgeDiagnostics keeps the first-version entry point (pilot and simulation). The T1 column is the reversal rate
+// over all T1 triplets with a known correct side (all Δ strata), which is NOT the §9.1 gate statistic; the gate is
+// computed by fit.JudgeQCStats on the Δ(θ₀) ≥ 2 stratum.
 func judgeDiagnostics(w io.Writer, names []string, types []perturb.TripletType, trueSign []int, js []fit.Judgment) {
-	fmt.Fprintln(w, "\n## 判定者の診断（決定文書 §9.1）")
-	fmt.Fprintln(w, "\n| 判定者 | 判定数 | 同程度の割合 | 提示順を入れ替えても同じ | T1 反転率 | 上限（90%） | ゲート（r_max 0.20） |")
-	fmt.Fprintln(w, "| --- | --: | --: | --: | --: | --: | --- |")
+	fmt.Fprintln(w, "\n## 判定者の診断（参考）")
+	fmt.Fprintln(w, "\n| 判定者 | 判定数 | 同程度の割合 | 提示順を入れ替えても同じ | T1 反転率（全層、ゲートではない） |")
+	fmt.Fprintln(w, "| --- | --: | --: | --: | --: |")
 	for j, name := range names {
 		var n, tie int
 		byT := map[int][]fit.Answer{}
-		t1n, t1rev, t1tie := 0, 0, 0
-		t1Trips := map[int]bool{}
+		t1n, t1rev := 0, 0
 		for _, k := range js {
 			if k.Judge != j {
 				continue
@@ -838,16 +491,12 @@ func judgeDiagnostics(w io.Writer, names []string, types []perturb.TripletType, 
 			byT[k.Triplet] = append(byT[k.Triplet], k.Answer)
 			if types[k.Triplet] == perturb.T1Monotone && trueSign[k.Triplet] != 0 {
 				t1n++
-				t1Trips[k.Triplet] = true
 				wrong := fit.AnswerB
 				if trueSign[k.Triplet] < 0 {
 					wrong = fit.AnswerA
 				}
-				switch k.Answer {
-				case wrong:
+				if k.Answer == wrong {
 					t1rev++
-				case fit.AnswerTie:
-					t1tie++
 				}
 			}
 		}
@@ -860,15 +509,7 @@ func judgeDiagnostics(w io.Writer, names []string, types []perturb.TripletType, 
 				}
 			}
 		}
-		g := stats.ReversalGate(t1rev, t1tie, t1n, len(t1Trips), 0, 0)
-		gate := "—"
-		if t1n > 0 {
-			gate = "合格"
-			if g.Fail {
-				gate = "**不合格**"
-			}
-		}
-		fmt.Fprintf(w, "| %s | %d | %.1f%% | %s | %s | %s | %s |\n", name, n, pct(tie, n), ratio(same, pairs), ratio(t1rev, t1n), num(g.Upper), gate)
+		fmt.Fprintf(w, "| %s | %d | %.1f%% | %s | %s |\n", name, n, pct(tie, n), ratio(same, pairs), ratio(t1rev, t1n))
 	}
 }
 
@@ -892,10 +533,6 @@ func num(v float64) string {
 	}
 	return fmt.Sprintf("%.2f", v)
 }
-
-// ---------------------------------------------------------------------------------------------------------------
-// Auxiliary parameters, agreement, ceiling
-// ---------------------------------------------------------------------------------------------------------------
 
 // auxTable is the per-judge auxiliary parameters.
 func auxTable(w io.Writer, names []string, est fit.Params, truth []judgeTruth) {
@@ -924,7 +561,7 @@ type judgeTruth struct{ beta, tau, pi float64 }
 // agreementTable is the agreement rate per rule (plan §7.3).
 func agreementTable(w io.Writer, rows []agreeRow, js []fit.Judgment, negMask []bool) {
 	fmt.Fprintln(w, "\n## 規則ごとの一致率（計画 §7.3）")
-	fmt.Fprintln(w, "\nΔ の符号が判定の多数（A / B）と一致する割合。多数が「同程度」の三つ組は除く。")
+	fmt.Fprintln(w, "\nΔ の符号が判定の多数（A / B、同数は除外）と一致する割合。多数が「同程度」の三つ組は除く。Δ = 0 は ½ 点。")
 	fmt.Fprintln(w, "\n| 規則 | 全体 | 極性反転なし | 極性反転あり |")
 	fmt.Fprintln(w, "| --- | --- | --- | --- |")
 	noNeg := make([]bool, len(negMask))
@@ -983,7 +620,8 @@ type p2Input struct {
 	Names []string
 	Trips []fit.Triplet
 	Js    []fit.Judgment
-	// Aux is the auxiliary fit at θ₀ (FixTheta) and Mixed its random-intercept counterpart (σ̂).
+	// Aux is the auxiliary fit at θ₀ (FixTheta, working independence); Mixed its random-intercept counterpart
+	// (β_j, τ_j, π_j, σ̂), which the simulated gate pass probabilities use (review-fit-impl M5).
 	Aux   fit.Params
 	Mixed *fit.Params
 	// Tie is the type tie used to count informative triplets; MinInf the §15.3 floor.
@@ -995,6 +633,8 @@ type p2Input struct {
 	StabilityHalfWidth float64
 	// GateTriplets is n_T assumed for the simulated pass probabilities (0 → 100).
 	GateTriplets int
+	// QC options (zero → defaults).
+	QC fit.QCOptions
 }
 
 // writeP2Report prints aux parameters, σ̂, φ coverage, QC, simulated T1 pass probabilities, discard rates,
@@ -1003,9 +643,8 @@ func writeP2Report(w io.Writer, in p2Input) error {
 	fmt.Fprintln(w, "\n# P2 報告（θ の推定なし、決定文書 §13 項目 2）")
 	auxTable(w, in.Names, in.Aux, nil)
 	if in.Mixed != nil {
-		fmt.Fprintf(w, "\nランダム切片の当てはめ（θ = θ₀ 固定）: σ̂ = %.3f、β = %s\n", in.Mixed.Sigma, fmtSlice(in.Mixed.Beta))
+		fmt.Fprintf(w, "\nランダム切片の当てはめ（θ = θ₀ 固定）: σ̂ = %.3f、β = %s、τ = %s、π = %s\n", in.Mixed.Sigma, fmtSlice(in.Mixed.Beta), fmtSlice(in.Mixed.Tau), fmtSlice(in.Mixed.Pi))
 	}
-	// φ coverage per parameter.
 	nInf, err := fit.Informative(in.Trips, ged.Current(), in.Tie)
 	if err != nil {
 		return err
@@ -1018,11 +657,7 @@ func writeP2Report(w io.Writer, in p2Input) error {
 			continue
 		}
 		scaled := float64(nInf[p]) * 3000 / math.Max(1, float64(len(in.Trips)))
-		minCell := "—"
-		if m, ok := in.MinInf[p]; ok {
-			minCell = fmt.Sprint(m)
-		}
-		fmt.Fprintf(w, "| %s | %d | %.0f | %s |\n", fit.NormName(p), nInf[p], scaled, minCell)
+		fmt.Fprintf(w, "| %s | %d | %.0f | %s |\n", fit.NormName(p), nInf[p], scaled, minCell(in.MinInf, p))
 	}
 	negN := 0
 	for _, t := range in.Trips {
@@ -1030,8 +665,7 @@ func writeP2Report(w io.Writer, in p2Input) error {
 			negN++
 		}
 	}
-	fmt.Fprintf(w, "| θ_neg | %d | %.0f | %d |\n", negN, float64(negN)*3000/math.Max(1, float64(len(in.Trips))), in.MinInf[fit.NormNeg])
-	// cos intervals of the substitution function.
+	fmt.Fprintf(w, "| θ_neg | %d | %.0f | %s |\n", negN, float64(negN)*3000/math.Max(1, float64(len(in.Trips))), minCell(in.MinInf, fit.NormNeg))
 	dp, err := fit.DeltaPhi(in.Trips, ged.Current())
 	if err != nil {
 		return err
@@ -1045,27 +679,38 @@ func writeP2Report(w io.Writer, in p2Input) error {
 		}
 	}
 	fmt.Fprintf(w, "\n置換関数の節点ごとの情報（Δφ ≠ 0 の三つ組）: cos0.9 %d、cos0.7 %d、cos0.5 %d、cos0.3 %d（§15.3 は各区間 600 置換）。\n", knot[0], knot[1], knot[2], knot[3])
-	// QC.
-	gates := judgeQC(w, judgeQCInput{Names: in.Names, Trips: in.Trips, Js: in.Js})
-	_ = gates
-	// Simulated T1 pass probabilities from the fitted aux parameters.
+	qc := fit.JudgeQCStats(in.Trips, in.Js, in.Names, in.QC)
+	writeJudgeQC(w, qc, fit.ConfirmOptions{GateDelta: defaultF(in.QC.GateDelta, 2), RMax: defaultF(in.QC.RMax, stats.GateRMax), GateConf: defaultF(in.QC.Conf, stats.GateConf)})
+	// Simulated pass probabilities from the random-intercept fit over the realized gate Δ(θ₀) (M5).
 	nT := in.GateTriplets
 	if nT <= 0 {
 		nT = 100
 	}
-	sigma := 0.0
-	if in.Mixed != nil {
-		sigma = in.Mixed.Sigma
+	var deltas []float64
+	gd := defaultF(in.QC.GateDelta, 2)
+	for _, t := range in.Trips {
+		if (t.Type == "T1" || t.HasFlag("t1_gate")) && t.T1Delta0 >= gd {
+			deltas = append(deltas, t.T1Delta0)
+		}
 	}
-	fmt.Fprintln(w, "\n## §9.1 のゲートの合格確率（当てはめた補助パラメータからの模擬）")
-	fmt.Fprintf(w, "\nΔ(θ₀) = 2（層の下端、保守的）で z = β_j·2 + π_j·o + u、u ~ N(0, σ̂²)、σ̂ = %.2f。無作為回答率は推定していない（反転率に +lapse/3 が乗る）。n_T = %d。\n", sigma, nT)
-	fmt.Fprintln(w, "\n| 判定者 | 模擬の反転率 | 合格確率 |")
-	fmt.Fprintln(w, "| --- | --: | --: |")
-	for j, name := range in.Names {
-		r := simulatedReversal(in.Aux.Beta[j], in.Aux.Tau[j], in.Aux.Pi[j], sigma, 2)
-		fmt.Fprintf(w, "| %s | %.3f | %.3f |\n", name, r, stats.GatePassProbability(r, nT, 0, 0))
+	gridNote := "実現した Δ(θ₀) ≥ 2 の分布"
+	if len(deltas) == 0 {
+		deltas = []float64{2, 2.5, 3, 4}
+		gridNote = "ゲート三つ組がないので格子 {2, 2.5, 3, 4}"
 	}
-	// Discard rates.
+	fmt.Fprintln(w, "\n## §9.1 のゲートの合格確率（ランダム切片の当てはめからの模擬）")
+	if in.Mixed == nil {
+		fmt.Fprintln(w, "\nランダム切片の当てはめがないので計算しない（作業独立の β は減衰しているので σ̂ と組み合わせられない）。")
+	} else {
+		fmt.Fprintf(w, "\nz = β_j·Δ + π_j·o + u、u ~ N(0, σ̂²)、σ̂ = %.2f、Δ は%s（%d 個）。Rao–Kupper には無作為回答のパラメータがないので、無作為回答率 0 と 0.10（反転率に (1−ℓ)·r + ℓ/3）の 2 行。n_T = %d。\n", in.Mixed.Sigma, gridNote, len(deltas), nT)
+		fmt.Fprintln(w, "\n| 判定者 | 反転率（ℓ = 0） | 合格確率 | 反転率（ℓ = 0.10） | 合格確率 |")
+		fmt.Fprintln(w, "| --- | --: | --: | --: | --: |")
+		for j, name := range in.Names {
+			r0 := fit.SimulatedReversal(in.Mixed.Beta[j], in.Mixed.Tau[j], in.Mixed.Pi[j], in.Mixed.Sigma, 0, deltas)
+			r1 := fit.SimulatedReversal(in.Mixed.Beta[j], in.Mixed.Tau[j], in.Mixed.Pi[j], in.Mixed.Sigma, 0.10, deltas)
+			fmt.Fprintf(w, "| %s | %.3f | %.3f | %.3f | %.3f |\n", name, r0, stats.GatePassProbability(r0, nT, 0, 0), r1, stats.GatePassProbability(r1, nT, 0, 0))
+		}
+	}
 	if len(in.Discards) > 0 {
 		fmt.Fprintln(w, "\n## 破棄率")
 		fmt.Fprintln(w, "\n| "+strings.Join(in.Discards[0], " | ")+" |")
@@ -1074,29 +719,46 @@ func writeP2Report(w io.Writer, in p2Input) error {
 			fmt.Fprintln(w, "| "+strings.Join(r, " | ")+" |")
 		}
 	}
-	// ICC by exemplar pair and domain.
+	// ICC on source-level mean residuals (review-fit-impl m14).
 	resid, err := scoreResiduals(in.Trips, in.Js, in.Aux)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, "\n## 残差の級内相関（決定文書 §6; 0.05 を超えればその水準のブートストラップを感度分析に加える）")
+	fmt.Fprintln(w, "\n## 残差の級内相関（決定文書 §6; 元の議論ごとに平均した残差の一元配置 ICC(1)。0.05 を超えればその水準のブートストラップを感度分析に加える）")
 	fmt.Fprintln(w, "\n| 水準 | 群数 | ICC(1) |")
 	fmt.Fprintln(w, "| --- | --: | --: |")
+	type srcAgg struct {
+		sum float64
+		n   int
+		t   fit.Triplet
+	}
+	bySrc := map[int]*srcAgg{}
+	for i, r := range resid {
+		if math.IsNaN(r) {
+			continue
+		}
+		a := bySrc[in.Trips[i].Source]
+		if a == nil {
+			a = &srcAgg{t: in.Trips[i]}
+			bySrc[in.Trips[i].Source] = a
+		}
+		a.sum += r
+		a.n++
+	}
 	for _, lv := range []struct {
 		name string
 		key  func(fit.Triplet) string
 	}{{"例示の組", func(t fit.Triplet) string { return t.ExemplarPair }}, {"領域", func(t fit.Triplet) string { return t.Domain }}, {"生成モデル", func(t fit.Triplet) string { return t.Generator }}} {
 		groups := map[string][]float64{}
-		for i, r := range resid {
-			k := lv.key(in.Trips[i])
-			if k == "" {
+		for _, a := range bySrc {
+			k := lv.key(a.t)
+			if k == "" || a.n == 0 {
 				continue
 			}
-			groups[k] = append(groups[k], r)
+			groups[k] = append(groups[k], a.sum/float64(a.n))
 		}
 		fmt.Fprintf(w, "| %s | %d | %s |\n", lv.name, len(groups), num(icc1(groups)))
 	}
-	// Matching stability.
 	hw := in.StabilityHalfWidth
 	if hw <= 0 {
 		hw = 0.25
@@ -1105,32 +767,19 @@ func writeP2Report(w io.Writer, in p2Input) error {
 	for p := range box {
 		box[p] = hw
 	}
-	share, err := matchingStability(in.Trips, ged.Current(), box)
+	share, err := fit.MatchingStability(in.Trips, ged.Current(), box, 64, 1)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "\n## 対応付けの安定性（決定文書 §11.6）\n\nθ₀ ± %.2f の箱（各パラメータを 1 つずつ動かす）で対応付けが変わる三つ組の割合: %.1f%%。\n", hw, 100*share)
+	fmt.Fprintf(w, "\n## 対応付けの安定性（決定文書 §11.6）\n\nθ₀ ± %.2f の箱（軸上 22 点 + 無作為な角 64 点）で対応付けが変わる三つ組の割合: %.1f%%。\n", hw, 100*share)
 	return nil
 }
 
-// simulatedReversal is E[P(B | z)] over u ~ N(0, σ²) and both orders at Δ = delta for a judge (β, τ, π).
-func simulatedReversal(beta, tau, pi, sigma, delta float64) float64 {
-	const n = 41
-	s := 0.0
-	for i := range n {
-		u := 0.0
-		w := 1.0 / n
-		if sigma > 0 {
-			x := -4 + 8*float64(i)/float64(n-1)
-			u = sigma * x
-			w = math.Exp(-x*x/2) / math.Sqrt(2*math.Pi) * (8.0 / float64(n-1))
-		}
-		for _, o := range []float64{1, -1} {
-			_, pb, _ := fit.Probs(beta*delta+pi*o+u, tau)
-			s += w * pb / 2
-		}
+func defaultF(v, d float64) float64 {
+	if v <= 0 {
+		return d
 	}
-	return s
+	return v
 }
 
 // scoreResiduals returns per-triplet mean residuals score − E[score] with score A = +1, B = −1, same = 0 under p
@@ -1188,7 +837,6 @@ func icc1(groups map[string][]float64) float64 {
 	}
 	grand /= float64(N)
 	ssb, ssw := 0.0, 0.0
-	n0 := float64(N)
 	sumN2 := 0.0
 	for _, g := range groups {
 		m, n := 0.0, 0
@@ -1210,45 +858,10 @@ func icc1(groups map[string][]float64) float64 {
 		}
 		sumN2 += float64(n * n)
 	}
-	n0 = (float64(N) - sumN2/float64(N)) / float64(k-1)
+	n0 := (float64(N) - sumN2/float64(N)) / float64(k-1)
 	msb := ssb / float64(k-1)
 	msw := ssw / float64(N-k)
 	return (msb - msw) / (msb + (n0-1)*msw)
-}
-
-// matchingStability is the share of triplets whose matching signature changes at any corner of the per-parameter
-// box center ± halfWidth[p] (decisions §11.6).
-func matchingStability(trips []fit.Triplet, center ged.Theta, halfWidth [ged.NumParams]float64) (float64, error) {
-	if len(trips) == 0 {
-		return math.NaN(), nil
-	}
-	base, err := fit.Signatures(trips, center)
-	if err != nil {
-		return 0, err
-	}
-	changed := make([]bool, len(trips))
-	for p := range ged.NumParams {
-		for _, dir := range []float64{-1, 1} {
-			th := center
-			th[p] = math.Max(0, th[p]+dir*halfWidth[p])
-			s, err := fit.Signatures(trips, th)
-			if err != nil {
-				return 0, err
-			}
-			for i := range s {
-				if s[i] != base[i] {
-					changed[i] = true
-				}
-			}
-		}
-	}
-	n := 0
-	for _, c := range changed {
-		if c {
-			n++
-		}
-	}
-	return float64(n) / float64(len(trips)), nil
 }
 
 func fmtSlice(v []float64) string {
@@ -1315,13 +928,16 @@ func sortedKV[V any](m map[string]V) [][2]string {
 // Profile likelihood (§16 #11)
 // ---------------------------------------------------------------------------------------------------------------
 
-// writeProfiles writes the log-likelihood as each cost is varied one at a time on a 0.1 grid over [0, 3].
-// slice fixes the other parameters at their estimates; profile refits the others with the bound-constrained
-// optimizer from three starts (the estimate, θ₀, all-0.5) and keeps the best. Both re-solve the matching at
-// each point. A profile with more than one local maximum (beyond 0.5 log-likelihood units) is flagged non-monotone.
+// writeProfiles writes the log-likelihood as each cost is varied one at a time on a 0.1 grid over [0, max(3, θ̂_p + 1)].
+// The filters of opts are applied once; slice fixes the other parameters at their estimates; profile refits the others
+// with the bound-constrained optimizer from three starts (the estimate, θ₀, all-0.5) and keeps the best. Both
+// re-solve the matching at each point. A profile with more than one local maximum (beyond 0.5 log-likelihood units)
+// is flagged non-monotone.
 func writeProfiles(path string, ft []fit.Triplet, js []fit.Judgment, opts fit.Options, est fit.Params) error {
 	var b bytes.Buffer
 	b.WriteString("param,value,slice_loglik,profile_loglik,assign_changes,flag\n")
+	ft, js, _ = fit.Filter(ft, js, opts)
+	opts.IncludeAll, opts.Exclude, opts.ExcludeSameFamily, opts.Weights, opts.CohZeroOnly = true, nil, false, nil, false
 	var half ged.Theta
 	for i := range half {
 		half[i] = 0.5
@@ -1336,8 +952,8 @@ func writeProfiles(path string, ft []fit.Triplet, js []fit.Judgment, opts fit.Op
 			changes        int
 		}
 		var pts []pt
-		for k := 0; k <= 30; k++ {
-			v := float64(k) * 0.1
+		top := math.Max(3, est.Theta[p]+1)
+		for v := 0.0; v <= top+1e-9; v += 0.1 {
 			sp := est
 			sp.Theta[p] = v
 			for i, m := range opts.Tie {
@@ -1390,7 +1006,6 @@ func peaks[T any](pts []T, f func(T) float64, tol float64) int {
 	count := 0
 	for i := range n {
 		v := f(pts[i])
-		// Walk left and right until the value departs by tol; it is a peak if both sides drop first.
 		dropL, dropR := i == 0, i == n-1
 		for l := i - 1; l >= 0; l-- {
 			if f(pts[l]) > v+1e-9 {

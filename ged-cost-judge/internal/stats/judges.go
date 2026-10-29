@@ -150,6 +150,18 @@ func GatePassProbability(r float64, nT int, rMax, conf float64) float64 {
 }
 
 func binomPMF(k, n int, p float64) float64 {
+	switch {
+	case p <= 0:
+		if k == 0 {
+			return 1
+		}
+		return 0
+	case p >= 1:
+		if k == n {
+			return 1
+		}
+		return 0
+	}
 	lc := lgamma(float64(n+1)) - lgamma(float64(k+1)) - lgamma(float64(n-k+1))
 	return math.Exp(lc + float64(k)*math.Log(p) + float64(n-k)*math.Log(1-p))
 }

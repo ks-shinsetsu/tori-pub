@@ -61,7 +61,6 @@ func TestGradient(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		o := newObjective(l, ds, trips, js, opts, 1e-4, mixed)
 		p := Init(opts)
 		p.Theta = altTheta()
 		p.ThetaNeg = 0.7
@@ -70,6 +69,10 @@ func TestGradient(t *testing.T) {
 		for j := range 3 {
 			p.Beta[j], p.Tau[j], p.Pi[j] = 1.5+0.3*float64(j), 0.5+0.1*float64(j), 0.1*float64(j)
 		}
+		// Centre the adaptive quadrature at slightly different parameters so the nodes are not exactly at the mode.
+		at := p.Clone()
+		at.Sigma = 1.1
+		o := newObjective(l, ds, trips, js, opts, 1e-4, mixed, at)
 		x := l.pack(p, mixed)
 		g := make([]float64, len(x))
 		f0 := o.eval(x, g)

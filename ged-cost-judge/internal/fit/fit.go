@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"runtime"
 	"slices"
 	"sort"
@@ -81,6 +82,10 @@ type Triplet struct {
 	CohA, CohB float64
 	// T1Delta0 is Δ(θ₀) of a T1 triplet (the judge QC gate stratum of §9.1).
 	T1Delta0 float64
+
+	// orig is the original Source of a bootstrap copy (set by subset); see foldKey.
+	orig    int
+	hasOrig bool
 }
 
 // HasFlag reports whether the triplet carries flag f.
@@ -88,10 +93,36 @@ func (t Triplet) HasFlag(f string) bool { return slices.Contains(t.Flags, f) }
 
 // weight returns the effective importance weight.
 func (t Triplet) weight() float64 {
-	if t.Weight <= 0 {
+	if t.Weight == 0 || math.IsNaN(t.Weight) {
 		return 1
 	}
 	return t.Weight
+}
+
+// checkWeights rejects negative weights (a zero weight means 1 by the field contract; exclude via Flags instead).
+func checkWeights(trips []Triplet, opts Options) error {
+	if !opts.Weighted {
+		return nil
+	}
+	for i, t := range trips {
+		w := t.Weight
+		if opts.Weights != nil && i < len(opts.Weights) {
+			w = opts.Weights[i]
+		}
+		if w < 0 || math.IsInf(w, 0) {
+			return fmt.Errorf("fit: triplet %d has weight %g (must be ≥ 0; 0 or NaN means 1)", i, w)
+		}
+	}
+	return nil
+}
+
+// foldKey is the cluster identity used to group folds: the original source of a bootstrap copy, so that copies of
+// one source never straddle a CV fold inside a nested bootstrap (review-fit-impl M2).
+func (t Triplet) foldKey() int {
+	if t.hasOrig {
+		return t.orig
+	}
+	return t.Source
 }
 
 // DeltaCoh is coh(A) − coh(B).
@@ -133,8 +164,9 @@ const (
 	GammaFixed
 )
 
-// DefaultExclude is the default triplet-flag exclusion list (decisions #15, §12b).
-var DefaultExclude = []string{"x_spk", "diag_ca_type"}
+// DefaultExclude is the default triplet-flag exclusion list: X-spk (RQ4 only, #15), the diagnostic CA cell (§12b),
+// QT30 transfer triplets (transfer-only, #15), P-del/P-add co-occurrence (#15, §15.5) and pilot/P2 triplets (§13, §15.9).
+var DefaultExclude = []string{"x_spk", "diag_ca_type", "qt30", "del_add_cooccur", "pilot"}
 
 // ThetaMax is the upper bound of every cost (decisions §6: θ_p > 10 counts as divergent).
 const ThetaMax = 10.0
@@ -262,6 +294,9 @@ type Result struct {
 	Cycled bool
 	// Capped indicates the outer loop hit MaxOuter without converging or cycling.
 	Capped bool
+	// InnerConverged is false if the bound-constrained inner solver of the returned round stopped on a line-search
+	// failure or an iteration/evaluation cap rather than on its tolerances.
+	InnerConverged bool
 	// Boundary[p] is true if the free cost p ended below BoundaryEps; Divergent[p] if it ended at ThetaMax (clipped).
 	Boundary  [ged.NumParams]bool
 	Divergent [ged.NumParams]bool
@@ -548,8 +583,33 @@ func answerLogLik(y Answer, z, tau float64) (ll, dz, dtau float64) {
 		return logSigmoid(-z - tau), -(1 - b), -(1 - b)
 	default:
 		a, b := sigmoid(z-tau), sigmoid(-z-tau)
-		pt := math.Max(1-a-b, floor)
+		pt := 1 - a - b
+		if pt < floor {
+			// Floored: the value is constant, so its derivatives are 0 (review-fit-impl m18).
+			return math.Log(floor), 0, 0
+		}
 		return math.Log(pt), (-a*(1-a) + b*(1-b)) / pt, (a*(1-a) + b*(1-b)) / pt
+	}
+}
+
+// answerCurvature is d²/dz² of the log-likelihood of one judgment (used to centre the adaptive quadrature).
+func answerCurvature(y Answer, z, tau float64) float64 {
+	switch y {
+	case AnswerA:
+		a := sigmoid(z - tau)
+		return -a * (1 - a)
+	case AnswerB:
+		b := sigmoid(-z - tau)
+		return -b * (1 - b)
+	default:
+		a, b := sigmoid(z-tau), sigmoid(-z-tau)
+		pt := 1 - a - b
+		if pt < 1e-12 {
+			return 0
+		}
+		f := -a*(1-a) + b*(1-b)
+		fp := -a*(1-a)*(1-2*a) - b*(1-b)*(1-2*b)
+		return (fp*pt - f*f) / (pt * pt)
 	}
 }
 
@@ -579,10 +639,14 @@ type objective struct {
 	mixed  bool
 	ghX    []float64
 	ghLogW []float64
-	nllRaw float64
+	// Adaptive Gauss–Hermite (Liu & Pierce 1994): per-triplet centre û_t and scale s_t of the integrand in u,
+	// computed once per outer round at the round's starting parameters and held fixed inside the inner optimizer,
+	// so the inner objective is smooth with exact gradients (review-fit-impl M3).
+	center, scale []float64
+	nllRaw        float64
 }
 
-func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Options, ridge float64, mixed bool) *objective {
+func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Options, ridge float64, mixed bool, at Params) *objective {
 	o := &objective{l: l, ds: ds, trips: trips, js: js, opts: opts, ridge: ridge, mixed: mixed}
 	o.fold = make([][ged.NumParams]float64, len(ds))
 	for i, d := range ds {
@@ -607,10 +671,58 @@ func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Opti
 		o.ghX = x
 		o.ghLogW = make([]float64, nq)
 		for q := range w {
-			o.ghLogW[q] = math.Log(w[q]) - 0.5*math.Log(math.Pi)
+			o.ghLogW[q] = math.Log(w[q]) + x[q]*x[q] // e^{x²} undoes the Hermite weight; the Gaussian prior is applied explicitly
 		}
+		o.recenter(at)
 	}
 	return o
+}
+
+// recenter computes the mode û_t and the scale s_t = (−g″(û_t))^{−1/2} of g(u) = Σ_k log P(y_k | z_k + u) − u²/(2σ²)
+// for every triplet at the parameters p (damped Newton; g is strictly concave because the Rao–Kupper
+// probabilities are log-concave in z).
+func (o *objective) recenter(p Params) {
+	n := len(o.byTrip)
+	o.center, o.scale = make([]float64, n), make([]float64, n)
+	sigma := math.Max(p.Sigma, 1e-8)
+	for t, ks := range o.byTrip {
+		o.scale[t] = sigma
+		if len(ks) == 0 {
+			continue
+		}
+		D := o.delta(t, p)
+		base := make([]float64, len(ks))
+		for i, ki := range ks {
+			k := o.js[ki]
+			base[i] = p.Beta[k.Judge]*D + p.Pi[k.Judge]*k.Order + p.Gamma*o.trips[t].DeltaCoh()
+		}
+		g := func(u float64) (val, d1, d2 float64) {
+			val, d1, d2 = -u*u/(2*sigma*sigma), -u/(sigma*sigma), -1/(sigma*sigma)
+			for i, ki := range ks {
+				k := o.js[ki]
+				ll, dz, _ := answerLogLik(k.Answer, base[i]+u, p.Tau[k.Judge])
+				val += ll
+				d1 += dz
+				d2 += answerCurvature(k.Answer, base[i]+u, p.Tau[k.Judge])
+			}
+			return val, d1, d2
+		}
+		u := 0.0
+		val, d1, d2 := g(u)
+		for it := 0; it < 50 && math.Abs(d1) > 1e-10; it++ {
+			step := -d1 / math.Min(d2, -1e-12)
+			for ls := 0; ls < 30; ls++ {
+				v, nd1, nd2 := g(u + step)
+				if v >= val-1e-12 {
+					u, val, d1, d2 = u+step, v, nd1, nd2
+					break
+				}
+				step /= 2
+			}
+		}
+		o.center[t] = u
+		o.scale[t] = 1 / math.Sqrt(math.Max(-d2, 1/(sigma*sigma)))
+	}
 }
 
 func (o *objective) weight(t int) float64 {
@@ -675,9 +787,11 @@ func (o *objective) eval(x, grad []float64) float64 {
 			}
 			w := o.weight(t)
 			D := o.delta(t, p)
+			sig2 := p.Sigma * p.Sigma
+			logPrior := -math.Log(p.Sigma) - 0.5*math.Log(2*math.Pi) + math.Log(math.Sqrt2*o.scale[t])
 			for q := range nq {
-				u := p.Sigma * math.Sqrt2 * o.ghX[q]
-				s := o.ghLogW[q]
+				u := o.center[t] + math.Sqrt2*o.scale[t]*o.ghX[q]
+				s := o.ghLogW[q] + logPrior - u*u/(2*sig2)
 				if grad != nil {
 					dzq[q] = make([]float64, len(ks))
 					dtq[q] = make([]float64, len(ks))
@@ -704,12 +818,13 @@ func (o *objective) eval(x, grad []float64) float64 {
 				if r < 1e-300 {
 					continue
 				}
-				u := p.Sigma * math.Sqrt2 * o.ghX[q]
+				u := o.center[t] + math.Sqrt2*o.scale[t]*o.ghX[q]
 				for i, ki := range ks {
 					k := o.js[ki]
 					o.accum(grad, k, p, D, dzq[q][i], dtq[q][i], w*r)
-					grad[l.logSigma()] -= w * r * dzq[q][i] * u
 				}
+				// The nodes are fixed; σ enters only through the prior density: d/dlogσ log φ(u; σ) = u²/σ² − 1.
+				grad[l.logSigma()] -= w * r * (u*u/sig2 - 1)
 			}
 		}
 	}
@@ -826,6 +941,9 @@ func fitMulti(trips []Triplet, js []Judgment, opts Options, init *Params, mixed 
 	}
 	if opts.Weights != nil && len(opts.Weights) != len(trips) {
 		return Result{}, fmt.Errorf("fit: len(Weights) = %d, want %d", len(opts.Weights), len(trips))
+	}
+	if err := checkWeights(trips, opts); err != nil {
+		return Result{}, err
 	}
 	trips, js, _ = Filter(trips, js, opts)
 	opts.Weights = nil // materialised into Triplet.Weight by Filter
@@ -956,30 +1074,36 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 		return r
 	}
 	for outer := 1; outer <= opts.MaxOuter; outer++ {
-		obj := newObjective(l, ds, trips, js, opts, ridge, mixed)
+		obj := newObjective(l, ds, trips, js, opts, ridge, mixed, p)
 		br := projLBFGS(obj.eval, l.pack(p, mixed), lo, hi, boxOptions{})
 		if math.IsNaN(br.F) || math.IsInf(br.F, 0) {
 			return best, errors.New("fit: objective is not finite")
 		}
 		p = l.unpack(br.X, opts.Tie, mixed)
 
-		// Re-solve the matching at this θ and measure the objective under real GED (GED is a minimum over matchings).
+		// Re-solve the matching at this θ (and re-centre the quadrature) and measure the objective under real GED.
 		next, err := features(trips, p.Theta)
 		if err != nil {
 			return best, err
 		}
-		trueObj := newObjective(l, next, trips, js, opts, ridge, mixed)
+		trueObj := newObjective(l, next, trips, js, opts, ridge, mixed, p)
 		f := trueObj.eval(br.X, nil)
-		cur := Result{Params: p, NegLogLik: trueObj.nllRaw, Objective: f, Outer: outer}
+		cur := Result{Params: p, NegLogLik: trueObj.nllRaw, Objective: f, Outer: outer, InnerConverged: br.Converged}
 		if f < bestF {
 			best, bestF = cur, f
 		}
 		sig := sigOf(next)
+		centersStable := !mixed || math.Abs(f-br.F) < 1e-6*math.Max(1, math.Abs(f))
 		if sig == sigOf(ds) {
-			cur.Converged = true
-			return finish(cur), nil
+			if centersStable {
+				cur.Converged = true
+				return finish(cur), nil
+			}
+			// Same matching but the adaptive quadrature centres moved: another inner round at the new centres.
+			ds, prevTrue = next, f
+			continue
 		}
-		if math.Abs(f-prevTrue) < 1e-6*math.Max(1, math.Abs(f)) {
+		if math.Abs(f-prevTrue) < 1e-6*math.Max(1, math.Abs(f)) && centersStable {
 			// Objective-based stopping (decisions §11.2): the matching moved but the true objective did not.
 			best.Converged = true
 			best.Outer = outer
@@ -1055,10 +1179,50 @@ func NegLogLikMixed(trips []Triplet, js []Judgment, p Params, nodes int) (float6
 		return 0, err
 	}
 	opts := Options{Judges: len(p.Beta), Quadrature: nodes, FitNeg: true, Gamma: GammaFree}
+	p.Sigma = math.Max(p.Sigma, 1e-3) // the same floor pack applies, so the centring and the prior agree
 	l := layout{j: opts.Judges}
-	o := newObjective(l, ds, trips, js, opts, 0, true)
+	o := newObjective(l, ds, trips, js, opts, 0, true, p)
 	o.eval(l.pack(p, true), nil)
 	return o.nllRaw, nil
+}
+
+// ExclusionCounts counts, per flag in the effective exclusion list, the triplets it removes ("excluded and counted",
+// decisions #15), plus the Δcoh ≠ 0 count when CohZeroOnly is set.
+func ExclusionCounts(trips []Triplet, opts Options) map[string]int {
+	excl := opts.Exclude
+	if excl == nil && !opts.IncludeAll {
+		excl = DefaultExclude
+	}
+	if opts.IncludeAll {
+		excl = nil
+	}
+	out := map[string]int{}
+	for _, f := range excl {
+		out[f] = 0
+	}
+	for _, t := range trips {
+		for _, f := range excl {
+			if t.HasFlag(f) {
+				out[f]++
+			}
+		}
+		if opts.CohZeroOnly && math.Abs(t.DeltaCoh()) > 1e-12 {
+			out["Δcoh≠0"]++
+		}
+	}
+	return out
+}
+
+// RandomStarts draws n starting cost vectors uniformly on [0.1, 2] (the stand-in for the CMA-ES check of §11.3).
+func RandomStarts(n int, seed uint64) []ged.Theta {
+	rng := rand.New(rand.NewPCG(seed, 17))
+	out := make([]ged.Theta, n)
+	for i := range out {
+		for p := range ged.NumParams {
+			out[i][p] = 0.1 + 1.9*rng.Float64()
+		}
+	}
+	return out
 }
 
 func equalFold(a, b string) bool { return strings.EqualFold(a, b) }

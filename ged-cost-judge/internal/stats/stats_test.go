@@ -35,8 +35,8 @@ func TestClopperPearson(t *testing.T) {
 	if u := ClopperPearsonUpper(0, 100, 0.90); !near(u, 0.02276, 2e-5) {
 		t.Fatalf("0/100: %v", u)
 	}
-	// 15/100 → ≈ 0.207.
-	if u := ClopperPearsonUpper(15, 100, 0.90); !near(u, 0.207, 2e-3) {
+	// 15/100 → 0.2061 (bisection on the exact binomial).
+	if u := ClopperPearsonUpper(15, 100, 0.90); !near(u, 0.2061, 1e-4) {
 		t.Fatalf("15/100: %v", u)
 	}
 	// 14/100 is the last passing count at n_T = 100, r_max = 0.20 (decisions §9.1: fail iff k_eff ≥ 15).
@@ -69,6 +69,12 @@ func TestReversalGate(t *testing.T) {
 	g = ReversalGate(29, 0, 200, 100, 0, 0) // k_eff = 14.5 → upper bound?
 	t.Logf("k_eff 14.5: upper %.4f fail %v", g.Upper, g.Fail)
 	// Pass probabilities of §9.1: 0.05 → 1.00, 0.10 → 0.93, 0.15 → 0.46, 0.20 → 0.08.
+	if p := GatePassProbability(0, 100, 0, 0); p != 1 {
+		t.Fatalf("pass prob at r = 0: %v", p)
+	}
+	if p := GatePassProbability(1, 100, 0, 0); p != 0 {
+		t.Fatalf("pass prob at r = 1: %v", p)
+	}
 	for _, c := range []struct{ r, want, tol float64 }{{0.05, 1.00, 0.01}, {0.10, 0.93, 0.02}, {0.15, 0.46, 0.03}, {0.20, 0.08, 0.02}} {
 		if p := GatePassProbability(c.r, 100, 0, 0); !near(p, c.want, c.tol) {
 			t.Errorf("pass prob at r = %.2f: %.3f, want %.2f", c.r, p, c.want)
@@ -123,6 +129,11 @@ func TestDecide(t *testing.T) {
 	if d.Label != NotEstimable {
 		t.Fatalf("frozen anchored: %v", d.Label)
 	}
+	// Replicate floor: 3 valid replicates out of B = 1000.
+	d = Decide(DecisionInput{Est: 1, Boot: boot(1, 0.09, 3), Theta0: 1, M: 0.25, TotalReps: 1000})
+	if d.Label != NotEstimable {
+		t.Fatalf("replicate floor: %v", d.Label)
+	}
 	// Information floor by count.
 	d = Decide(DecisionInput{Est: 1, Boot: boot(1, 0.09, 1000), Theta0: 1, M: 0.25, NInformative: 100, MinInformative: 650})
 	if d.Label != NotEstimable {
@@ -135,7 +146,7 @@ func TestDecide(t *testing.T) {
 	}
 	d = Decide(DecisionInput{Est: 0.2, Boot: boot(0.2, 0.2, 1000), Theta0: 1, M: 0.25, BoundaryShare: 0.3})
 	if d.Label != Change || !d.OneSided {
-		t.Fatalf("one-sided change: %v onesided=%v upper=%.3f", d.Label, d.OneSided, d.Upper90)
+		t.Fatalf("one-sided change: %v onesided=%v upper=%.3f", d.Label, d.OneSided, d.Upper)
 	}
 	d = Decide(DecisionInput{Est: 0.9, Boot: boot(0.9, 0.05, 1000), Theta0: 1, M: 0.25, BoundaryShare: 0.3})
 	if d.Label != UndecidedImprecise || !d.OneSided {
@@ -208,13 +219,26 @@ func TestMcNemar(t *testing.T) {
 	}
 	// Clustered: A right on 70 of 100 units, B on 50, clusters of 2; the bootstrap lower bound must be > 0.
 	rightA, rightB, elig := make([]bool, 100), make([]bool, 100), make([]bool, 100)
+	scoreA, scoreB := make([]float64, 100), make([]float64, 100)
 	cl := make([]int, 100)
 	for u := range 100 {
 		rightA[u], rightB[u], elig[u], cl[u] = u < 70, u%2 == 0, true, u/2
+		if rightA[u] {
+			scoreA[u] = 1
+		}
+		if rightB[u] {
+			scoreB[u] = 1
+		}
 	}
-	r := ClusteredMcNemar(rightA, rightB, elig, cl, nil, 200, 1)
+	r := ClusteredMcNemar(scoreA, scoreB, elig, cl, nil, 200, 1)
 	if !near(r.Est, 20, 1e-9) || !r.Supported {
 		t.Fatalf("clustered: %+v", r)
+	}
+	// Half credit: a unit with Δ = 0 under A scores 0.5 → the mean difference moves by 0.5/100.
+	scoreA[99] = 0.5
+	r2 := ClusteredMcNemar(scoreA, scoreB, elig, cl, nil, 10, 1)
+	if !near(r2.Est, 20+0.5, 1e-9) {
+		t.Fatalf("half credit: %v", r2.Est)
 	}
 	b, c := DiscordantCounts(rightA, rightB, elig)
 	if b != 35 || c != 15 {
@@ -230,6 +254,9 @@ func TestKrippendorff(t *testing.T) {
 	}
 	if a := KrippendorffAlpha([][]int{{0, 0}, {1, 1}, {2, 2, -1}}); a != 1 {
 		t.Fatalf("perfect: %v", a)
+	}
+	if a := KrippendorffAlpha([][]int{{0, 0}, {0, 0}}); !math.IsNaN(a) {
+		t.Fatalf("single category should be NaN: %v", a)
 	}
 	// Three coders with a missing value: (1,1,1), (1,2,·), (2,2,2).
 	// o_11 = 3, o_12 = o_21 = 1, o_22 = 3; n_1 = n_2 = 4, n = 8; α = 1 − 7·2/32 = 0.5625.

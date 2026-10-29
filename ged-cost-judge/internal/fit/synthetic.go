@@ -7,7 +7,8 @@ import (
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
 )
 
-// A tiny synthetic world for the tests (independent of internal/simulate).
+// A tiny synthetic world, independent of internal/simulate, used by the tests of this package and by the
+// end-to-end test of the confirmatory report. It is not the P1 simulator (that is internal/simulate).
 
 type simJudge struct{ beta, tau, pi float64 }
 
@@ -18,6 +19,7 @@ type simWorld struct {
 	neg    float64
 	judges []simJudge
 	sigma  float64
+	lapse  float64 // probability of a uniformly random answer
 }
 
 func newWorld(seed uint64, theta ged.Theta, sigma float64) *simWorld {
@@ -25,6 +27,28 @@ func newWorld(seed uint64, theta ged.Theta, sigma float64) *simWorld {
 		rng: rand.New(rand.NewPCG(seed, 99)), cos: map[[2]string]float64{}, theta: theta, sigma: sigma,
 		judges: []simJudge{{2.0, 0.6, 0.3}, {1.5, 0.9, -0.2}, {2.5, 0.4, 0}},
 	}
+}
+
+// SyntheticOptions configures Synthetic.
+type SyntheticOptions struct {
+	Sources int       // 4 triplets each (the first is a T1 incremental triplet)
+	Theta   ged.Theta // true costs (zero value → the reference alternative world)
+	Neg     float64   // true θ_neg
+	Sigma   float64   // shared per-triplet offset SD
+	Lapse   float64   // random-answer probability
+	WithNeg bool      // include polarity flips
+}
+
+// Synthetic generates a small synthetic dataset (3 judges × 2 orders, two generators, T1Delta0 filled for the T1
+// triplets) from the reference judge models of plan §6.5. For tests and smoke runs only.
+func Synthetic(seed uint64, o SyntheticOptions) ([]Triplet, []Judgment) {
+	var zero ged.Theta
+	if o.Theta == zero {
+		o.Theta = altTheta()
+	}
+	w := newWorld(seed, o.Theta, o.Sigma)
+	w.neg, w.lapse = o.Neg, o.Lapse
+	return w.generate(o.Sources, o.WithNeg)
 }
 
 func (w *simWorld) sim(ref, v string) float64 {
@@ -158,28 +182,47 @@ func (w *simWorld) generate(sources int, withNeg bool) ([]Triplet, []Judgment) {
 			a, b := ref.Clone(), ref.Clone()
 			negA, negB := 0, 0
 			tag := fmt.Sprintf("%d_%d", s, k)
-			na, nb := 1+w.rng.IntN(2), 1+w.rng.IntN(2)
-			for i := range na {
-				e := w.rng.IntN(nEdits)
-				if e == eNeg && !withNeg {
-					e = eDelEdge
+			typ := "T3"
+			if k == 0 {
+				// T1 incremental: A = one light edit, B = A plus two heavy edits (A ⊂ B).
+				typ = "T1"
+				w.apply(&a, []int{eDelEdge, eRelabel, eReverse}[w.rng.IntN(3)], tag+"a0")
+				b = a.Clone()
+				w.apply(&b, eDelProp, tag+"b0")
+				w.apply(&b, []int{eDelProp, eAddProp, eDelEdge}[w.rng.IntN(3)], tag+"b1")
+			} else {
+				na, nb := 1+w.rng.IntN(2), 1+w.rng.IntN(2)
+				for i := range na {
+					e := w.rng.IntN(nEdits)
+					if e == eNeg && !withNeg {
+						e = eDelEdge
+					}
+					negA += w.apply(&a, e, tag+"a"+fmt.Sprint(i))
 				}
-				negA += w.apply(&a, e, tag+"a"+fmt.Sprint(i))
-			}
-			for i := range nb {
-				e := w.rng.IntN(nEdits)
-				if e == eNeg && !withNeg {
-					e = eAddEdge
+				for i := range nb {
+					e := w.rng.IntN(nEdits)
+					if e == eNeg && !withNeg {
+						e = eAddEdge
+					}
+					negB += w.apply(&b, e, tag+"b"+fmt.Sprint(i))
 				}
-				negB += w.apply(&b, e, tag+"b"+fmt.Sprint(i))
 			}
 			trips = append(trips, Triplet{Source: s, Ref: ref, A: a, B: b, SimA: w.sim, SimB: w.sim,
-				NegDiff: float64(negB - negA), Generator: gens[s%2], Type: "T3"})
+				NegDiff: float64(negB - negA), Generator: gens[s%2], Type: typ})
 		}
 	}
 	d, err := Delta(trips, w.theta)
 	if err != nil {
 		panic(err)
+	}
+	d0, err := Delta(trips, ged.Current())
+	if err != nil {
+		panic(err)
+	}
+	for t := range trips {
+		if trips[t].Type == "T1" {
+			trips[t].T1Delta0 = d0[t]
+		}
 	}
 	for t := range trips {
 		u := w.sigma * w.rng.NormFloat64()
@@ -195,6 +238,9 @@ func (w *simWorld) generate(sources int, withNeg bool) ([]Triplet, []Judgment) {
 					ans = AnswerA
 				case r < pa+pb:
 					ans = AnswerB
+				}
+				if w.lapse > 0 && w.rng.Float64() < w.lapse {
+					ans = Answer(w.rng.IntN(3))
 				}
 				js = append(js, Judgment{Triplet: t, Judge: j, Order: o, Answer: ans})
 			}

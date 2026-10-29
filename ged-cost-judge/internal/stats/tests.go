@@ -156,15 +156,16 @@ func McNemarExact(b, c int, oneSided bool) float64 {
 }
 
 // ClusteredMcNemar is the cluster-bootstrap version of the C1/C4 comparison (decisions §4): the difference
-// agree(A) − agree(B) over the eligible units, resampling clusters (stratified by stratum label) with
-// replacement; one-sided (Greater) against null 0. rightA/rightB are per-unit correctness indicators;
-// eligible marks units that enter; cluster and stratum give the resampling unit and its stratum per unit.
-func ClusteredMcNemar(rightA, rightB, eligible []bool, cluster []int, stratum []string, reps int, seed uint64) ContrastResult {
-	est, _ := agreeDiff(rightA, rightB, eligible, nil)
+// 100·(mean scoreA − mean scoreB) over the eligible units, resampling every cluster (all clusters of all units,
+// stratified by stratum label) with replacement, as the main source bootstrap does; one-sided (Greater) against
+// null 0. scoreA/scoreB are per-unit agreement scores (1 right, 0.5 for Δ = 0, 0 wrong); eligible marks units that
+// enter; cluster and stratum give the resampling unit and its stratum per unit.
+func ClusteredMcNemar(scoreA, scoreB []float64, eligible []bool, cluster []int, stratum []string, reps int, seed uint64) ContrastResult {
+	est, _ := agreeDiff(scoreA, scoreB, eligible, nil)
 	byStratum := map[string][]int{}
 	seen := map[int]bool{}
 	for u, c := range cluster {
-		if !eligible[u] || seen[c] {
+		if seen[c] {
 			continue
 		}
 		seen[c] = true
@@ -184,15 +185,12 @@ func ClusteredMcNemar(rightA, rightB, eligible []bool, cluster []int, stratum []
 	}
 	units := map[int][]int{}
 	for u, c := range cluster {
-		if eligible[u] {
-			units[c] = append(units[c], u)
-		}
+		units[c] = append(units[c], u)
 	}
 	boot := make([]float64, reps)
 	for r := range reps {
 		rng := rand.New(rand.NewPCG(seed, uint64(r)))
-		var w []int // multiplicity per unit via drawn clusters
-		w = make([]int, len(rightA))
+		w := make([]int, len(scoreA))
 		for _, s := range names {
 			ids := byStratum[s]
 			for range ids {
@@ -202,15 +200,15 @@ func ClusteredMcNemar(rightA, rightB, eligible []bool, cluster []int, stratum []
 				}
 			}
 		}
-		boot[r], _ = agreeDiff(rightA, rightB, eligible, w)
+		boot[r], _ = agreeDiff(scoreA, scoreB, eligible, w)
 	}
 	return BootstrapContrast(est, boot, 0, Greater)
 }
 
-// agreeDiff is 100·(mean rightA − mean rightB) over eligible units, with optional multiplicities.
-func agreeDiff(rightA, rightB, eligible []bool, w []int) (float64, int) {
+// agreeDiff is 100·(mean scoreA − mean scoreB) over eligible units, with optional multiplicities.
+func agreeDiff(scoreA, scoreB []float64, eligible []bool, w []int) (float64, int) {
 	a, b, n := 0.0, 0.0, 0
-	for u := range rightA {
+	for u := range scoreA {
 		if !eligible[u] {
 			continue
 		}
@@ -222,12 +220,8 @@ func agreeDiff(rightA, rightB, eligible []bool, w []int) (float64, int) {
 			continue
 		}
 		n += m
-		if rightA[u] {
-			a += float64(m)
-		}
-		if rightB[u] {
-			b += float64(m)
-		}
+		a += float64(m) * scoreA[u]
+		b += float64(m) * scoreB[u]
 	}
 	if n == 0 {
 		return math.NaN(), 0
@@ -314,7 +308,7 @@ func KrippendorffAlpha(values [][]int) float64 {
 		}
 	}
 	if den == 0 {
-		return 1
+		return math.NaN() // a single category: expected disagreement is 0 and α is undefined (not evaluable)
 	}
 	return 1 - (n-1)*num/den
 }
