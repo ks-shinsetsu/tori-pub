@@ -33,6 +33,8 @@ type Config struct {
 	Sources int // number of source arguments (PerSrc triplets each)
 	PerSrc  int
 	Seed    uint64
+	// World names the true-cost world (informational; True and TrueNeg are what the simulator uses).
+	World string
 	// True is θ*, TrueNeg the polarity-flip weight.
 	True    ged.Theta
 	TrueNeg float64
@@ -53,20 +55,100 @@ type Config struct {
 	LabelNoise float64
 }
 
-// Default is the main scenario of plan §6.5 (β ≈ 2, σ = 1, 10% random) with the revised catalogue and §1.2 sources.
+// Default is the main scenario of plan §6.5 (β ≈ 2, σ = 1, 10% random) with the revised catalogue and §1.2 sources,
+// in the alternative world alt′ (WorldAlt, decisions-stats Appendix A preamble).
 func Default() Config {
-	tr := ged.Current()
-	tr[ged.PNodeMissing] = 1.3
-	tr[ged.PNodeExtra] = 0.7
-	tr[ged.PEdgeMissing] = 1.2
-	tr[ged.PTypeRACA] = 1.5
-	tr[ged.PDirection] = 1.2
+	w, _ := WorldByName(WorldAlt)
 	return Config{
 		Sources: 250, PerSrc: 4, Seed: 1,
-		True: tr, TrueNeg: 1.5,
+		World: w.Name, True: w.True, TrueNeg: w.TrueNeg,
 		Judges: []Judge{{2.0, 0.6, 0.3}, {1.5, 0.9, -0.2}, {2.5, 0.4, 0.0}},
 		Sigma:  1, Random: 0.1, Shape: ShapeSpec, MinProps: 6, MaxProps: 18,
 	}
+}
+
+// World names (decisions-stats Appendix A.5).
+const (
+	WorldNull   = "null"
+	WorldMild   = "mild"
+	WorldSingle = "single"
+	WorldAlt    = "alt"
+	WorldEdgeN  = "edgeN"
+)
+
+// World is a true cost vector θ* with its polarity-flip weight.
+type World struct {
+	Name    string
+	True    ged.Theta
+	TrueNeg float64
+	// Doc describes the world as defined in decisions-stats Appendix A.5 (and the choices made where it is silent).
+	Doc string
+}
+
+// TrueNegDefault is the polarity-flip weight of every world (as in the A.5 batch of 2026-10-28; θ_neg has no
+// table value and no margin decision, so the worlds do not move it).
+const TrueNegDefault = 1.5
+
+// Worlds are the five A.5 worlds in batch order.
+//
+//   - null: θ* = θ₀.
+//   - edgeN: θ* = θ₀ × 4/3 with I-missing at 5/3: on the sum-normalized scale I-missing sits at θ₀ + m and edge-extra
+//     at θ₀ − m (m = 0.25), the other four margin-judged costs at θ₀ (ŝ_true = 4/3). The knots and the CA pairs are
+//     scaled with the rest (so their normalized values equal θ₀); θ_neg is not scaled.
+//   - alt′: I-missing 1.3, I-extra 0.7, edge-missing 1.2, RA↔MA 1.05 (θ₀ + 0.30), direction 1.2, RA↔CA 1.5,
+//     CA↔MA 0.75, knots at θ₀. The CA pairs are seen only by the untied diagnostic fit (§12b).
+//   - single: I-missing 1.3, everything else at θ₀.
+//   - mild: the seven pre-reduction margin-judged costs (I-missing, I-extra, edge-missing, the three type costs,
+//     direction) at θ₀ + 0.15, knots at θ₀.
+func Worlds() []World {
+	th0 := ged.Current()
+	null := th0
+
+	edge := th0
+	for p := range edge {
+		edge[p] *= 4.0 / 3
+	}
+	edge[ged.PNodeMissing] = 5.0 / 3
+
+	alt := th0
+	alt[ged.PNodeMissing] = 1.3
+	alt[ged.PNodeExtra] = 0.7
+	alt[ged.PEdgeMissing] = 1.2
+	alt[ged.PTypeRAMA] = 1.05
+	alt[ged.PTypeRACA] = 1.5
+	alt[ged.PTypeCAMA] = 0.75
+	alt[ged.PDirection] = 1.2
+
+	single := th0
+	single[ged.PNodeMissing] = 1.3
+
+	mild := th0
+	for _, p := range []int{ged.PNodeMissing, ged.PNodeExtra, ged.PEdgeMissing, ged.PTypeRACA, ged.PTypeRAMA, ged.PTypeCAMA, ged.PDirection} {
+		mild[p] += 0.15
+	}
+	return []World{
+		{WorldNull, null, TrueNegDefault, "θ* = θ₀"},
+		{WorldEdgeN, edge, TrueNegDefault, "θ* = θ₀ × 4/3, I-missing 5/3 (normalized: I-missing θ₀ + 0.25, edge-extra θ₀ − 0.25, rest θ₀; knots and CA pairs scaled, θ_neg not)"},
+		{WorldAlt, alt, TrueNegDefault, "alt′: I-missing 1.3, I-extra 0.7, edge-missing 1.2, RA↔MA 1.05, direction 1.2, RA↔CA 1.5, CA↔MA 0.75 (CA pairs seen only by the untied diagnostic fit)"},
+		{WorldSingle, single, TrueNegDefault, "I-missing 1.3, everything else at θ₀"},
+		{WorldMild, mild, TrueNegDefault, "I-missing, I-extra, edge-missing, the three type costs and direction at θ₀ + 0.15; knots at θ₀"},
+	}
+}
+
+// WorldByName returns the named world.
+func WorldByName(name string) (World, error) {
+	for _, w := range Worlds() {
+		if w.Name == name {
+			return w, nil
+		}
+	}
+	return World{}, fmt.Errorf("unknown world %q (null | edgeN | alt | single | mild)", name)
+}
+
+// WithWorld returns c with the true costs of w.
+func (c Config) WithWorld(w World) Config {
+	c.World, c.True, c.TrueNeg = w.Name, w.True, w.TrueNeg
+	return c
 }
 
 // Misspecified is Default with per-context cost heterogeneity (SD 0.25 on the log scale, per source and parameter)
@@ -93,10 +175,41 @@ type Meta struct {
 	T1Stratum string
 	// TrueDelta is Δ at θ* (including the polarity-flip weight; at the source's θ_s when Hetero > 0).
 	TrueDelta float64
+	// Generator is the synthetic generator label of the source (GeneratorOf).
+	Generator string
 }
 
+// Flags are the fit.Triplet flags of the triplet (decisions-stats §16 #16): x_spk, diag_ca_type, del_add_cooccur,
+// t3_ident, t3_diag, and t1_gate for a T1 triplet in the Δ(θ₀) ≥ 2 stratum (§9.1; realized Δ(θ₀) > 0).
+func (m Meta) Flags() []string {
+	var f []string
+	add := func(name string, ok bool) {
+		if ok {
+			f = append(f, name)
+		}
+	}
+	add("x_spk", m.Info.XSpk)
+	add("diag_ca_type", m.Info.DiagCAType)
+	add("del_add_cooccur", m.Info.DelAddCooccur)
+	add("t3_ident", m.Info.T3Ident)
+	add("t3_diag", m.Info.T3Diag)
+	add("t1_gate", m.Type == perturb.T1Monotone && m.Delta0 > 1e-9 && m.T1Stratum == perturb.T1High)
+	return f
+}
+
+// Generators are the synthetic generator labels; sources alternate between them (s mod 2), so the generator-stratified
+// bootstrap and CV of decisions-stats §6–§7 are exercised with the 1:1 balance of §15 item 2.
+var Generators = []string{"gen-a", "gen-b"}
+
+// GeneratorOf is the generator label of source s.
+func GeneratorOf(s int) string { return Generators[s%len(Generators)] }
+
+// JudgeFamily is the synthetic model-family label of judge j (fit.Judgment.Family).
+func JudgeFamily(j int) string { return fmt.Sprintf("judge-%d", j+1) }
+
 // InFit reports whether the triplet enters the fit by default (X-spk and diagnostic CA relabels are excluded,
-// decisions-stats §16 item 16; P-add/P-del co-occurrence is never produced but would be excluded too).
+// decisions-stats §16 item 16; P-add/P-del co-occurrence is never produced but would be excluded too). On simulated
+// data it equals fit.Filter with the default options (TestFitSetMatchesFilter).
 func (m Meta) InFit() bool { return !m.Info.XSpk && !m.Info.DiagCAType && !m.Info.DelAddCooccur }
 
 type world struct {
@@ -383,14 +496,19 @@ func Generate(cfg Config) ([]fit.Triplet, []fit.Judgment, []Meta, error) {
 					break
 				}
 			}
-			trips = append(trips, fit.Triplet{
+			m := Meta{Type: typ, EditsA: tp.A.Edits, EditsB: tp.B.Edits, Info: tp.PlanInfo, Target: target, Delta0: d0,
+				Generator: GeneratorOf(s)}
+			tr := fit.Triplet{
 				Source: s, Ref: src, A: tp.A.Graph, B: tp.B.Graph, SimA: sa, SimB: sb,
 				NegDiff: float64(tp.B.Neg - tp.A.Neg),
-			})
-			m := Meta{Type: typ, EditsA: tp.A.Edits, EditsB: tp.B.Edits, Info: tp.PlanInfo, Target: target, Delta0: d0}
+				Type:    string(typ), Generator: m.Generator,
+			}
 			if typ == perturb.T1Monotone {
 				m.T1Stratum = perturb.T1StratumOf(d0)
+				tr.T1Delta0 = d0
 			}
+			tr.Flags = m.Flags()
+			trips = append(trips, tr)
 			metas = append(metas, m)
 			thetas = append(thetas, th)
 		}
@@ -438,7 +556,7 @@ func Generate(cfg Config) ([]fit.Triplet, []fit.Judgment, []Meta, error) {
 						y = fit.Answer((int(y) + 1 + w.rng.IntN(2)) % 3)
 					}
 				}
-				js = append(js, fit.Judgment{Triplet: t, Judge: j, Order: o, Answer: y})
+				js = append(js, fit.Judgment{Triplet: t, Judge: j, Order: o, Answer: y, Family: JudgeFamily(j)})
 			}
 		}
 	}
