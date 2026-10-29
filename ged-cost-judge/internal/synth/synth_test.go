@@ -3,6 +3,8 @@ package synth
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -234,6 +236,114 @@ func TestVerificationProblems(t *testing.T) {
 		"pairs":[{"index":1,"relation":"MA","direction":"second_to_first"},{"index":2,"relation":"none","direction":"none"}],"fluency":"2","coherence":"4"}`)
 	if p := coll.Problems(q); len(p) != 2 || !strings.Contains(p[0], "untouched pair") || !strings.Contains(p[1], "fluency 2") {
 		t.Fatalf("problems %q", p)
+	}
+}
+
+// B1 (review-synth-impl): a relation-edit endpoint is referenced by its base text, so a realizer that negates the
+// attacker to make CA → RA fit, and reports the negated text, is read as "negated" and rejected; a content edit
+// (P-para) keeps the realizer's text as reference.
+func TestVerifyReferenceIsBaseForRelationEndpoints(t *testing.T) {
+	base := baseDiscussion()
+	e := base.Graph.Edges[1] // p4 attacks p3
+	target := perturb.Variant{Graph: base.Graph.Clone()}
+	target.Graph.Edges[1].Kind = ged.RA
+	edits := []perturb.Edit{{Kind: perturb.RTypeCA, Edge: &e, NewKind: ged.RA, Direction: "CA→RA"}, {Kind: perturb.PPara, Prop: "s0.p2", Strength: "weak"}}
+	out := base
+	out.Graph = base.Graph.Clone()
+	negated := "The studies showing higher footfall were not done in large cities."
+	para := "Without parking, shops lose passing trade."
+	for i, p := range out.Graph.Props {
+		switch p.ID {
+		case "s0.p4":
+			out.Graph.Props[i].Text = negated // the realizer's honest report of a negated endpoint
+		case "s0.p2":
+			out.Graph.Props[i].Text = para
+		}
+	}
+	q := BuildVerifyQuery(base, out, target, edits, nil, 0)
+	ref := map[string]PropExpect{}
+	for _, pe := range q.Props {
+		ref[pe.ID] = pe
+	}
+	if ref["s0.p4"].Ref != base.PropText("s0.p4") || ref["s0.p3"].Ref != base.PropText("s0.p3") || ref["s0.p2"].Ref != para {
+		t.Fatalf("references %+v", q.Props)
+	}
+	// The verifier reads the negated endpoint against the base text.
+	var props []string
+	for _, pe := range q.Props {
+		c := "same"
+		if pe.ID == "s0.p4" {
+			c = "negated"
+		}
+		props = append(props, fmt.Sprintf(`{"label":%q,"content":%q}`, pe.Label, c))
+	}
+	v := verification(t, `{"propositions":[`+strings.Join(props, ",")+`],"pairs":[{"index":1,"relation":"RA","direction":"second_to_first"}],"fluency":"4","coherence":"4"}`)
+	if q.Pairs[0].From != "s0.p4" {
+		t.Fatalf("pair %+v", q.Pairs[0])
+	}
+	p := v.Problems(q)
+	if len(p) != 1 || !strings.Contains(p[0], "p4 is stated with reversed polarity") {
+		t.Fatalf("polarity leak not caught: %q", p)
+	}
+}
+
+// M3 (review-synth-impl): an infeasible return names the edit; without a valid number it falls back to the side's
+// only refusable edit, and is an error when several could be meant.
+func TestRealizeInfeasibleEdit(t *testing.T) {
+	base := baseDiscussion()
+	ra, ca := base.Graph.Edges[0], base.Graph.Edges[1]
+	edits := []perturb.Edit{{Kind: perturb.XSpk}, {Kind: perturb.PPara, Prop: "s0.p1", Strength: "weak"},
+		{Kind: perturb.RRev, Edge: &ra}, {Kind: perturb.RTypeCA, Edge: &ca, NewKind: ged.MA, Direction: "CA→MA"}}
+	tv := perturb.Variant{Graph: base.Graph.Clone(), Edits: edits}
+	g := &Generator{Model: "m", Version: V2}
+	for _, c := range []struct {
+		n    int
+		want int
+		err  bool
+	}{{3, 3, false}, {2, 2, false}, {1, 0, true}, {0, 0, true}, {9, 0, true}} {
+		g.Client = realizeClient(map[string]any{"infeasible": true, "reason": "x", "infeasible_edit": c.n})
+		res, _, err := g.Realize(context.Background(), RealizeInput{Base: base, Target: tv, Edits: edits, Prefix: "s0."})
+		if c.err != (err != nil) || (!c.err && (!res.Infeasible || res.InfeasibleEdit != c.want)) {
+			t.Errorf("infeasible_edit %d: %+v %v", c.n, res, err)
+		}
+	}
+	// one refusable edit: a missing number is attributed to it
+	one := []perturb.Edit{{Kind: perturb.PPara, Prop: "s0.p1", Strength: "weak"}, {Kind: perturb.RTypeCA, Edge: &ca, NewKind: ged.MA, Direction: "CA→MA"}}
+	g.Client = realizeClient(map[string]any{"infeasible": true, "reason": "x"})
+	if res, _, err := g.Realize(context.Background(), RealizeInput{Base: base, Target: tv, Edits: one, Prefix: "s0."}); err != nil || res.InfeasibleEdit != 1 {
+		t.Fatalf("single refusable edit: %+v %v", res, err)
+	}
+}
+
+// M6: RealizeKey / VerifyKey are the cache keys of exactly the requests Realize / Verify send.
+func TestRequestKeys(t *testing.T) {
+	base := baseDiscussion()
+	v, edits := rdelVariant(base)
+	var sent []llm.Request
+	c := &llm.FuncClient{Fn: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		sent = append(sent, req)
+		return &llm.Response{Text: `{"infeasible": false}`, Model: req.Model}, nil
+	}}
+	g := &Generator{Client: c, Model: "m", Version: V2, Verifier: &Agent{Client: c, Model: "v", Family: "openai"}}
+	in := RealizeInput{Base: base, Target: v, Edits: edits, Prefix: "s0."}
+	_, _, _ = g.Realize(context.Background(), in)
+	q := BuildVerifyQuery(base, base, v, edits, nil, 1)
+	_, _, _, _ = g.Verify(context.Background(), base, q)
+	if len(sent) != 2 || g.RealizeKey(in) != llm.CacheKey(sent[0]) || g.VerifyKey(base, q) != llm.CacheKey(sent[1]) || sent[0].Schema == nil {
+		t.Fatalf("keys do not match the sent requests (%d sent)", len(sent))
+	}
+}
+
+// M7: a refused judgment is an error wrapping llm.ErrRefusal, never an answer.
+func TestParseJudgeAnswerRefusal(t *testing.T) {
+	if a, err := ParseJudgeAnswer(&llm.Response{Text: `{"answer":"same"}`}); err != nil || a != "same" {
+		t.Fatalf("%q %v", a, err)
+	}
+	if _, err := ParseJudgeAnswer(&llm.Response{FinishReason: llm.FinishRefusal, Model: "m"}); !errors.Is(err, llm.ErrRefusal) {
+		t.Fatalf("refusal: %v", err)
+	}
+	if _, err := ParseJudgeAnswer(&llm.Response{FinishReason: "max_tokens", Text: `{"answ`}); !errors.Is(err, llm.ErrTruncated) {
+		t.Fatalf("truncation: %v", err)
 	}
 }
 

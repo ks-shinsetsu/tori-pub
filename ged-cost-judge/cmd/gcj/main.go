@@ -4,7 +4,7 @@
 //	gcj -topics        stage 0: build the topic bank (API)
 //	gcj -import-qt30   build the QT30 transfer set from ../aif-with-llm/data/aifdb (no API)
 //	gcj -pilot         generate sources, variants and judgments, and estimate (API; -p2 for the P2 report)
-//	gcj -qc            P2 audits on the records of a -pilot run (API)
+//	gcj -audit         P2 data audits on the records of a -pilot run (API; -qc is reserved for the judge QC, plan §9.3)
 package main
 
 import (
@@ -36,7 +36,7 @@ func main() {
 		doSim     = flag.Bool("simulate", false, "合成の判定でパラメータの回収を確かめる（API 不使用）")
 		doPilot   = flag.Bool("pilot", false, "元の議論・変種・判定を作って推定まで通す（API を使う）")
 		doTopics  = flag.Bool("topics", false, "段階 0: 話題バンクを作る（領域ごとに 2 回、cos < 0.85 で重複除去。<out>/topics.json）")
-		doQC      = flag.Bool("qc", false, "P2 の監査（ラベルの正しさ 100 変種、均質さ 40 + 40 件、例示の再注釈）を前の -pilot の記録に対して行う（API を使う）")
+		doAudit   = flag.Bool("audit", false, "P2 のデータの監査（ラベルの正しさ 100 変種、均質さ 40 + 40 件、例示の再注釈）を前の -pilot の記録に対して行う（API を使う）")
 		doQT30    = flag.Bool("import-qt30", false, "QT30 の転移セットを作る（-aifdb から §1.4 の条件で。<out>/qt30_sources.json。API 不使用）")
 		sources   = flag.Int("sources", 750, "元の議論の数（1 件につき三つ組 4 つ）")
 		seed      = flag.Uint64("seed", 1, "乱数の seed")
@@ -47,7 +47,7 @@ func main() {
 		null      = flag.Bool("null", false, "合成: 真のコストを現行値にする")
 		verify    = flag.Bool("verify", false, "v1 のみ: 書き下しの検証つきの手順を使う（realize_v2 + verify_v1、T3 の割り付け）")
 		outDir    = flag.String("out", "out", "出力先")
-		budget    = flag.Float64("budget", -1, "API の費用の上限（USD）。超えたら以降の呼び出しを止め、バッチは投げる前に見込みを確かめる。負なら既定（-sources 750 で $260 = dataset-spec §4.5 の定価の 1.5 倍、件数に比例。-topics は $2、-qc は $5）")
+		budget    = flag.Float64("budget", -1, "API の費用の上限（USD）。超えたら以降の呼び出しを止め、バッチは投げる前に見込みを確かめる。負なら既定（-sources 750 で $260 = dataset-spec §4.5 の定価の 1.5 倍、件数に比例。-topics は $2、-audit は $5。0 は API を使わない）")
 		promptVer = flag.String("prompt-version", synth.V2, "v2: 改訂版のパイプライン（例示つきの生成、realize_v3、盲検の再注釈、2 系列）。v1: パイロット 2 の手順（luna のみ。応答のキャッシュで再現する）")
 		gens      = flag.String("generators", "gpt-5.6-luna,claude-sonnet-5-5", "v2: 生成モデル（半数ずつ。検証者は別系列の方）")
 		judges    = flag.String("judges", "gpt-5.6-luna,claude-sonnet-5-5,claude-haiku-5-5", "v2: 判定者（全三つ組 × 提示順 2。Anthropic はバッチ）")
@@ -83,8 +83,8 @@ func main() {
 		err = runTopics(po)
 	case *doQT30:
 		err = runImportQT30(po)
-	case *doQC:
-		err = runQC(po)
+	case *doAudit:
+		err = runAudit(po)
 	case *doPilot:
 		err = runPilot(po)
 	default:

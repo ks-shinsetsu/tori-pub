@@ -75,8 +75,10 @@ func TestPilotTripletV2RoundTrip(t *testing.T) {
 		Discarded:  []discardedPlan{{Plan: 0, Reason: "infeasible", Details: []string{"infeasible: needs a negation"}}},
 		Infeasible: []string{"needs a negation"},
 		Judgments: []judgmentRecord{{Judge: "claude-haiku-5-5", Family: "anthropic", Setting: "effort=low,thinking=adaptive", Order: -1,
-			Raw: "2", Answer: "A", CacheKey: "k", PromptHash: "h", Batch: true}},
+			Raw: "2", Answer: "A", CacheKey: "k", PromptHash: "h", Batch: true},
+			{Judge: "claude-sonnet-5-5", Family: "anthropic", Order: 1, CacheKey: "k2", Error: "refused", Refusal: true}},
 	}
+	zero := 0
 	diagInfo := &perturb.PlanInfo{Type: perturb.T3Contrast, T3Diag: true, DiagCAType: true, Swapped: true, PredDelta0: -0.4, EditsA: 1, EditsB: 1}
 	relabel := func(dir, reason string) editRecord {
 		from, to, _ := strings.Cut(dir, "→")
@@ -86,11 +88,13 @@ func TestPilotTripletV2RoundTrip(t *testing.T) {
 	diag := pilotTriplet{
 		Type: perturb.T3Contrast, ID: "s0003-t2", SourceID: "s0003", Generator: "gpt-5.6-luna", VerifierFamily: "anthropic",
 		Flags: tripletFlags{Pilot: true, Fit: []string{"diag_ca_type", "t3_diag", "pilot"}},
-		Plan:  diagInfo, SubPlanned: perturb.T3Diag, DiagInfeasible: 1, Replans: 1,
+		Plan:  diagInfo, SubPlanned: perturb.T3Diag, DiagInfeasible: 1, Replans: 1, ReplacementOf: "s0003-t0",
 		PlanA: []editRecord{{Edit: perturb.Edit{Kind: perturb.RDel, Edge: &ged.Edge{From: "s3.p2", To: "s3.p1", Kind: ged.RA}, Distance: &one, Degree: []int{1, 3}}}},
 		PlanB: []editRecord{relabel("RA→CA", "")},
 		Discarded: []discardedPlan{{Plan: 0, Info: diagInfo, Reason: "infeasible", DiagRedraw: true, Details: []string{"infeasible: would negate p3"},
-			EditsA: []editRecord{{Edit: perturb.Edit{Kind: perturb.PAdd, Prop: "n1", Degree: []int{0}}}}, EditsB: []editRecord{relabel("CA→RA", "would negate p3")}}},
+			EditsA: []editRecord{{Edit: perturb.Edit{Kind: perturb.PAdd, Prop: "n1", Degree: []int{0}}}}, EditsB: []editRecord{relabel("CA→RA", "would negate p3")},
+			B: &variantRecord{Base: "S", Attempts: []attemptRecord{{Infeasible: true, Reason: "would negate p3", InfeasibleEdit: &zero,
+				RealizeKey: "rk", RealizeRaw: `{"infeasible":true}`}}}}},
 		Infeasible: []string{"would negate p3"},
 	}
 	for _, tr := range []pilotTriplet{t1, diag} {
@@ -120,14 +124,14 @@ func TestPilotTripletV2RoundTrip(t *testing.T) {
 	b1, _ := json.Marshal(t1)
 	for _, want := range []string{`"t1_delta0":2.25`, `"t1_stratum":"\u003e=2"`, `"t1_target":"\u003e=2"`, `"exemplar_pair":7`, `"coh_a":4`,
 		`"distance":5`, `"degree":[1,2]`, `"edges_removed":2`, `"realized_cos":0.71`, `"infeasible":[{"kind":"P-del","infeasible":"no untouched isolated proposition"}]`,
-		`"pred_delta0":2.1`, `"n_edits_b":3`, `"judgments"`} {
+		`"pred_delta0":2.1`, `"n_edits_b":3`, `"judgments"`, `"refusal":true`} {
 		if !strings.Contains(string(b1), want) {
 			t.Errorf("T1 record lacks %s: %s", want, b1)
 		}
 	}
 	b2, _ := json.Marshal(diag)
 	for _, want := range []string{`"t3_diag":true`, `"diag_ca_type":true`, `"swapped":true`, `"t3_sub_planned":"diag"`, `"diag_infeasible":1`,
-		`"diag_redraw":true`, `"plan_info":{`, `"direction":"CA→RA","distance":1,"degree":[1,3],"infeasible":"would negate p3"`, `"new_kind":"CA","direction":"RA→CA"`} {
+		`"diag_redraw":true`, `"plan_info":{`, `"replacement_of":"s0003-t0"`, `"infeasible_edit":0`, `"realize_key":"rk"`, `"realize_raw":"{\"infeasible\":true}"`, `"direction":"CA→RA","distance":1,"degree":[1,3],"infeasible":"would negate p3"`, `"new_kind":"CA","direction":"RA→CA"`} {
 		if !strings.Contains(string(b2), want) {
 			t.Errorf("t3_diag record lacks %s: %s", want, b2)
 		}
@@ -168,6 +172,13 @@ type fakeLLM struct {
 	// caSeen marks the sources (by first utterance) whose first CA relabel was declared infeasible.
 	caSeen       map[string]bool
 	caInfeasible int
+	// rejectTopics: the first rejectTopics topics seen fail G1 on attempts 1–3 (exercises source replacement).
+	rejectTopics int
+	rejected     map[string]bool
+	// failRealize: every realization of the discussion containing this text is unusable (discarded slots).
+	failRealize string
+	// refuseEvery: every n-th judge request (by content hash) is refused (llm.FinishRefusal).
+	refuseEvery int
 }
 
 func newFakeLLM() *fakeLLM {
@@ -225,6 +236,9 @@ func (f *fakeLLM) complete(_ context.Context, req llm.Request) (*llm.Response, e
 		}
 		out = map[string]any{"questions": qs}
 	case "judge":
+		if h := sha256.Sum256([]byte(user)); f.refuseEvery > 0 && int(h[3])%f.refuseEvery == 0 {
+			return &llm.Response{FinishReason: llm.FinishRefusal, Model: req.Model + "-test"}, nil
+		}
 		out = map[string]string{"answer": fakeJudge(user)}
 	default:
 		return nil, fmt.Errorf("fake: unexpected tag %q", req.Tag)
@@ -262,7 +276,32 @@ func fakeJudge(user string) string {
 	return "2"
 }
 
+var (
+	reTopic   = regexp.MustCompile(`(?m)^Topic: (.*)$`)
+	reAttempt = regexp.MustCompile(`\(attempt (\d+)\)`)
+)
+
 func (f *fakeLLM) source(user string) any {
+	if f.rejectTopics > 0 {
+		topic := reTopic.FindStringSubmatch(user)[1]
+		attempt := 0
+		if m := reAttempt.FindStringSubmatch(user); m != nil {
+			attempt, _ = strconv.Atoi(m[1])
+			attempt--
+		}
+		f.mu.Lock()
+		if f.rejected == nil {
+			f.rejected = map[string]bool{}
+		}
+		if !f.rejected[topic] && len(f.rejected) < f.rejectTopics {
+			f.rejected[topic] = true
+		}
+		reject := f.rejected[topic] && attempt < 3
+		f.mu.Unlock()
+		if reject {
+			return map[string]any{} // unusable: rejected after the 3 attempts of the allocation
+		}
+	}
 	m := reTarget.FindStringSubmatch(user)
 	at := func(i int) int { n, _ := strconv.Atoi(m[i]); return n }
 	n, ra, ca, ma, iso := at(1), at(2), at(3), at(4), at(5)
@@ -401,6 +440,19 @@ func (f *fakeLLM) realize(user string) any {
 			}
 		}
 	}
+	if f.failRealize != "" && strings.Contains(user, f.failRealize) {
+		return map[string]any{"changes": []any{map[string]any{"utterance": 999, "op": "replace", "text": "x", "role": "edit"}}}
+	}
+	// editNo is the number of the first edit line containing what.
+	editNo := func(what string) int {
+		for _, e := range edits {
+			if strings.Contains(e, what) {
+				n, _ := strconv.Atoi(strings.SplitN(e, ".", 2)[0])
+				return n
+			}
+		}
+		return 0
+	}
 	nonce := f.next()
 	// The first diagnostic CA relabel on each source is declared infeasible, later ones are feasible (exercises the
 	// in-slot t3_diag redraw); every third other realization with a relabel declares it infeasible (the plan redraw).
@@ -413,10 +465,12 @@ func (f *fakeLLM) realize(user string) any {
 		}
 		f.mu.Unlock()
 		if first {
-			return map[string]any{"infeasible": true, "reason": "the CA relabel would negate a proposition", "changes": []any{}, "propositions": []any{}}
+			return map[string]any{"infeasible": true, "reason": "the CA relabel would negate a proposition", "infeasible_edit": editNo("expected answer for this edit"),
+				"changes": []any{}, "propositions": []any{}}
 		}
 	} else if nonce%3 == 0 && strings.Contains(user, "Change the relation") && !strings.Contains(user, "was rejected") {
-		return map[string]any{"infeasible": true, "reason": "the relabel needs a negation", "changes": []any{}, "propositions": []any{}}
+		return map[string]any{"infeasible": true, "reason": "the relabel needs a negation", "infeasible_edit": editNo("Change the relation"),
+			"changes": []any{}, "propositions": []any{}}
 	}
 	newText := map[string]string{}
 	var props []map[string]any
@@ -582,6 +636,7 @@ func TestPilotV2Offline(t *testing.T) {
 	f := newFakeLLM()
 	o := testOptions(t)
 	o.diagShare = 0.5 // enough t3_diag slots to see the in-slot redraw
+	f.refuseEvery = 40
 	env := testEnv(f, o.allModels())
 	null, _ := os.Open(os.DevNull)
 	stdout := os.Stdout
@@ -611,8 +666,14 @@ func TestPilotV2Offline(t *testing.T) {
 	if acc < 10 {
 		t.Fatalf("only %d of %d sources accepted: %+v", acc, len(srcs), srcs[0].Attempts)
 	}
-	if len(trips) != 4*acc {
-		t.Fatalf("%d triplet records for %d sources", len(trips), acc)
+	orig := 0
+	for _, tr := range trips {
+		if tr.ReplacementOf == "" {
+			orig++
+		}
+	}
+	if orig != 4*acc {
+		t.Fatalf("%d original triplet slots for %d sources", orig, acc)
 	}
 	ok, t1, judged := 0, 0, 0
 	for _, tr := range trips {
@@ -626,6 +687,13 @@ func TestPilotV2Offline(t *testing.T) {
 		}
 		if want := tripletFitFlags(tr.Type, *tr.Plan, *tr.Delta0, tr.T1Stratum, tr.Flags.QT30, tr.Flags.Pilot); !slices.Equal(tr.Flags.Fit, want) {
 			t.Errorf("%s: fit flags %v, want %v", tr.ID, tr.Flags.Fit, want)
+		}
+		for _, rec := range []*variantRecord{tr.RealizeA, tr.RealizeB} {
+			for _, a := range rec.Attempts {
+				if (a.Model != "" && (a.RealizeKey == "" || a.RealizeRaw == "")) || (a.Verification != nil && (a.VerifyKey == "" || a.VerifyRaw == "")) {
+					t.Errorf("%s: attempt without cache key or raw output: %+v", tr.ID, a)
+				}
+			}
 		}
 		if tr.Plan.Type != tr.Type || tr.Plan.EditsA != len(tr.PlanA) || tr.Plan.EditsB != len(tr.PlanB) || (tr.SubPlanned != "" && tr.Type != perturb.T3Contrast) {
 			t.Errorf("%s: plan %+v vs %d/%d edits, sub %q", tr.ID, tr.Plan, len(tr.PlanA), len(tr.PlanB), tr.SubPlanned)
@@ -662,9 +730,14 @@ func TestPilotV2Offline(t *testing.T) {
 			continue
 		}
 		var redraw *discardedPlan
+		nextA, nextB := tr.PlanA, tr.PlanB // the plan right after the redraw
 		for i := range tr.Discarded {
 			if tr.Discarded[i].DiagRedraw {
 				redraw = &tr.Discarded[i]
+				nextA, nextB = tr.PlanA, tr.PlanB
+				if i+1 < len(tr.Discarded) {
+					nextA, nextB = tr.Discarded[i+1].EditsA, tr.Discarded[i+1].EditsB
+				}
 			}
 		}
 		if redraw == nil || redraw.Reason != "infeasible" || redraw.Info == nil || !redraw.Info.T3Diag || tr.DiagFallback || tr.SubPlanned != perturb.T3Diag {
@@ -674,6 +747,18 @@ func TestPilotV2Offline(t *testing.T) {
 		refused := false
 		for _, e := range append(slices.Clone(redraw.EditsA), redraw.EditsB...) {
 			refused = refused || (e.Kind == perturb.RTypeCA && e.Infeasible != "" && e.Direction != "" && e.Distance != nil)
+		}
+		// only the relabel was redrawn: the estimation side is the same edit as in the refused plan
+		ordinary := func(a, b []editRecord) string {
+			side := a
+			if len(a) == 1 && a[0].Kind == perturb.RTypeCA {
+				side = b
+			}
+			js, _ := json.Marshal(side[0].Edit)
+			return string(js)
+		}
+		if ordinary(redraw.EditsA, redraw.EditsB) != ordinary(nextA, nextB) {
+			t.Errorf("%s: the estimation side changed in the relabel redraw", tr.ID)
 		}
 		if !refused || !slices.Contains(tr.Flags.Fit, "diag_ca_type") || !slices.Contains(tr.Flags.Fit, "t3_diag") || !hasKind(append(slices.Clone(tr.EditsA), tr.EditsB...), perturb.RTypeCA) {
 			t.Errorf("%s: refused relabel not recorded or flags %v", tr.ID, tr.Flags.Fit)
@@ -702,6 +787,20 @@ func TestPilotV2Offline(t *testing.T) {
 	}
 	if strings.Contains(string(md), "種別のタイを外した診断用の当てはめ") {
 		t.Error("P2 report prints the untied diagnostic fit (θ)")
+	}
+	refusals := 0
+	for _, tr := range trips {
+		for _, j := range tr.Judgments {
+			if j.Refusal {
+				refusals++
+				if j.Answer != "" || !strings.Contains(j.Error, "refused") {
+					t.Errorf("%s: refusal recorded as %+v", tr.ID, j)
+				}
+			}
+		}
+	}
+	if refusals == 0 || !strings.Contains(string(md), "判定の失敗") {
+		t.Errorf("refusals %d not reported", refusals)
 	}
 	t.Logf("sources %d/%d, triplets %d/%d (T1 %d, t3_diag redrawn %d), calls %v", acc, len(srcs), ok, len(trips), t1, diagOK, f.calls)
 }
@@ -829,7 +928,7 @@ func TestFitTripletsCopiesContract(t *testing.T) {
 }
 
 // Stage 0 and the QC audits run offline on the fake (the QC reads the records of an offline pilot).
-func TestTopicsAndQCOffline(t *testing.T) {
+func TestTopicsAndAuditOffline(t *testing.T) {
 	f := newFakeLLM()
 	o := testOptions(t)
 	o.sources = 6
@@ -851,10 +950,10 @@ func TestTopicsAndQCOffline(t *testing.T) {
 	if err := runPilotV2(context.Background(), o, env); err != nil {
 		t.Fatal(err)
 	}
-	if err := runQCEnv(context.Background(), o, env); err != nil {
+	if err := runAuditEnv(context.Background(), o, env); err != nil {
 		t.Fatal(err)
 	}
-	md, _ := os.ReadFile(filepath.Join(o.out, "qc.md"))
+	md, _ := os.ReadFile(filepath.Join(o.out, "audit.md"))
 	for _, want := range []string{"例示の再注釈", "ラベルの正しさの監査", "均質さの監視"} {
 		if !strings.Contains(string(md), want) {
 			t.Errorf("qc report lacks %q:\n%s", want, md)
@@ -925,5 +1024,216 @@ func TestDefaultBudget(t *testing.T) {
 	}
 	if b := defaultBudget(75); b != 26 {
 		t.Fatalf("75 → %v", b)
+	}
+}
+
+// Rejected sources are replaced until -sources are accepted (same spec, topic passed on, attempts continued), and
+// discarded slots are replaced on the same source with the same type, at most maxReplaceRounds times (review M2).
+func TestPilotV2Replenish(t *testing.T) {
+	f := newFakeLLM()
+	f.rejectTopics, f.failRealize = 2, "The src1 claim"
+	o := testOptions(t)
+	o.sources = 5
+	null, _ := os.Open(os.DevNull)
+	stdout := os.Stdout
+	os.Stdout = null
+	defer func() { os.Stdout = stdout }()
+	if err := runPilotV2(context.Background(), o, testEnv(f, o.allModels())); err != nil && !strings.Contains(err.Error(), "使える三つ組") {
+		t.Fatal(err)
+	}
+	srcs, err := readJSONL[sourceRecord](filepath.Join(o.out, "pilot_sources.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, replaced := 0, map[string]sourceRecord{}
+	for _, s := range srcs {
+		if s.Accepted {
+			acc++
+		}
+		if s.ReplacementOf != "" {
+			replaced[s.ReplacementOf] = s
+		}
+	}
+	if acc != o.sources || len(replaced) != 2 {
+		t.Fatalf("accepted %d of %d, replacements %d", acc, o.sources, len(replaced))
+	}
+	for _, s := range srcs {
+		r, ok := replaced[s.SourceID]
+		if !ok {
+			continue
+		}
+		if s.Accepted || s.ReplacedBy != r.SourceID || r.Spec.TopicID != s.Spec.TopicID || r.Attempts[0].Attempt != 3 || !r.Accepted {
+			t.Errorf("replacement of %s: %+v", s.SourceID, r)
+		}
+	}
+	trips, err := readJSONL[pilotTriplet](filepath.Join(o.out, "pilot_triplets.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]pilotTriplet{}
+	for _, tr := range trips {
+		byID[tr.ID] = tr
+	}
+	chains := 0
+	for _, tr := range trips {
+		if tr.ReplacementOf == "" || byID[tr.ReplacementOf].ReplacementOf != "" {
+			continue
+		}
+		// follow the chain of replacements of one discarded original slot
+		n, cur := 0, tr
+		for {
+			n++
+			prev := byID[cur.ReplacementOf]
+			if !strings.HasPrefix(prev.Err, "discarded") || prev.SourceID != cur.SourceID || prev.Type != cur.Type || prev.SubPlanned != cur.SubPlanned {
+				t.Errorf("%s replaces %s: %q", cur.ID, prev.ID, prev.Err)
+			}
+			var nextT *pilotTriplet
+			for i := range trips {
+				if trips[i].ReplacementOf == cur.ID {
+					nextT = &trips[i]
+				}
+			}
+			if nextT == nil {
+				break
+			}
+			cur = *nextT
+		}
+		if n > maxReplaceRounds {
+			t.Errorf("%d replacements of one slot", n)
+		}
+		chains++
+	}
+	if chains == 0 {
+		t.Fatal("no discarded slot was replaced")
+	}
+}
+
+// The relabel-only redraw keeps the other side, changes the relabel, skips refused relabels and gives up when none
+// is left.
+func TestRedrawRelabel(t *testing.T) {
+	src := parityGraph()
+	var d synth.Discussion
+	d.Graph = src
+	pp := &pipelineV2{sources: []*sourceRecord{{Discussion: d}}, catalogue: catalogueOptions(0)}
+	pp.srcOpts = []perturb.BuildOptions{pp.catalogue}
+	sub := perturb.T3Diag
+	o := pp.catalogue
+	o.Sub = &sub
+	rng := rand.New(rand.NewPCG(3, 4))
+	tp := perturb.DrawTriplet(rng, src, perturb.T3Contrast, o)
+	if !tp.T3Diag {
+		t.Fatalf("not a t3_diag plan: %+v", tp.PlanInfo)
+	}
+	onA := tp.A.Edits[0].Kind == perturb.RTypeCA
+	refused := map[string]bool{}
+	for n := 0; ; n++ {
+		np, ok := pp.redrawRelabel(rng, 0, tp, onA, refused)
+		if !ok {
+			want := 0 // RA and MA edges have one CA-involving direction, CA edges two
+			for _, e := range src.Edges {
+				want += map[string]int{ged.RA: 1, ged.MA: 1, ged.CA: 2}[e.Kind]
+			}
+			if n != want {
+				t.Fatalf("gave up after %d relabels, want %d", n, want)
+			}
+			break
+		}
+		ca, other, oldOther := np.B, np.A, tp.A
+		if onA {
+			ca, other, oldOther = np.A, np.B, tp.B
+		}
+		e := ca.Edits[0]
+		k := relabelKey(*e.Edge, e.Direction)
+		if e.Kind != perturb.RTypeCA || refused[k] || e.Distance == nil || len(e.Degree) != 2 || ca.Graph.Edges[slices.IndexFunc(ca.Graph.Edges, func(x ged.Edge) bool { return x.From == e.Edge.From && x.To == e.Edge.To })].Kind != e.NewKind {
+			t.Fatalf("relabel %+v (refused %v)", e, refused[k])
+		}
+		if !slices.EqualFunc(other.Edits, oldOther.Edits, func(a, b perturb.Edit) bool { return a.Kind == b.Kind && a.Prop == b.Prop }) || !np.T3Diag {
+			t.Fatal("the estimation side changed")
+		}
+		refused[k] = true
+	}
+}
+
+// Batch responses obtained before a whole-call error are metered and recorded (review M1); a reservation holds a
+// batch projection against request-by-request calls (review M5).
+type failingBatch struct {
+	f    *fakeLLM
+	keep int
+}
+
+func (c *failingBatch) Complete(ctx context.Context, req llm.Request) (*llm.Response, error) {
+	return c.f.complete(ctx, req)
+}
+
+func (c *failingBatch) CompleteBatch(ctx context.Context, reqs []llm.Request) ([]llm.BatchResult, error) {
+	out := make([]llm.BatchResult, len(reqs))
+	for i, r := range reqs {
+		if i < c.keep {
+			resp, err := c.f.complete(ctx, r)
+			out[i] = llm.BatchResult{Response: resp, Err: err}
+		} else {
+			out[i].Err = errors.New("canceled")
+		}
+	}
+	return out, errors.New("batch: polling failed")
+}
+
+func TestJudgePartialBatchAndReservation(t *testing.T) {
+	f := newFakeLLM()
+	o := testOptions(t)
+	o.judges = []string{"claude-sonnet-5-5"}
+	env := testEnv(f, o.allModels())
+	env.clients["claude-sonnet-5-5"] = &failingBatch{f: f, keep: 3}
+	env.cached = func(llm.Client, llm.Request) bool { return true } // nothing projected
+	r, err := newV2Run(o, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &sourceRecord{Discussion: synth.Discussion{Utterances: []synth.Utterance{{Speaker: "Host", Text: "hello"}}}}
+	var kept []*pilotTriplet
+	for i := range 3 {
+		d := synth.Discussion{Utterances: []synth.Utterance{{Speaker: "Host", Text: fmt.Sprintf("variant %d", i)}}}
+		kept = append(kept, &pilotTriplet{TextA: d, TextB: src.Discussion})
+	}
+	js, err := r.judgeAll(context.Background(), kept, []*sourceRecord{src})
+	if err == nil || !strings.Contains(err.Error(), "polling failed") || len(js) != 3 || r.mt.calls["judge"] != 3 {
+		t.Fatalf("err %v, %d judgments, %d metered", err, len(js), r.mt.calls["judge"])
+	}
+	recorded := 0
+	for _, tr := range kept {
+		for _, j := range tr.Judgments {
+			if j.Error == "" {
+				recorded++
+			}
+		}
+		if len(tr.Judgments) != 2 {
+			t.Fatalf("%d judgment records", len(tr.Judgments))
+		}
+	}
+	if recorded != 3 {
+		t.Fatalf("%d answered records, want 3", recorded)
+	}
+
+	m := newMeter(1)
+	m.reserve(0.6)
+	if m.check() != nil || m.remaining() > 0.41 {
+		t.Fatalf("remaining %v", m.remaining())
+	}
+	m.reserve(0.5)
+	if m.check() == nil {
+		t.Fatal("reserved projections do not count against the budget")
+	}
+	m.release(1.1)
+	if m.check() != nil || m.pending() != 0 {
+		t.Fatal("release")
+	}
+}
+
+// v2 refuses to let a generator's own family verify it (dataset-spec §4.1, review M4).
+func TestNoSelfVerification(t *testing.T) {
+	o := testOptions(t)
+	o.generators = []string{"claude-sonnet-5-5"}
+	if _, err := newV2Run(o, testEnv(newFakeLLM(), o.allModels())); err == nil || !strings.Contains(err.Error(), "another family") {
+		t.Fatalf("self-verification allowed: %v", err)
 	}
 }

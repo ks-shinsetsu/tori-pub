@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -106,10 +107,19 @@ func planRecord(tp perturb.TripletPlan) *perturb.PlanInfo {
 
 // attemptRecord is one realize (+ verify) attempt.
 type attemptRecord struct {
-	Attempt      int                  `json:"attempt"`
-	Error        string               `json:"error,omitempty"`
-	Infeasible   bool                 `json:"infeasible,omitempty"`
-	Reason       string               `json:"reason,omitempty"`
+	Attempt    int    `json:"attempt"`
+	Error      string `json:"error,omitempty"`
+	Infeasible bool   `json:"infeasible,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	// InfeasibleEdit is the index (into the edits this variant realized) of the edit the realizer returned
+	// infeasible (review-synth-impl M3).
+	InfeasibleEdit *int `json:"infeasible_edit,omitempty"`
+	// RealizeKey / VerifyKey are the cache keys of the attempt's requests; RealizeRaw / VerifyRaw the raw
+	// responses (dataset-spec §6, review M6).
+	RealizeKey   string               `json:"realize_key,omitempty"`
+	VerifyKey    string               `json:"verify_key,omitempty"`
+	RealizeRaw   string               `json:"realize_raw,omitempty"`
+	VerifyRaw    string               `json:"verify_raw,omitempty"`
 	Model        string               `json:"model,omitempty"`
 	Stats        synth.RealizeStats   `json:"stats"`
 	Changed      []int                `json:"changed_utterances,omitempty"`
@@ -174,6 +184,9 @@ type judgmentRecord struct {
 	Cached     bool      `json:"cached,omitempty"`
 	Batch      bool      `json:"batch,omitempty"`
 	Error      string    `json:"error,omitempty"`
+	// Refusal / Truncated mark an answer the judge refused or cut off (never a tie; review M7).
+	Refusal   bool `json:"refusal,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 	// VerifierFamilyEqJudgeFamily marks judgments whose judge family equals the triplet's verifier family (§12c).
 	VerifierFamilyEqJudgeFamily bool `json:"verifier_family_eq_judge_family"`
 }
@@ -263,6 +276,8 @@ type slotSpec struct {
 	// sub is the T3 sub-stratum of a v2 slot, drawn once per slot (dataset-spec §2.2; the T1 Δ(θ₀) stratum is
 	// drawn by perturb.DrawTriplet).
 	sub perturb.T3Sub
+	// replaces is the id of the discarded slot this one replaces (v2, review-synth-impl M2).
+	replaces string
 }
 
 type verifyPipeline struct {
@@ -566,6 +581,15 @@ func statKeys(recs []editRecord, qt30 bool) []string {
 	return out
 }
 
+// cellKind is the kind × direction part of an edit's statKeys cell ("R-type RA→MA", "R-add d5-8", "P-del").
+func cellKind(r editRecord) string {
+	k := statKeys([]editRecord{r}, false)
+	if len(k) == 0 {
+		return string(r.Kind)
+	}
+	return strings.TrimSuffix(k[0], " ×1") + " ×"
+}
+
 // v2Stats aggregates realization outcomes.
 type v2Stats struct {
 	mu sync.Mutex
@@ -587,7 +611,9 @@ type v2Stats struct {
 	// t3_diag (dataset-spec §2.2): slots planned in the sub-stratum, accepted with the relabel, fallen back to an
 	// ordinary T3 slot; diagDir counts relabel realizations and infeasible returns per direction.
 	diagSlots, diagAccepted, diagFallback int
-	diagDir                               map[string]*[2]int
+	// replaced counts replacement slots (review M2).
+	replaced int
+	diagDir  map[string]*[2]int
 	// discards counts plans and discarded plans per edit kind × generator (decisions-stats §15 item 8).
 	discards map[[2]string]*[2]int
 }
@@ -637,13 +663,27 @@ func (s *v2Stats) discardRows() [][]string {
 	return rows
 }
 
-func (s *v2Stats) record(recs []editRecord, rec *variantRecord, infeasible, qt30 bool, pair string) {
+// record counts one realized variant (recs: its edits). inf is the index of the edit the realizer returned
+// infeasible (-1 otherwise): an infeasible return is attributed to that edit's cell only (review M3).
+func (s *v2Stats) record(recs []editRecord, rec *variantRecord, inf int, qt30 bool, pair string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if qt30 {
 		pair = "QT30 " + pair
 	}
-	for _, k := range statKeys(recs, qt30) {
+	infeasible := inf >= 0
+	keys := statKeys(recs, qt30)
+	if infeasible {
+		keys = nil
+		if inf < len(recs) {
+			for _, k := range statKeys(recs, qt30) {
+				if strings.HasPrefix(strings.TrimPrefix(k, "QT30 "), cellKind(recs[inf])) {
+					keys = append(keys, k)
+				}
+			}
+		}
+	}
+	for _, k := range keys {
 		c := s.cells[k]
 		if c == nil {
 			c = &[5]int{}
@@ -661,7 +701,7 @@ func (s *v2Stats) record(recs []editRecord, rec *variantRecord, infeasible, qt30
 			c[3]++
 		}
 	}
-	for _, r := range recs {
+	for i, r := range recs {
 		if r.Kind != perturb.RTypeCA || qt30 {
 			continue
 		}
@@ -671,16 +711,12 @@ func (s *v2Stats) record(recs []editRecord, rec *variantRecord, infeasible, qt30
 			s.diagDir[r.Direction] = c
 		}
 		c[0]++
-		if infeasible {
+		if i == inf {
 			c[1]++
 		}
 	}
-	if infeasible {
-		for _, r := range recs {
-			if slices.Contains(synth.InfeasibleKinds, r.Kind) {
-				s.infeasible[string(r.Kind)+" "+r.Direction]++
-			}
-		}
+	if infeasible && inf < len(recs) {
+		s.infeasible[string(recs[inf].Kind)+" "+recs[inf].Direction]++
 	}
 	for _, a := range rec.Attempts {
 		for _, p := range a.Problems {
@@ -753,11 +789,12 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 			return synth.Discussion{}, rec, outcomeBudget
 		}
 		in.Attempt = r
+		key := g.RealizeKey(in)
 		res, resp, err := g.Realize(pp.ctx, in)
 		pp.mt.add("realize", resp)
-		att := attemptRecord{Attempt: r, Stats: res.Stats, Changed: res.ChangedUtterances}
+		att := attemptRecord{Attempt: r, Stats: res.Stats, Changed: res.ChangedUtterances, RealizeKey: key}
 		if resp != nil {
-			att.Model = resp.Model
+			att.Model, att.RealizeRaw = resp.Model, resp.Text
 			att.Usage = map[string]llm.Usage{"realize": resp.Usage}
 		}
 		if err != nil {
@@ -767,7 +804,8 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 			continue
 		}
 		if res.Infeasible {
-			att.Infeasible, att.Reason = true, res.Reason
+			idx := res.InfeasibleEdit
+			att.Infeasible, att.Reason, att.InfeasibleEdit = true, res.Reason, &idx
 			rec.Attempts = append(rec.Attempts, att)
 			return synth.Discussion{}, rec, outcomeInfeasible
 		}
@@ -784,10 +822,12 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 		}
 		q := synth.BuildVerifyQuery(in.Base, res.Discussion, in.Target, in.Edits, rng, 2)
 		att.Query = &q
+		att.VerifyKey = g.VerifyKey(res.Discussion, q)
 		ver, meta, resp, err := g.Verify(pp.ctx, res.Discussion, q)
 		pp.mt.add("verify", resp)
 		att.Verifier = &meta
 		if resp != nil {
+			att.VerifyRaw = resp.Text
 			if att.Usage == nil {
 				att.Usage = map[string]llm.Usage{}
 			}
@@ -894,29 +934,141 @@ func (t *pilotTriplet) setPlan(tp perturb.TripletPlan, k int) {
 	}
 }
 
+// infeasibleEdit is the index of the edit the realizer returned infeasible in rec (-1 if none).
+func infeasibleEdit(rec *variantRecord) int {
+	for _, a := range rec.Attempts {
+		if a.Infeasible && a.InfeasibleEdit != nil {
+			return *a.InfeasibleEdit
+		}
+	}
+	return -1
+}
+
 // failPlan keeps dp as a discarded plan after outcome o of the variant with edits side (recs: their records in
-// dp; the kinds the realizer may refuse get the infeasible reason). It reports whether the failure is a t3_diag
-// relabel returned infeasible, which is redrawn inside the slot (dataset-spec §2.2).
+// dp). An infeasible return is attributed to the edit the realizer named, which gets the reason (Edit.Infeasible).
+// It reports whether that edit is a t3_diag relabel, which is redrawn inside the slot (dataset-spec §2.2).
 func (t *pilotTriplet) failPlan(dp discardedPlan, o realizeOutcome, rec *variantRecord, side []perturb.Edit, recs []editRecord) bool {
 	dp.Reason, dp.Details = outcomeReason(o), lastProblems(rec)
 	if o == outcomeInfeasible {
 		reason := infeasibleReason(rec)
 		t.Infeasible = append(t.Infeasible, reason)
-		for i := range recs {
-			if slices.Contains(synth.InfeasibleKinds, recs[i].Kind) {
-				recs[i].Infeasible = reason
-			}
+		if i := infeasibleEdit(rec); i >= 0 && i < len(recs) && i < len(side) {
+			recs[i].Infeasible = reason
+			dp.DiagRedraw = dp.Info != nil && dp.Info.T3Diag && side[i].Kind == perturb.RTypeCA
 		}
-		dp.DiagRedraw = dp.Info != nil && dp.Info.T3Diag && hasKind(side, perturb.RTypeCA)
 	}
 	t.Discarded = append(t.Discarded, dp)
 	return dp.DiagRedraw
 }
 
-// slot builds one v2 triplet: ≤ 3 plans, plus ≤ 3 in-slot redraws of an infeasible t3_diag relabel.
+// relabelKey identifies a relabel (edge and direction) refused on a source.
+func relabelKey(e ged.Edge, dir string) string { return e.From + ">" + e.To + " " + dir }
+
+// relabelVariant is the one-edit variant of src that relabels edge e to newKind (a t3_diag side), with the edit's
+// record attributes as perturb computes them (utterance distance, endpoint degrees in src).
+func relabelVariant(src ged.Graph, e ged.Edge, newKind string, utt map[string]int) perturb.Variant {
+	g := src.Clone()
+	for i, x := range g.Edges {
+		if x == e {
+			g.Edges[i].Kind = newKind
+			break
+		}
+	}
+	deg := func(id string) int {
+		n := 0
+		for _, x := range src.Edges {
+			if x.From == id || x.To == id {
+				n++
+			}
+		}
+		return n
+	}
+	pos := func(id string) (int, bool) {
+		if utt != nil {
+			u, ok := utt[id]
+			return u, ok
+		}
+		i := slices.IndexFunc(src.Props, func(p ged.Prop) bool { return p.ID == id })
+		return i, i >= 0
+	}
+	edge := e
+	ed := perturb.Edit{Kind: perturb.RTypeCA, Edge: &edge, NewKind: newKind, Direction: perturb.DirectionLabel(e.Kind, newKind),
+		Degree: []int{deg(e.From), deg(e.To)}}
+	if ua, ok := pos(e.From); ok {
+		if ub, ok := pos(e.To); ok {
+			d := ua - ub
+			if d < 0 {
+				d = -d
+			}
+			ed.Distance = &d
+		}
+	}
+	v := perturb.Variant{Graph: g, Edits: []perturb.Edit{ed}, Origin: map[string]string{}, Changed: map[string]perturb.Edit{}}
+	for _, p := range g.Props {
+		v.Origin[p.ID] = p.ID
+	}
+	return v
+}
+
+// redrawRelabel replaces the relabel side of t3_diag plan tp (A when onA) by another CA-involving relabel on the
+// same source, keeping the other side (dataset-spec §2.2: "another edge or direction on the same source"). As in
+// the catalogue, the parameter pair (RA↔CA, CA↔MA) is drawn first and then a direction with an edge left; edge ×
+// direction combinations already refused are skipped. ok is false when none is left.
+func (pp *pipelineV2) redrawRelabel(rng *rand.Rand, source int, tp perturb.TripletPlan, onA bool, refused map[string]bool) (perturb.TripletPlan, bool) {
+	src := pp.sources[source].Discussion.Graph
+	o := pp.srcOpts[source]
+	pairs := slices.Clone(perturb.TypeCAPairs)
+	if rng.IntN(2) == 1 {
+		pairs[0], pairs[1] = pairs[1], pairs[0]
+	}
+	for _, dirs := range pairs {
+		var feasible [][2]string
+		var cands [][]ged.Edge
+		for _, d := range dirs {
+			var es []ged.Edge
+			for _, e := range src.Edges {
+				if e.Kind == d[0] && !refused[relabelKey(e, perturb.DirectionLabel(d[0], d[1]))] {
+					es = append(es, e)
+				}
+			}
+			if len(es) > 0 {
+				feasible, cands = append(feasible, d), append(cands, es)
+			}
+		}
+		if len(feasible) == 0 {
+			continue
+		}
+		i := rng.IntN(len(feasible))
+		e := cands[i][rng.IntN(len(cands[i]))]
+		v := relabelVariant(src, e, feasible[i][1], o.Utterance)
+		np := tp
+		np.Infeasible = slices.Clone(tp.Infeasible)
+		if onA {
+			np.A = v
+		} else {
+			np.B = v
+		}
+		np.PredDelta0 = math.NaN()
+		if d, err := perturb.Delta0(src, np.A, np.B, *o.Theta0, o.CosPred); err == nil {
+			np.PredDelta0 = d
+		}
+		return np, true
+	}
+	return tp, false
+}
+
+// realizedSide is a variant realized and verified in an earlier plan of the slot, reused when only the other
+// side's relabel is redrawn.
+type realizedSide struct {
+	d   synth.Discussion
+	rec *variantRecord
+}
+
+// slot builds one v2 triplet: ≤ 3 plans, plus ≤ 3 in-slot redraws of a t3_diag relabel returned infeasible
+// (only the relabel is redrawn; a side already realized is kept).
 func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
-	rng := rand.New(rand.NewPCG(pp.seed^0xc0ffee, uint64(s.source*4+s.k)))
 	sr := pp.sources[s.source]
+	rng := rand.New(rand.NewPCG(pp.seed^0xc0ffee^sourceSeed(sr.SourceID), uint64(s.k)))
 	src := sr.Discussion
 	g := pp.gens[sr.Generator]
 	t := newTripletRecord(sr, s)
@@ -928,25 +1080,46 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 	sub := s.sub
 	var lastReason string
 	plans := 0
+	var next *perturb.TripletPlan // a t3_diag plan with its relabel redrawn
+	var keptA *realizedSide       // A's realization, kept while only B's relabel is redrawn
+	refused := map[string]bool{}  // relabels returned infeasible on this source
 	for attempt := 0; plans < maxPlans; attempt++ {
 		if err := pp.mt.check(); err != nil {
 			t.Err = err.Error()
 			return t
 		}
 		t.Replans = attempt
-		tp := pp.drawPlan(rng, s, sub)
+		var tp perturb.TripletPlan
+		if next != nil {
+			tp, next = *next, nil
+		} else {
+			tp, keptA = pp.drawPlan(rng, s, sub), nil
+		}
 		t.setPlan(tp, s.k)
 		dp := discardedPlan{Plan: attempt, Info: t.Plan, EditsA: slices.Clone(t.PlanA), EditsB: slices.Clone(t.PlanB)}
-		// diagRedraw counts an infeasible t3_diag relabel; after the third on this source the slot is ordinary T3.
-		diagRedraw := func() {
+		// diagRedraw handles a relabel returned infeasible (the edit e on side A when onA): the relabel alone is
+		// redrawn; after maxDiagInfeasible returns on the source, or with no relabel left, the slot is ordinary T3.
+		diagRedraw := func(e perturb.Edit, onA bool) {
+			refused[relabelKey(*e.Edge, e.Direction)] = true
 			t.DiagInfeasible++
-			if t.DiagInfeasible >= maxDiagInfeasible {
-				sub, t.DiagFallback = perturb.T3Plain, true
+			if t.DiagInfeasible < maxDiagInfeasible {
+				if np, ok := pp.redrawRelabel(rng, s.source, tp, onA, refused); ok {
+					next = &np
+					return
+				}
 			}
+			sub, t.DiagFallback = perturb.T3Plain, true
 		}
 
-		da, recA, oa := pp.realizeVerifiedV2(g, synth.RealizeInput{Base: src, Target: tp.A, Edits: tp.A.Edits, Prefix: prefix}, rng)
-		pp.stats.record(t.PlanA, recA, oa == outcomeInfeasible, sr.QT30, pair)
+		var da synth.Discussion
+		var recA *variantRecord
+		oa := outcomeOK
+		if keptA != nil {
+			da, recA = keptA.d, keptA.rec
+		} else {
+			da, recA, oa = pp.realizeVerifiedV2(g, synth.RealizeInput{Base: src, Target: tp.A, Edits: tp.A.Edits, Prefix: prefix}, rng)
+			pp.stats.record(t.PlanA, recA, outcomeInfeasibleEdit(oa, recA), sr.QT30, pair)
+		}
 		dp.A = recA
 		if oa == outcomeBudget {
 			t.Err = errBudget.Error()
@@ -955,7 +1128,7 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 		if oa != outcomeOK {
 			lastReason = outcomeReason(oa)
 			if t.failPlan(dp, oa, recA, tp.A.Edits, dp.EditsA) {
-				diagRedraw()
+				diagRedraw(tp.A.Edits[infeasibleEdit(recA)], true)
 				continue
 			}
 			plans++
@@ -970,7 +1143,7 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 			sideB, extraRecs, dpRecsB = tp.B.Edits[n:], t.PlanB[n:], dp.EditsB[n:]
 		}
 		db, recB, ob := pp.realizeVerifiedV2(g, inB, rng)
-		pp.stats.record(extraRecs, recB, ob == outcomeInfeasible, sr.QT30, pair)
+		pp.stats.record(extraRecs, recB, outcomeInfeasibleEdit(ob, recB), sr.QT30, pair)
 		dp.B = recB
 		if ob == outcomeBudget {
 			t.Err = errBudget.Error()
@@ -979,7 +1152,11 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 		if ob != outcomeOK {
 			lastReason = outcomeReason(ob)
 			if t.failPlan(dp, ob, recB, sideB, dpRecsB) {
-				diagRedraw()
+				keptA = &realizedSide{da, recA}
+				diagRedraw(sideB[infeasibleEdit(recB)], false)
+				if next == nil {
+					keptA = nil
+				}
 				continue
 			}
 			plans++
@@ -1026,6 +1203,22 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 	}
 	t.Err = "discarded: 3 回の編集計画とも使えなかった（最後の理由: " + lastReason + "）"
 	return t
+}
+
+// outcomeInfeasibleEdit is the infeasible edit's index for the stats (-1 unless o is an infeasible return).
+func outcomeInfeasibleEdit(o realizeOutcome, rec *variantRecord) int {
+	if o != outcomeInfeasible {
+		return -1
+	}
+	return max(infeasibleEdit(rec), 0)
+}
+
+// sourceSeed is the slot RNG stream of a source, from its stable id (not from the accepted index, so that
+// acceptance and dedup do not change other sources' plans; review m1).
+func sourceSeed(id string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(id))
+	return h.Sum64()
 }
 
 // fitFlagList is the fit.Triplet flag list of the triplet (tripletFitFlags on its plan and realized Δ(θ₀)).
@@ -1180,6 +1373,39 @@ func (pp *pipelineV2) buildAll(rng *rand.Rand) ([]*pilotTriplet, error) {
 		trips[i] = pp.slot(slots[i])
 		return nil
 	})
+	// Replenish discarded slots (review-synth-impl M2, dataset-spec §2.3: the triplet counts are accepted ones): a
+	// replacement is the next slot of the same source with the same type and sub-stratum; ≤ maxReplaceRounds rounds,
+	// none once the budget is spent. Slots lost to the budget or to an embedding error are not replaced.
+	nextK := map[int]int{}
+	var pending []int
+	for i, t := range trips {
+		nextK[slots[i].source] = max(nextK[slots[i].source], slots[i].k+1)
+		if strings.HasPrefix(t.Err, "discarded") {
+			pending = append(pending, i)
+		}
+	}
+	for round := 0; round < maxReplaceRounds && len(pending) > 0 && pp.mt.check() == nil; round++ {
+		rs := make([]slotSpec, len(pending))
+		for j, i := range pending {
+			r := slots[i]
+			r.k, r.replaces = nextK[r.source], trips[i].ID
+			nextK[r.source]++
+			rs[j] = r
+		}
+		rt := make([]*pilotTriplet, len(rs))
+		parallel(len(rs), 8, func(j int) error {
+			rt[j] = pp.slot(rs[j])
+			return nil
+		})
+		pending = nil
+		for j, t := range rt {
+			if strings.HasPrefix(t.Err, "discarded") {
+				pending = append(pending, len(trips))
+			}
+			trips, slots = append(trips, t), append(slots, rs[j])
+			pp.stats.replaced++
+		}
+	}
 	pp.stats.slots = len(slots)
 	for i, t := range trips {
 		gen := pp.sources[slots[i].source].Generator
@@ -1215,8 +1441,8 @@ func (pp *pipelineV2) buildAll(rng *rand.Rand) ([]*pilotTriplet, error) {
 // writeVerifyReportV2 writes the G3/G4 summary (dataset-spec §7 first-pass gate per kind × direction × edit count).
 func writeVerifyReportV2(b *bytes.Buffer, s *v2Stats, kept []*pilotTriplet, d0 []float64) {
 	fmt.Fprintln(b, "\n## 書き下し（G3）と盲検の再注釈による検証（G4）")
-	fmt.Fprintf(b, "\n- 三つ組の枠 %d、採用 %d、破棄 %d（%.1f%%）。編集計画の引き直し 計 %d 回（infeasible を含む）。T1 の実現後 Δ(θ₀) < 0.5 による引き直し %d 回\n",
-		s.slots, s.accepted, s.discarded, pct(s.discarded, s.slots), s.replans, s.t1Dropped)
+	fmt.Fprintf(b, "\n- 三つ組の枠 %d（うち破棄した枠の補充 %d、最大 %d 巡）、採用 %d、破棄 %d（%.1f%%）。編集計画の引き直し 計 %d 回（infeasible を含む）。T1 の実現後 Δ(θ₀) < 0.5 による引き直し %d 回\n",
+		s.slots, s.replaced, maxReplaceRounds, s.accepted, s.discarded, pct(s.discarded, s.slots), s.replans, s.t1Dropped)
 	fmt.Fprintln(b, "- 合格の基準（dataset-spec §4.3）: 触れた命題がすべて same / paraphrase（削除したものは absent）、触れた組と抜き取りの 2 組の関係が意図どおり、流暢さ 3 以上。整合性は記録のみ")
 	fmt.Fprintln(b, "- 1 回目の合格率は infeasible を分母から外して数える（§7）。R-add の距離 5–8 は別の行（d5-8）")
 	fmt.Fprintln(b, "\n| 編集 × 方向 × 編集数 | 書き下し | 1 回目で合格 | 作り直しで合格 | 不合格 | infeasible |")

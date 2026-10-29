@@ -580,9 +580,10 @@ func ParseJudgeAnswer(resp *llm.Response) (string, error) {
 	if resp == nil {
 		return "", errors.New("synth: no judge response")
 	}
-	var out judgeOut
-	if err := json.Unmarshal([]byte(resp.Text), &out); err != nil {
-		return "", fmt.Errorf("synth: judge answer: %w (text=%.200q)", err, resp.Text)
+	// DecodeJSON reports a refusal as llm.ErrRefusal and a truncation as llm.ErrTruncated (never as a tie).
+	out, err := llm.DecodeJSON[judgeOut](resp)
+	if err != nil {
+		return "", fmt.Errorf("synth: judge answer: %w", err)
 	}
 	switch out.Answer {
 	case "1", "2", "same":

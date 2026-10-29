@@ -13,7 +13,7 @@ Every edit must be visible in the text. A careful reader who sees only the edite
 - Removing a proposition removes its wording from the discussion.
 - Adding a proposition adds its wording to an utterance or to a new utterance; it must not support, attack or restate anything.
 
-Infeasible edits. Some relation edits (changing a relation's kind, reversing a relation, adding a relation) cannot always be made without changing what a proposition claims, for example turning an objection into a reason usually requires negating it. If any requested relation edit cannot be made while keeping every proposition's claim as it is, do not force it: set `infeasible` to true, explain briefly in `reason`, and leave `changes` and `propositions` empty. Use this only for those three kinds of edit and only when it is genuinely impossible; it is not a way to skip a hard edit.
+Infeasible edits. Some relation edits (changing a relation's kind, reversing a relation, adding a relation) cannot always be made without changing what a proposition claims, for example turning an objection into a reason usually requires negating it. If any requested relation edit cannot be made while keeping every proposition's claim as it is, do not force it: set `infeasible` to true, give the number of that edit (as numbered under Edits) in `infeasible_edit`, explain briefly in `reason`, and leave `changes` and `propositions` empty. Otherwise set `infeasible_edit` to 0. Use this only for those three kinds of edit and only when it is genuinely impossible; it is not a way to skip a hard edit.
 
 Rules:
 

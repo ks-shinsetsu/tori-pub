@@ -55,8 +55,8 @@ func (v Verification) Coherent() int { return score15(v.Coherence) }
 type PropExpect struct {
 	Label string `json:"label"`
 	ID    string `json:"id"`
-	// Ref is the reference text: the intended variant text (the realizer's text for edited propositions,
-	// the base text otherwise; for T1's B, A's realized text).
+	// Ref is the reference text: the realizer's text for a proposition whose content an edit must change
+	// (P-para, P-shift, P-neg, P-add), the base text otherwise (for T1's B, A's realized text).
 	Ref string `json:"ref"`
 	// Present is false for a deleted proposition (P-del, P-del+R): it must be absent from the text.
 	Present bool `json:"present"`
@@ -82,9 +82,15 @@ type VerifyQuery struct {
 	Pairs []PairExpect `json:"pairs"`
 }
 
-// BuildVerifyQuery derives the touched elements of a realization: every proposition named by edits
-// (reference = intended text in out, or base text for a deleted one), every touched pair with its
-// intended relation in the variant graph, and up to nSample untouched variant edges (collateral check).
+// BuildVerifyQuery derives the touched elements of a realization: every proposition named by edits, every
+// touched pair with its intended relation in the variant graph, and up to nSample untouched variant edges
+// (collateral check).
+//
+// The reference text of a proposition is the realizer's text only when an edit must change its content
+// (P-para, P-shift, P-neg, P-add); every other proposition (the endpoints of relation edits, deleted ones and the
+// endpoints of sampled edges) is referenced by its base text, whose wording must stay (dataset-spec §2.1, §4.3).
+// So a realizer that negates an endpoint to make a relation fit, and reports the negated text, is read as
+// "negated" against the base text and rejected (the §5.1 polarity-leak control).
 func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []perturb.Edit, rng *rand.Rand, nSample int) VerifyQuery {
 	var q VerifyQuery
 	inTarget := map[string]bool{}
@@ -97,11 +103,17 @@ func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []pert
 			kindOf[e.Prop] = e.Kind
 		}
 	}
+	ref := func(id string) string {
+		if t := base.PropText(id); t != "" && !mustChangeText(edits, id) {
+			return t
+		}
+		return out.PropText(id)
+	}
 	label := map[string]string{}
 	for _, id := range TouchedProps(edits) {
 		pe := PropExpect{ID: id, Present: inTarget[id], Edit: kindOf[id]}
 		if pe.Present {
-			pe.Ref = out.PropText(id)
+			pe.Ref = ref(id)
 		} else {
 			pe.Ref = base.PropText(id)
 		}
@@ -150,7 +162,7 @@ func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []pert
 	for _, p := range q.Pairs {
 		for _, id := range []string{p.First, p.Second} {
 			if _, ok := label[id]; !ok {
-				pe := PropExpect{ID: id, Present: true, Ref: out.PropText(id), Label: fmt.Sprintf("C%d", len(q.Props)+1)}
+				pe := PropExpect{ID: id, Present: true, Ref: ref(id), Label: fmt.Sprintf("C%d", len(q.Props)+1)}
 				label[id] = pe.Label
 				q.Props = append(q.Props, pe)
 			}
@@ -289,9 +301,29 @@ func metaOf(a Agent, resp *llm.Response) VerifierMeta {
 // edited text d and the touched elements of q. It returns the verifier's family and model id.
 func (g *Generator) Verify(ctx context.Context, d Discussion, q VerifyQuery) (Verification, VerifierMeta, *llm.Response, error) {
 	a := g.verifier()
-	v, resp, err := llm.CompleteJSON[Verification](ctx, a.Client, a.request(g.VerifyPrompt.Body, q.userMessage(d), "verify"),
-		"verification_v2", "Per-proposition content, per-pair relation, fluency and coherence")
+	req, err := g.verifyRequest(d, q)
+	if err != nil {
+		return Verification{}, metaOf(a, nil), nil, err
+	}
+	v, resp, err := llm.CompleteJSON[Verification](ctx, a.Client, req, "", "")
 	return v, metaOf(a, resp), resp, err
+}
+
+// verifyRequest builds the verify_v2 request with its schema (exactly what is sent and cached).
+func (g *Generator) verifyRequest(d Discussion, q VerifyQuery) (llm.Request, error) {
+	req := g.verifier().request(g.VerifyPrompt.Body, q.userMessage(d), "verify")
+	schema, err := llm.SchemaFor[Verification]("verification_v2", "Per-proposition content, per-pair relation, fluency and coherence")
+	req.Schema = schema
+	return req, err
+}
+
+// VerifyKey is the cache key of the verify request for d and q.
+func (g *Generator) VerifyKey(d Discussion, q VerifyQuery) string {
+	req, err := g.verifyRequest(d, q)
+	if err != nil {
+		return ""
+	}
+	return RequestKey(g.verifier().Client, req)
 }
 
 // SourceAnnotation is the verifier's full blind re-annotation of a source (prompts/verify_source_v1.md).
