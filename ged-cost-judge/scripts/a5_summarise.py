@@ -3,8 +3,10 @@
 
 Usage:  python3 scripts/a5_summarise.py out/a5/*.jsonl   (standard library only)
 
-First the completed / timed-out seed counts per world (rows with "status":"timeout" written by gcj -max-seconds;
-they are excluded from every statistic). Then per world (and scenario) it prints:
+First the completed / not-completed seed counts per world: a row whose "status" is anything but "ok" (rows from
+before the field count as ok) is not completed and is excluded from every statistic; "status":"timeout" (written by
+gcj -max-seconds) is broken out, any other status is counted as such. Each unparsable line is reported as file:line.
+Then per world (and scenario) it prints:
   - decision-label frequencies per margin-judged parameter (combined label, and P(keep) / P(change) per fit);
   - verdict frequencies with Clopper-Pearson 95% intervals;
   - the false-change rate: P("change") for every parameter whose normalized truth lies inside the band
@@ -122,35 +124,46 @@ def table(head, rows, align=None):
 
 
 def load(paths):
-    """Returns ({(world, scenario): {seed: ok record}}, {(world, scenario): {seed: timeout record}}). The first ok
-    record of a seed wins; a timeout row counts only while the seed has no ok record (a successful retry replaces it)."""
+    """Returns ({(world, scenario): {seed: ok record}}, {(world, scenario): {seed: not-completed record}}). A row is
+    ok when its "status" is "ok" or absent (rows from before the field); any other status is not completed. The first
+    ok record of a seed wins; a not-completed row counts only while the seed has no ok record (a successful retry
+    replaces it), the first one of a seed winning."""
     worlds = OrderedDict()
-    timeouts = OrderedDict()
-    bad = 0
+    failed = OrderedDict()
+    bad = []
     for path in paths:
         with open(path, encoding="utf-8") as fh:
-            for line in fh:
+            for lineno, line in enumerate(fh, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     r = json.loads(line)
                 except json.JSONDecodeError:
-                    bad += 1  # a line cut by an interruption
+                    bad.append(f"{path}:{lineno}")  # e.g. a line cut by an interruption
                     continue
                 key = (r["world"], r.get("scenario", "reference"))
                 worlds.setdefault(key, OrderedDict())
-                timeouts.setdefault(key, OrderedDict())
-                if r.get("status", "ok") == "timeout":
-                    timeouts[key].setdefault(r["seed"], r)
+                failed.setdefault(key, OrderedDict())
+                if r.get("status", "ok") == "ok":
+                    worlds[key].setdefault(r["seed"], r)
                 else:
-                    worlds[key].setdefault(r["seed"], r)  # the first ok record of a seed wins
-    for key, seeds in timeouts.items():
+                    failed[key].setdefault(r["seed"], r)
+    for key, seeds in failed.items():
         for seed in [s for s in seeds if s in worlds[key]]:
             del seeds[seed]
+    for b in bad:
+        print(f"skipped unparsable line {b}")
     if bad:
-        print(f"(skipped {bad} unparsable line(s))\n")
-    return worlds, timeouts
+        print()
+    return worlds, failed
+
+
+def limit_text(x):
+    """-max-seconds as recorded in a row (absent in rows from before the field)."""
+    if x is None:
+        return "not recorded"
+    return "none" if x == 0 else f"{x} s"
 
 
 def covers(d, truth, level):
@@ -354,18 +367,22 @@ def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
-    worlds, timeouts = load(argv[1:])
+    worlds, failed = load(argv[1:])
     print("# Appendix A.5 summary")
-    print("\n### Completed and timed-out seeds per world (timeouts are excluded from every rate below)\n")
+    print("\n### Completed and not-completed seeds per world (not-completed seeds are excluded from every rate below)\n")
     rows = []
     for key, seeds in worlds.items():
-        to = timeouts.get(key, {})
-        att = len(seeds) + len(to)
-        lim = sorted({r.get("max_seconds") for r in to.values()})
-        rows.append([f"{key[0]} ({key[1]})", len(seeds), len(to), rate(len(to), att),
-                     ", ".join(str(x) for x in sorted(to)) or "—", ", ".join(f"{x} s" for x in lim) or "—"])
-    print(table(["world", "ok", "timeout", "timeout rate [CP 95%]", "timed-out seeds", "limit"], rows,
-                ["---", "--:", "--:", "---", "---", "---"]))
+        nc = failed.get(key, {})
+        att = len(seeds) + len(nc)
+        status = Counter(r.get("status") for r in nc.values())
+        other = ", ".join(f"{s} {c}" for s, c in sorted(status.items()) if s != "timeout") or "—"
+        lim = {r.get("max_seconds") for r in list(seeds.values()) + list(nc.values())}
+        rows.append([f"{key[0]} ({key[1]})", len(seeds), len(nc), status.get("timeout", 0), other, rate(len(nc), att),
+                     ", ".join(str(x) for x in sorted(nc)) or "—",
+                     ", ".join(limit_text(x) for x in sorted(lim, key=lambda x: (x is None, x or 0)))])
+    print(table(["world", "ok", "not completed", "of which timeout", "of which other status",
+                 "not-completed rate [CP 95%]", "not-completed seeds", "limit (-max-seconds, all rows)"], rows,
+                ["---", "--:", "--:", "--:", "---", "---", "---", "---"]))
     for (world, scenario), seeds in worlds.items():
         if seeds:
             summarise(world, scenario, list(seeds.values()))

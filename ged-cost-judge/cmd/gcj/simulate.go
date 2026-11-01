@@ -29,8 +29,8 @@ var (
 	simWorld      = flag.String("world", "", "合成: 真のコストの世界 null | edgeN | alt | single | mild（decisions-stats 付録 A.5。空: alt、-null なら null）")
 	simJSONL      = flag.String("jsonl", "", "合成: seed ごとの結果を 1 行の JSON で追記するファイル（A.5 の集計用）")
 	simDReps      = flag.Int("d-reps", 50, "合成: D のネストしたブートストラップの回数（0: D を計算しない。本番は 200）")
-	simMaxSeconds = flag.Int("max-seconds", 0, "合成: 1 seed（生成から推定まで）の壁時計の上限（秒、0: なし）。超えたら -jsonl に status \"timeout\" の行を書いて終了コード 3 で止まる（残りの seed も走らない）")
-	simApplyQC    = flag.Bool("apply-qc", false, "合成: 判定者の機械的 QC（§9、§9.1）で落ちた判定者を除いて推定する（既定は QC を計算・記録するだけ。参照シナリオの合成判定者は 3,000 三つ組で 3 人とも Krippendorff α < 0.4 で落ち、除くと推定できない）")
+	simMaxSeconds = flag.Int("max-seconds", 0, "合成: 1 seed（生成から推定まで）の壁時計の上限（秒、0: なし）。超えたら -jsonl に status \"timeout\" の行を書いて終了コード 3 で止まる（残りの seed も走らず、-out の Markdown レポートも書かない）")
+	simApplyQC    = flag.Bool("apply-qc", false, "合成: 判定者の機械的 QC（§9、§9.1）で落ちた判定者を除いて推定する（既定は QC を計算・記録するだけ。除外の基準は T1 の逆転ゲートとタイの割合で、Krippendorff α は記述のみ（§9、2026-10-29 改訂）。参照シナリオの合成判定者は通常 QC を通るが、元の議論が少ないと T1 ゲートで落ち、全員落ちると推定できない）")
 	simLOJO       = flag.Bool("lojo", false, "合成: 判定者を 1 人ずつ除いた判断の表も計算する（fit.Confirmatory の LOJO、各 B = -boot。1 seed の時間が約 4 倍）")
 	simDiagBoot   = flag.Int("diag-boot", 0, "合成: 種別のタイを外した診断用の当てはめのブートストラップ回数（0: 点推定のみ）")
 	simRandom     = flag.Float64("random", -1, "合成: 無作為に答える確率（負: シナリオの既定値）")
@@ -169,7 +169,7 @@ func runSimulate(o simOptions) error {
 		if *simMaxSeconds > 0 {
 			limit = max(0, time.Duration(*simMaxSeconds)*time.Second-time.Since(t0))
 		}
-		rec, rf, err, timedOut := runWithLimit(limit, func() (seedRecord, repFit, error) {
+		rec, rf, timedOut, err := runWithLimit(limit, func() (seedRecord, repFit, error) {
 			return fitSeed(w, o, c, trips, js, metas, cnt, r == 0)
 		})
 		if timedOut {
@@ -280,10 +280,10 @@ func timeoutRow(cfg simulate.Config, o simOptions, maxSeconds int, secs float64)
 
 // runWithLimit runs f and reports timedOut when it has not returned within limit (negative: no limit; 0: already
 // over). On a timeout f keeps running in its goroutine; the caller must end the process.
-func runWithLimit(limit time.Duration, f func() (seedRecord, repFit, error)) (seedRecord, repFit, error, bool) {
+func runWithLimit(limit time.Duration, f func() (seedRecord, repFit, error)) (seedRecord, repFit, bool, error) {
 	if limit < 0 {
 		rec, rf, err := f()
-		return rec, rf, err, false
+		return rec, rf, false, err
 	}
 	type out struct {
 		rec seedRecord
@@ -299,9 +299,9 @@ func runWithLimit(limit time.Duration, f func() (seedRecord, repFit, error)) (se
 	defer timer.Stop()
 	select {
 	case r := <-ch:
-		return r.rec, r.rf, r.err, false
+		return r.rec, r.rf, false, r.err
 	case <-timer.C:
-		return seedRecord{}, repFit{}, nil, true
+		return seedRecord{}, repFit{}, true, nil
 	}
 }
 
@@ -348,8 +348,10 @@ type seedRecord struct {
 	Judgments   int    `json:"judgments"`
 	Boot        int    `json:"boot"`
 	DReps       int    `json:"d_reps"`
-	M           jf     `json:"m"`
-	Git         string `json:"git"`
+	// MaxSeconds is -max-seconds (0: none), on every row because the limit censors which seeds complete.
+	MaxSeconds int    `json:"max_seconds"`
+	M          jf     `json:"m"`
+	Git        string `json:"git"`
 	// TrueAnchored is θ* (11 costs + θ_neg); TrueNorm the normalized truth (fit.NormLen entries); STrue its ŝ.
 	TrueAnchored []jf `json:"true_anchored"`
 	TrueNorm     []jf `json:"true_norm"`
@@ -606,7 +608,7 @@ func qcSummary(q fit.JudgeQCResult) string {
 func fitSeed(w io.Writer, o simOptions, cfg simulate.Config, trips []fit.Triplet, js []fit.Judgment, metas []simulate.Meta, cnt simulate.Counts, detail bool) (seedRecord, repFit, error) {
 	th0 := ged.Current()
 	rec := seedRecord{World: cfg.World, Seed: cfg.Seed, Status: "ok", Scenario: *simScenario, Sources: cfg.Sources, Triplets: len(trips),
-		Judgments: len(js), Boot: o.boot, DReps: *simDReps, M: jf(o.m), Git: gitDescribe()}
+		Judgments: len(js), Boot: o.boot, DReps: *simDReps, MaxSeconds: *simMaxSeconds, M: jf(o.m), Git: gitDescribe()}
 	truth := trueVec(cfg)
 	truthN, sTrue := fit.Normalize(truth, nil)
 	rec.TrueAnchored, rec.TrueNorm, rec.STrue = jfs(truth), jfs(truthN), jf(sTrue)

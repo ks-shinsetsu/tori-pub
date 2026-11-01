@@ -17,8 +17,8 @@ import (
 // TestSimJSONLRecord runs the per-seed analysis on a tiny data set and checks the JSONL line: the prefix the resume
 // check of scripts/a5_batch.sh greps for, NaN written as null, and the fields scripts/a5_summarise.py reads.
 func TestSimJSONLRecord(t *testing.T) {
-	defer func(d, b int) { *simDReps, *simDiagBoot = d, b }(*simDReps, *simDiagBoot)
-	*simDReps, *simDiagBoot = 2, 2
+	defer func(d, b, s int) { *simDReps, *simDiagBoot, *simMaxSeconds = d, b, s }(*simDReps, *simDiagBoot, *simMaxSeconds)
+	*simDReps, *simDiagBoot, *simMaxSeconds = 2, 2, 600
 	w, err := simulate.WorldByName(simulate.WorldEdgeN)
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +51,7 @@ func TestSimJSONLRecord(t *testing.T) {
 	}
 	for _, k := range []string{"params", "verdict", "verdict_missing", "d", "hypotheses", "fits", "boot_shares", "informative",
 		"min_informative", "neg_informative", "diag", "secs", "s_true", "s_hat_indep", "sigma_hat", "true_norm", "exclusions",
-		"excluded_judges", "qc_fail", "stability", "scale_identified", "s_hat_ci90"} {
+		"excluded_judges", "qc_fail", "stability", "scale_identified", "s_hat_ci90", "max_seconds"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("record lacks %q", k)
 		}
@@ -74,6 +74,9 @@ func TestSimJSONLRecord(t *testing.T) {
 	}
 	if margin != 6 || len(params) != 11 { // 13 normalized entries minus the two tied CA pairs
 		t.Fatalf("%d params, %d margin-judged", len(params), margin)
+	}
+	if m["max_seconds"] != 600.0 {
+		t.Fatalf("max_seconds %v, want the -max-seconds value 600", m["max_seconds"])
 	}
 	if rec.Verdict == "" || rec.D == nil || rec.D.Reps != 2 || rec.Diag == nil || len(rec.Diag.Pairs) != 2 {
 		t.Fatalf("verdict %q, D %+v, diag %+v", rec.Verdict, rec.D, rec.Diag)
@@ -123,19 +126,22 @@ func TestSimWorldName(t *testing.T) {
 // TestRunWithLimit: a seed that outlives -max-seconds is reported as a timeout and its row starts with the prefix the
 // batch script's resume check reads; a seed within the limit (or without one) passes its result through.
 func TestRunWithLimit(t *testing.T) {
+	// The slow seed blocks until the test ends, so its goroutines (left running by runWithLimit) then return.
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
 	slow := func() (seedRecord, repFit, error) {
-		time.Sleep(2 * time.Second)
+		<-release
 		return seedRecord{Verdict: "late"}, repFit{}, nil
 	}
 	fast := func() (seedRecord, repFit, error) { return seedRecord{Verdict: "v"}, repFit{}, errors.New("e") }
-	if _, _, _, to := runWithLimit(20*time.Millisecond, slow); !to {
+	if _, _, to, _ := runWithLimit(20*time.Millisecond, slow); !to {
 		t.Fatal("slow seed not timed out")
 	}
-	if _, _, _, to := runWithLimit(0, slow); !to {
+	if _, _, to, _ := runWithLimit(0, slow); !to {
 		t.Fatal("zero remaining time not timed out")
 	}
 	for _, lim := range []time.Duration{-1, time.Minute} {
-		rec, _, err, to := runWithLimit(lim, fast)
+		rec, _, to, err := runWithLimit(lim, fast)
 		if to || rec.Verdict != "v" || err == nil {
 			t.Fatalf("limit %v: %+v %v %v", lim, rec, err, to)
 		}
