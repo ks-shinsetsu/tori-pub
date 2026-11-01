@@ -29,6 +29,7 @@ var (
 	simWorld      = flag.String("world", "", "合成: 真のコストの世界 null | edgeN | alt | single | mild（decisions-stats 付録 A.5。空: alt、-null なら null）")
 	simJSONL      = flag.String("jsonl", "", "合成: seed ごとの結果を 1 行の JSON で追記するファイル（A.5 の集計用）")
 	simDReps      = flag.Int("d-reps", 50, "合成: D のネストしたブートストラップの回数（0: D を計算しない。本番は 200）")
+	simMaxSeconds = flag.Int("max-seconds", 0, "合成: 1 seed（生成から推定まで）の壁時計の上限（秒、0: なし）。超えたら -jsonl に status \"timeout\" の行を書いて終了コード 3 で止まる（残りの seed も走らない）")
 	simApplyQC    = flag.Bool("apply-qc", false, "合成: 判定者の機械的 QC（§9、§9.1）で落ちた判定者を除いて推定する（既定は QC を計算・記録するだけ。参照シナリオの合成判定者は 3,000 三つ組で 3 人とも Krippendorff α < 0.4 で落ち、除くと推定できない）")
 	simLOJO       = flag.Bool("lojo", false, "合成: 判定者を 1 人ずつ除いた判断の表も計算する（fit.Confirmatory の LOJO、各 B = -boot。1 seed の時間が約 4 倍）")
 	simDiagBoot   = flag.Int("diag-boot", 0, "合成: 種別のタイを外した診断用の当てはめのブートストラップ回数（0: 点推定のみ）")
@@ -164,7 +165,26 @@ func runSimulate(o simOptions) error {
 		if r == 0 {
 			w = &body
 		}
-		rec, rf, err := fitSeed(w, o, c, trips, js, metas, cnt, r == 0)
+		limit := time.Duration(-1) // no limit
+		if *simMaxSeconds > 0 {
+			limit = max(0, time.Duration(*simMaxSeconds)*time.Second-time.Since(t0))
+		}
+		rec, rf, err, timedOut := runWithLimit(limit, func() (seedRecord, repFit, error) {
+			return fitSeed(w, o, c, trips, js, metas, cnt, r == 0)
+		})
+		if timedOut {
+			// fit.Confirmatory takes no context, so the only way to stop it is to end the process: record the
+			// timeout (scripts/a5_summarise.py counts these rows per world) and exit with code 3.
+			fmt.Fprintf(os.Stderr, "  seed %d: TIMEOUT after %.0fs (-max-seconds %d)\n", c.Seed, time.Since(t0).Seconds(), *simMaxSeconds)
+			if jsonl != nil {
+				if err := writeJSONLine(jsonl, timeoutRow(c, o, *simMaxSeconds, time.Since(t0).Seconds())); err != nil {
+					return err
+				}
+				jsonl.Sync()
+				jsonl.Close()
+			}
+			os.Exit(3)
+		}
 		if err != nil {
 			return fmt.Errorf("seed %d: %w", c.Seed, err)
 		}
@@ -175,11 +195,7 @@ func runSimulate(o simOptions) error {
 		recs = append(recs, rec)
 		fits = append(fits, rf)
 		if jsonl != nil {
-			line, err := json.Marshal(rec)
-			if err != nil {
-				return err
-			}
-			if _, err := jsonl.Write(append(line, '\n')); err != nil { // one write per line (O_APPEND)
+			if err := writeJSONLine(jsonl, rec); err != nil {
 				return err
 			}
 		}
@@ -239,6 +255,66 @@ type repFit struct {
 // One seed: the confirmatory analysis (fit.Confirmatory), the untied diagnostic fit, the per-seed JSONL record.
 // ---------------------------------------------------------------------------------------------------------------
 
+// timeoutRecord is the JSONL line of a seed stopped by -max-seconds.
+type timeoutRecord struct {
+	World      string `json:"world"`
+	Seed       uint64 `json:"seed"`
+	Status     string `json:"status"`
+	Scenario   string `json:"scenario"`
+	Sources    int    `json:"sources"`
+	Boot       int    `json:"boot"`
+	DReps      int    `json:"d_reps"`
+	MaxSeconds int    `json:"max_seconds"`
+	Git        string `json:"git"`
+	Secs       struct {
+		Total jf `json:"total"`
+	} `json:"secs"`
+}
+
+func timeoutRow(cfg simulate.Config, o simOptions, maxSeconds int, secs float64) timeoutRecord {
+	r := timeoutRecord{World: cfg.World, Seed: cfg.Seed, Status: "timeout", Scenario: *simScenario, Sources: cfg.Sources,
+		Boot: o.boot, DReps: *simDReps, MaxSeconds: maxSeconds, Git: gitDescribe()}
+	r.Secs.Total = jf(secs)
+	return r
+}
+
+// runWithLimit runs f and reports timedOut when it has not returned within limit (negative: no limit; 0: already
+// over). On a timeout f keeps running in its goroutine; the caller must end the process.
+func runWithLimit(limit time.Duration, f func() (seedRecord, repFit, error)) (seedRecord, repFit, error, bool) {
+	if limit < 0 {
+		rec, rf, err := f()
+		return rec, rf, err, false
+	}
+	type out struct {
+		rec seedRecord
+		rf  repFit
+		err error
+	}
+	ch := make(chan out, 1)
+	go func() {
+		rec, rf, err := f()
+		ch <- out{rec, rf, err}
+	}()
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.rec, r.rf, r.err, false
+	case <-timer.C:
+		return seedRecord{}, repFit{}, nil, true
+	}
+}
+
+// writeJSONLine writes v as one line in a single write (the file is opened O_APPEND).
+func writeJSONLine(f io.Writer, v any) error {
+	line, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(append(line, '\n'))
+	return err
+}
+
 // jf is a float that marshals NaN and ±Inf as null.
 type jf float64
 
@@ -261,8 +337,10 @@ func jfs(v []float64) []jf {
 // seedRecord is one JSONL line (the A.5 analysis input; scripts/a5_summarise.py). The line starts with
 // {"world":…,"seed":…, which the resume check of scripts/a5_batch.sh relies on.
 type seedRecord struct {
-	World       string `json:"world"`
-	Seed        uint64 `json:"seed"`
+	World string `json:"world"`
+	Seed  uint64 `json:"seed"`
+	// Status is "ok" here and "timeout" in a timeoutRecord (third key: the batch script's resume check reads it).
+	Status      string `json:"status"`
 	Scenario    string `json:"scenario"`
 	Sources     int    `json:"sources"`
 	Triplets    int    `json:"triplets"`
@@ -527,7 +605,7 @@ func qcSummary(q fit.JudgeQCResult) string {
 // report (io.Discard except for the first seed); detail adds the descriptive tables that cost extra fits.
 func fitSeed(w io.Writer, o simOptions, cfg simulate.Config, trips []fit.Triplet, js []fit.Judgment, metas []simulate.Meta, cnt simulate.Counts, detail bool) (seedRecord, repFit, error) {
 	th0 := ged.Current()
-	rec := seedRecord{World: cfg.World, Seed: cfg.Seed, Scenario: *simScenario, Sources: cfg.Sources, Triplets: len(trips),
+	rec := seedRecord{World: cfg.World, Seed: cfg.Seed, Status: "ok", Scenario: *simScenario, Sources: cfg.Sources, Triplets: len(trips),
 		Judgments: len(js), Boot: o.boot, DReps: *simDReps, M: jf(o.m), Git: gitDescribe()}
 	truth := trueVec(cfg)
 	truthN, sTrue := fit.Normalize(truth, nil)

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/simulate"
@@ -39,7 +42,7 @@ func TestSimJSONLRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(line), `{"world":"edgeN","seed":7,`) {
+	if !strings.HasPrefix(string(line), `{"world":"edgeN","seed":7,"status":"ok",`) {
 		t.Fatalf("record prefix %.60s", line)
 	}
 	var m map[string]any
@@ -114,5 +117,37 @@ func TestSimWorldName(t *testing.T) {
 		if (err != nil) != c.err || got != c.want {
 			t.Errorf("-world %q -null %v: %q, %v", c.world, c.null, got, err)
 		}
+	}
+}
+
+// TestRunWithLimit: a seed that outlives -max-seconds is reported as a timeout and its row starts with the prefix the
+// batch script's resume check reads; a seed within the limit (or without one) passes its result through.
+func TestRunWithLimit(t *testing.T) {
+	slow := func() (seedRecord, repFit, error) {
+		time.Sleep(2 * time.Second)
+		return seedRecord{Verdict: "late"}, repFit{}, nil
+	}
+	fast := func() (seedRecord, repFit, error) { return seedRecord{Verdict: "v"}, repFit{}, errors.New("e") }
+	if _, _, _, to := runWithLimit(20*time.Millisecond, slow); !to {
+		t.Fatal("slow seed not timed out")
+	}
+	if _, _, _, to := runWithLimit(0, slow); !to {
+		t.Fatal("zero remaining time not timed out")
+	}
+	for _, lim := range []time.Duration{-1, time.Minute} {
+		rec, _, err, to := runWithLimit(lim, fast)
+		if to || rec.Verdict != "v" || err == nil {
+			t.Fatalf("limit %v: %+v %v %v", lim, rec, err, to)
+		}
+	}
+	cfg := simulate.Default()
+	cfg.Seed = 12
+	var b bytes.Buffer
+	if err := writeJSONLine(&b, timeoutRow(cfg, simOptions{boot: 200}, 60, 61.5)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(b.String(), `{"world":"alt","seed":12,"status":"timeout",`) || !strings.HasSuffix(b.String(), "}\n") ||
+		!strings.Contains(b.String(), `"max_seconds":60`) || !strings.Contains(b.String(), `"secs":{"total":61.5}`) {
+		t.Fatalf("timeout row %s", b.String())
 	}
 }
