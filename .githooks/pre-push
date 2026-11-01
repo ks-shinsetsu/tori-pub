@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Enabled with: git config core.hooksPath .githooks
+# Scans every commit that the push would make public (for a new branch: the commits not on any remote yet).
+set -euo pipefail
+scan="$(git rev-parse --show-toplevel)/.githooks/secrets-scan.sh"
+zero=0000000000000000000000000000000000000000
+while read -r _ local_sha _ remote_sha; do
+	[ "$local_sha" = "$zero" ] && continue # deleting a remote ref
+	if [ "$remote_sha" = "$zero" ]; then
+		base=$(git rev-list "$local_sha" --not --remotes | tail -n 1)
+		[ -z "$base" ] && continue # nothing new
+		range="$base^..$local_sha"
+		git rev-parse -q --verify "$base^" >/dev/null || range="$local_sha" # root commit
+	else
+		range="$remote_sha..$local_sha"
+	fi
+	"$scan" range "$range"
+done

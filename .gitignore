@@ -8,3 +8,6 @@
 *.swp
 
 docs/
+
+# Claude Code agent worktrees
+.claude/worktrees/
