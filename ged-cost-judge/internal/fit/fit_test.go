@@ -2,10 +2,12 @@ package fit
 
 import (
 	"math"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/stats"
 )
 
 // TestGaussHermite checks the quadrature rule integrates e^{−x²} and x²e^{−x²}.
@@ -111,6 +113,9 @@ func TestRecovery(t *testing.T) {
 	}
 	t.Logf("fit in %s: outer=%d conv=%v cycled=%v spread=%.3f nll=%.1f", time.Since(start), res.Outer, res.Converged, res.Cycled, res.StartSpread, res.NegLogLik)
 	t.Logf("θ̂ = %.2f (truth %.2f) neg %.2f", res.Params.Theta, truth, res.Params.ThetaNeg)
+	if !res.Valid() {
+		t.Errorf("full-data fit is not a valid iterate: converged %v cycled %v (spread %.4f) capped %v inner %v", res.Converged, res.Cycled, res.CycleSpread, res.Capped, res.InnerConverged)
+	}
 	for _, p := range []int{ged.PNodeMissing, ged.PNodeExtra, ged.PEdgeMissing, ged.PTypeRAMA, ged.PDirection} {
 		if math.Abs(res.Params.Theta[p]-truth[p]) > 0.3 {
 			t.Errorf("param %d: got %.3f want %.3f", p, res.Params.Theta[p], truth[p])
@@ -145,7 +150,87 @@ func TestRecovery(t *testing.T) {
 		t.Errorf("%d of 5 intervals miss the truth", miss)
 	}
 	sh := Summarise(br.Meta)
-	t.Logf("shares: cycled %.2f capped %.2f notconv %.2f cold %d", sh.Cycled, sh.Capped, sh.NotConverged, sh.Cold)
+	t.Logf("shares: cycled %.2f capped %.2f invalid %.2f notconv %.2f cold %d", sh.Cycled, sh.Capped, sh.Invalid, sh.NotConverged, sh.Cold)
+	if sh.Invalid > 0.05 {
+		t.Errorf("%.0f%% of the replicates are not valid iterates (decisions §11.2 floor 5%%)", 100*sh.Invalid)
+	}
+}
+
+// TestValidIterate: the §11.2 validity of an iterate — a fixed point or stationary objective, a cycle narrower than
+// CycleTol, but not a wider cycle, a cap or an inner solver that stopped on a cap — and its summary over replicates.
+func TestValidIterate(t *testing.T) {
+	cases := []struct {
+		r    Result
+		want bool
+	}{
+		{Result{Converged: true, InnerConverged: true}, true},
+		{Result{Converged: true, InnerConverged: false}, false},
+		{Result{Cycled: true, CycleSpread: CycleTol / 2, InnerConverged: true}, true},
+		{Result{Cycled: true, CycleSpread: CycleTol, InnerConverged: true}, false},
+		{Result{Capped: true, InnerConverged: true}, false},
+	}
+	var meta []RepMeta
+	for i, c := range cases {
+		if got := c.r.Valid(); got != c.want {
+			t.Errorf("case %d: Valid() = %v, want %v", i, got, c.want)
+		}
+		meta = append(meta, metaOf(c.r, false))
+		if got := meta[i].Valid(); got != c.want {
+			t.Errorf("case %d: RepMeta.Valid() = %v, want %v", i, got, c.want)
+		}
+	}
+	meta = append(meta, RepMeta{Err: "boom"})
+	// Invalid: cases 1, 3, 4 and the failed one; the old NotConverged metric also counts the narrow cycle (case 2).
+	if sh := Summarise(meta); math.Abs(sh.Invalid-4.0/6) > 1e-12 || math.Abs(sh.NotConverged-5.0/6) > 1e-12 || math.Abs(sh.Cycled-2.0/6) > 1e-12 || math.Abs(sh.Capped-1.0/6) > 1e-12 {
+		t.Errorf("shares: %+v", sh)
+	}
+	if got, want := validMask(meta), []bool{true, false, true, false, false, false}; !slices.Equal(got, want) {
+		t.Errorf("validMask = %v, want %v", got, want)
+	}
+	// The replicate floor counts valid replicates per column without double counting a replicate that has no row.
+	rows := [][]float64{{1}, {1}, {1}, {1}, {1}, nil}
+	d := stats.Decide(stats.DecisionInput{Est: 1, Boot: columnOf(rows, 0), Valid: validMask(meta), Theta0: 1, M: 0.25, TotalReps: len(rows)})
+	if d.Reps != 5 || d.Valid != 2 {
+		t.Errorf("reps %d valid %d, want 5 and 2", d.Reps, d.Valid)
+	}
+}
+
+// TestQCSetIsFixed (re-review N3): the judge QC runs on every triplet but pilot and qt30, whatever the fit's own
+// exclusions are, so a sensitivity fit cannot move the gate.
+func TestQCSetIsFixed(t *testing.T) {
+	trips, js := Synthetic(13, SyntheticOptions{Sources: 60, Sigma: 1})
+	gate := 0
+	for i := range trips {
+		if trips[i].Type != "T1" || trips[i].T1Delta0 < 2 {
+			continue
+		}
+		switch gate % 4 {
+		case 0:
+			trips[i].Flags = append(trips[i].Flags, "pilot")
+		case 1:
+			trips[i].Flags = append(trips[i].Flags, "qt30")
+		case 2:
+			trips[i].Flags = append(trips[i].Flags, "sens") // a flag a sensitivity fit might exclude
+		}
+		gate++
+	}
+	if gate < 4 {
+		t.Fatalf("only %d gate triplets", gate)
+	}
+	want := JudgeQCStats(trips, js, []string{"a", "b", "c"}, QCOptions{}).NT - (gate+3)/4 - (gate+2)/4
+	co := ConfirmOptions{B: 4, SkipMixed: true, SkipD: true, SkipLOJO: true, RandomStarts: -1, MinInformative: map[int]int{}, MinGateTriplets: -1}
+	opts := Options{Judges: 3, Theta0: ged.Current()}
+	for _, excl := range [][]string{nil, append(slices.Clone(DefaultExclude), "sens"), {}} {
+		o := opts
+		o.Exclude = excl
+		res, err := Confirmatory(trips, js, o, co)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.QC.NT != want {
+			t.Errorf("Exclude %v: gate n_T = %d, want %d", excl, res.QC.NT, want)
+		}
+	}
 }
 
 // TestMixedSigmaZero (deliverable d): FitMixed with σ fixed near 0 agrees with the independence fit.

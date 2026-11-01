@@ -377,10 +377,13 @@ type seedRecord struct {
 		Indep shareRecord `json:"indep"`
 		Mixed shareRecord `json:"mixed"`
 	} `json:"boot_shares"`
-	Hypotheses     []hypRecord `json:"hypotheses"`
-	Verdict        string      `json:"verdict"`
-	VerdictMissing []string    `json:"verdict_missing"`
-	D              *dRecord    `json:"d"`
+	Hypotheses []hypRecord `json:"hypotheses"`
+	// Verdict is the §3 verdict after every cap (the simulate path always carries deviations, so it is at most
+	// "not contradicted"); VerdictUncapped is the verdict before the deviation cap (data-dependent caps applied).
+	Verdict         string   `json:"verdict"`
+	VerdictUncapped string   `json:"verdict_uncapped"`
+	VerdictMissing  []string `json:"verdict_missing"`
+	D               *dRecord `json:"d"`
 	// Informative are the n_p of §15.3 on the fit set at θ₀ (tied columns folded), keyed by parameter name, with the
 	// floor used (fit.DefaultMinInformative scaled to the design size below 3,000 triplets) in MinInformative.
 	Informative    map[string]int `json:"informative"`
@@ -439,20 +442,24 @@ type paramRecord struct {
 }
 
 type fitFlags struct {
-	Converged      bool     `json:"converged"`
-	Cycled         bool     `json:"cycled"`
-	Capped         bool     `json:"capped"`
-	InnerConverged bool     `json:"inner_converged"`
-	Outer          int      `json:"outer"`
-	Boundary       []string `json:"boundary"`
-	Divergent      []string `json:"divergent"`
-	StartSpread    jf       `json:"start_spread"`
-	StartNLL       []jf     `json:"start_nll"`
-	NLL            jf       `json:"nll"`
+	Converged      bool `json:"converged"`
+	Cycled         bool `json:"cycled"`
+	Capped         bool `json:"capped"`
+	InnerConverged bool `json:"inner_converged"`
+	// CycleSpread and Valid are the §11.2 cycle width and validity of the iterate (fit.Result.Valid).
+	CycleSpread jf       `json:"cycle_spread"`
+	Valid       bool     `json:"valid"`
+	Outer       int      `json:"outer"`
+	Boundary    []string `json:"boundary"`
+	Divergent   []string `json:"divergent"`
+	StartSpread jf       `json:"start_spread"`
+	StartNLL    []jf     `json:"start_nll"`
+	NLL         jf       `json:"nll"`
 }
 
 func flagsOf(r fit.Result) fitFlags {
 	f := fitFlags{Converged: r.Converged, Cycled: r.Cycled, Capped: r.Capped, InnerConverged: r.InnerConverged, Outer: r.Outer,
+		CycleSpread: jf(r.CycleSpread), Valid: r.Valid(),
 		StartSpread: jf(r.StartSpread), NLL: jf(r.NegLogLik), Boundary: []string{}, Divergent: []string{}}
 	for p := range ged.NumParams {
 		if r.Free[p] && r.Boundary[p] {
@@ -468,9 +475,12 @@ func flagsOf(r fit.Result) fitFlags {
 	return f
 }
 
+// shareRecord: invalid is the §11.2 share (wide cycle, cap, inner non-convergence, failure); not_converged keeps its
+// older meaning (outer or inner loop not converged, narrow cycles included) so earlier batches stay comparable.
 type shareRecord struct {
 	Cycled       jf            `json:"cycled"`
 	Capped       jf            `json:"capped"`
+	Invalid      jf            `json:"invalid"`
 	NotConverged jf            `json:"not_converged"`
 	Cold         int           `json:"cold"`
 	Boundary     map[string]jf `json:"boundary"`
@@ -479,7 +489,7 @@ type shareRecord struct {
 
 func sharesOf(meta []fit.RepMeta, free [ged.NumParams]bool) shareRecord {
 	s := fit.Summarise(meta)
-	r := shareRecord{Cycled: jf(s.Cycled), Capped: jf(s.Capped), NotConverged: jf(s.NotConverged), Cold: s.Cold, Boundary: map[string]jf{}}
+	r := shareRecord{Cycled: jf(s.Cycled), Capped: jf(s.Capped), Invalid: jf(s.Invalid), NotConverged: jf(s.NotConverged), Cold: s.Cold, Boundary: map[string]jf{}}
 	for p := range ged.NumParams {
 		if free[p] && s.Boundary[p] > 0 {
 			r.Boundary[ged.ParamNames[p]] = jf(s.Boundary[p])
@@ -573,9 +583,9 @@ func confirmatory(w io.Writer, o simOptions, cfg simulate.Config, trips []fit.Tr
 	if err != nil {
 		return res, err
 	}
-	fmt.Fprintf(os.Stderr, "  confirmatory: independence outer=%d converged=%v cycled=%v capped=%v spread=%.3f; random intercept outer=%d converged=%v capped=%v σ̂=%.3f; verdict %s\n",
-		res.Indep.Outer, res.Indep.Converged, res.Indep.Cycled, res.Indep.Capped, res.Indep.StartSpread,
-		res.Mixed.Outer, res.Mixed.Converged, res.Mixed.Capped, res.Mixed.Params.Sigma, res.Verdict)
+	fmt.Fprintf(os.Stderr, "  confirmatory: independence outer=%d converged=%v cycled=%v capped=%v valid=%v spread=%.3f; random intercept outer=%d converged=%v capped=%v valid=%v σ̂=%.3f; verdict %s (before the deviation cap: %s)\n",
+		res.Indep.Outer, res.Indep.Converged, res.Indep.Cycled, res.Indep.Capped, res.Indep.Valid(), res.Indep.StartSpread,
+		res.Mixed.Outer, res.Mixed.Converged, res.Mixed.Capped, res.Mixed.Valid(), res.Mixed.Params.Sigma, res.Verdict, res.VerdictUncapped)
 	fmt.Fprintf(w, "\n# 1 回目の seed の詳細（seed %d）\n", cfg.Seed)
 	fmt.Fprintf(w, "\nn_p の下限は §15.3 の値を三つ組 %d に比例換算（3,000 以上は換算しない）。合成データには文全体の埋め込みがないので C4（R0 対 B1）は計算しない。判定者を 1 人ずつ除く表は -lojo のときだけ。\n", cfg.Sources*cfg.PerSrc)
 	if !*simApplyQC {
@@ -690,7 +700,7 @@ func fitSeed(w io.Writer, o simOptions, cfg simulate.Config, trips []fit.Triplet
 		}
 		rec.D = dr
 	}
-	rec.Verdict, rec.VerdictMissing = res.Verdict.String(), append([]string{}, res.Missing...)
+	rec.Verdict, rec.VerdictUncapped, rec.VerdictMissing = res.Verdict.String(), res.VerdictUncapped.String(), append([]string{}, res.Missing...)
 
 	diagReport(w, diag, o.m)
 	if detail {
@@ -857,21 +867,26 @@ func acrossSeeds(w io.Writer, recs []seedRecord) {
 		fmt.Fprintf(w, "| %s | %.3f | %.3f | %.3f | %.3f | %d/%d | %.3f | %.3f | %.3f | %d/%d | %s |\n",
 			p.Name, float64(p.TrueNorm), mean(ei), fit.SD(ei), mean(si), ci, n, mean(em), fit.SD(em), mean(sm), cm, n, lab)
 	}
-	verdicts := map[string]int{}
-	cyc, bnd := 0, 0
+	verdicts, uncapped := map[string]int{}, map[string]int{}
+	cyc, bnd, inv := 0, 0, 0
 	var secs []float64
 	for _, r := range recs {
 		verdicts[r.Verdict]++
+		uncapped[r.VerdictUncapped]++
 		if r.Fits.Indep.Cycled || r.Fits.Mixed.Cycled {
 			cyc++
+		}
+		// The random-intercept record is zero (valid = false) when that fit did not run or the row predates the field.
+		if !r.Fits.Indep.Valid || (r.Fits.Mixed.Outer > 0 && !r.Fits.Mixed.Valid) {
+			inv++
 		}
 		if len(r.Fits.Indep.Boundary) > 0 || len(r.Fits.Mixed.Boundary) > 0 {
 			bnd++
 		}
 		secs = append(secs, float64(r.Secs.Total))
 	}
-	fmt.Fprintf(w, "\n判定: %s。全データの当てはめが循環した seed %d、境界に達した費用がある seed %d。1 seed あたり %.0f 秒（範囲 %.0f–%.0f）。\n",
-		labelCounts(verdicts), cyc, bnd, mean(secs), slices.Min(secs), slices.Max(secs))
+	fmt.Fprintf(w, "\n判定（逸脱による制限の後。合成データの実行は常に逸脱を含むので「妥当と確認」にはならない）: %s。制限の前の判定: %s。全データの当てはめが循環した seed %d、無効な反復（§11.2）の seed %d、境界に達した費用がある seed %d。1 seed あたり %.0f 秒（範囲 %.0f–%.0f）。\n",
+		labelCounts(verdicts), labelCounts(uncapped), cyc, inv, bnd, mean(secs), slices.Min(secs), slices.Max(secs))
 
 	// D: nested bootstrap against the Monte-Carlo SD (§16 #14).
 	var ds, sds []float64

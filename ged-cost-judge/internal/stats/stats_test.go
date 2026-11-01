@@ -134,6 +134,29 @@ func TestDecide(t *testing.T) {
 	if d.Label != NotEstimable {
 		t.Fatalf("replicate floor: %v", d.Label)
 	}
+	// Replicates with an invalid iterate stay in the interval but count against the floor: 1000 rows, 60 invalid → 94%.
+	mask := func(invalid int) []bool {
+		m := make([]bool, 1000)
+		for k := range m {
+			m[k] = k >= invalid
+		}
+		return m
+	}
+	d = Decide(DecisionInput{Est: 1, Boot: boot(1, 0.09, 1000), Valid: mask(60), Theta0: 1, M: 0.25, TotalReps: 1000})
+	if d.Label != NotEstimable || d.Reps != 1000 || d.Valid != 940 {
+		t.Fatalf("validity floor: %v reps %d valid %d", d.Label, d.Reps, d.Valid)
+	}
+	d = Decide(DecisionInput{Est: 1, Boot: boot(1, 0.09, 1000), Valid: mask(40), Theta0: 1, M: 0.25, TotalReps: 1000})
+	if d.Label == NotEstimable || d.Valid != 960 {
+		t.Fatalf("validity floor at 96%%: %v valid %d", d.Label, d.Valid)
+	}
+	// A NaN entry from an invalid replicate is counted once (neither as a row nor as a valid one).
+	b := boot(1, 0.09, 1000)
+	b[0] = math.NaN()
+	d = Decide(DecisionInput{Est: 1, Boot: b, Valid: mask(1), Theta0: 1, M: 0.25, TotalReps: 1000})
+	if d.Reps != 999 || d.Valid != 999 {
+		t.Fatalf("NaN invalid entry: reps %d valid %d", d.Reps, d.Valid)
+	}
 	// Information floor by count.
 	d = Decide(DecisionInput{Est: 1, Boot: boot(1, 0.09, 1000), Theta0: 1, M: 0.25, NInformative: 100, MinInformative: 650})
 	if d.Label != NotEstimable {

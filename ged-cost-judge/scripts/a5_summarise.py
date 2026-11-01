@@ -8,7 +8,9 @@ before the field count as ok) is not completed and is excluded from every statis
 gcj -max-seconds) is broken out, any other status is counted as such. Each unparsable line is reported as file:line.
 Then per world (and scenario) it prints:
   - decision-label frequencies per margin-judged parameter (combined label, and P(keep) / P(change) per fit);
-  - verdict frequencies with Clopper-Pearson 95% intervals;
+  - verdict frequencies with Clopper-Pearson 95% intervals, both after every cap ("verdict": at most "not
+    contradicted", since the simulate path always carries deviations) and before the deviation cap
+    ("verdict_uncapped": the data-dependent elements only);
   - the false-change rate: P("change") for every parameter whose normalized truth lies inside the band
     (|truth - theta0| <= m), and the family-wise rate of at least one false change (the null and edgeN worlds are
     the ones that matter);
@@ -17,7 +19,8 @@ Then per world (and scenario) it prints:
   - D: mean, Monte-Carlo SD across seeds, mean nested-bootstrap SD, coverage of the across-seed mean by the
     [one-sided 95% lower, upper] interval (two-sided 90%), and the shares with upper < 2 pt / lower >= 2 pt;
   - judge QC failures (recorded; applied only with gcj -apply-qc), scale identification, matching stability;
-  - hypothesis support rates; boundary / cycled / capped shares (full-data fits and bootstrap replicates);
+  - hypothesis support rates; boundary / cycled / capped / valid (decisions-stats §11.2) shares of the full-data fits
+    and the bootstrap replicates' cycled / capped / invalid (§11.2) / not-converged (older metric) shares;
   - informative counts against the minimum; the untied diagnostic fit's RA<->CA / CA<->MA against the truth;
   - run time per seed.
 """
@@ -221,11 +224,18 @@ def summarise(world, scenario, recs):
     print(table(["parameter", "truth", "θ₀", "in band"] + [SHORT[l] for l in LABELS]
                 + ["keep indep/mixed", "change indep/mixed"], rows))
 
-    # Verdicts.
+    # Verdicts: after every cap (the simulate path always has deviations, so "validated" cannot occur) and before
+    # the deviation cap (rows from before the field have no "verdict_uncapped").
     v = Counter(r["verdict"] for r in recs)
+    vu = Counter(r["verdict_uncapped"] for r in recs if "verdict_uncapped" in r)
+    nu = sum(vu.values())
     print("\n### Verdicts\n")
-    print(table(["verdict", "count", "rate [CP 95%]"], [[x, v.get(x, 0), rate(v.get(x, 0), n)] for x in VERDICTS],
-                ["---", "--:", "---"]))
+    print("capped = after every cap (the deviation cap always applies to simulations: -d-reps, scaled n_p floors, "
+          "QC not applied, LOJO off); uncapped = before the deviation cap, data-dependent elements only "
+          f"(recorded for {nu}/{n} seeds)\n")
+    print(table(["verdict", "capped: count", "capped: rate [CP 95%]", "uncapped: count", "uncapped: rate [CP 95%]"],
+                [[x, v.get(x, 0), rate(v.get(x, 0), n), vu.get(x, 0), rate(vu.get(x, 0), nu)] for x in VERDICTS],
+                ["---", "--:", "---", "--:", "---"]))
     miss = Counter(item.split(":")[0] if ":" in item else item for r in recs for item in r.get("verdict_missing", []))
     if miss:
         print("\nmissing elements (seeds): " + "; ".join(f"{k} {c}" for k, c in miss.most_common()))
@@ -316,14 +326,20 @@ def summarise(world, scenario, recs):
     for fitname in ("indep", "mixed"):
         fl = [r["fits"][fitname] for r in recs]
         bs = [r["boot_shares"][fitname] for r in recs]
+        valid = [f["valid"] for f in fl if "valid" in f]  # absent in rows from before the field
         rows.append([fitname, rate(sum(f["converged"] for f in fl), n), rate(sum(f["cycled"] for f in fl), n),
-                     rate(sum(f["capped"] for f in fl), n), rate(sum(bool(f["boundary"]) for f in fl), n),
+                     rate(sum(f["capped"] for f in fl), n), rate(sum(valid), len(valid)),
+                     f3(mean([f.get("cycle_spread") for f in fl if f.get("cycled")])),
+                     rate(sum(bool(f["boundary"]) for f in fl), n),
                      f3(mean([f["start_spread"] for f in fl])),
                      f3(mean([b["cycled"] for b in bs])), f3(mean([b["capped"] for b in bs])),
+                     f3(mean([b.get("invalid") for b in bs])),
                      f3(mean([b["not_converged"] for b in bs])), sum(b.get("errors", 0) for b in bs)])
-    print(table(["fit", "converged", "cycled", "capped (20 rounds)", "any cost at boundary", "mean start spread",
-                 "boot: cycled share", "boot: capped share", "boot: not converged", "boot errors"], rows,
-                ["---", "---", "---", "---", "---", "--:", "--:", "--:", "--:", "--:"]))
+    print(table(["fit", "converged", "cycled", "capped (20 rounds)", "valid (§11.2)", "mean cycle width (cycled fits)",
+                 "any cost at boundary", "mean start spread",
+                 "boot: cycled share", "boot: capped share", "boot: invalid (§11.2)", "boot: not converged (older metric)",
+                 "boot errors"], rows,
+                ["---", "---", "---", "---", "---", "--:", "---", "--:", "--:", "--:", "--:", "--:", "--:"]))
     bnd = defaultdict(list)
     for r in recs:
         for k, v in r["boot_shares"]["indep"]["boundary"].items():

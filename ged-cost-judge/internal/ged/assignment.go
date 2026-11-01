@@ -16,7 +16,19 @@ import (
 //
 // It returns the (i → j) pairs assigned as substitutions. Deleted and inserted nodes are not included.
 // The same matrix used to be solved by a Python (scipy) service. The solver matches scipy's
-// (see linearSumAssignment), so the same assignment is returned, including how ties are broken.
+// (see linearSumAssignment), so for the matrix it is given (the snapped one, below) the same assignment is
+// returned, including how ties are broken.
+//
+// The costs are rounded to the grid 2^−costBits before solving. Equal costs (two propositions below the last
+// substitution knot, say) are then equal in every sum and difference the solver forms, so a tie between two
+// assignments is broken by the solver's fixed rule and not by rounding noise that moves with θ (decisions §11.5:
+// the matching must be a deterministic, piecewise-constant function of θ; the estimation loop cannot converge
+// if it is not). The features returned by Compute are those of the chosen assignment, so the GED value itself
+// is not rounded; only a genuine difference below the grid can change which of two near-equal assignments is taken.
+// The forbidden sentinel 1e9 lies outside the exact range (see costBits), so reduced costs that involve it are
+// inexact; that is harmless because a forbidden entry is never selected on a feasible instance (the feasible
+// entries always contain a perfect matching, so Dijkstra reaches a free column through them first) and the dual
+// updates only touch selected rows and columns.
 func bipartiteMatch(sub [][]float64, del, ins []float64) (map[int]int, error) {
 	n, m := len(del), len(ins)
 	if n == 0 && m == 0 {
@@ -33,11 +45,13 @@ func bipartiteMatch(sub [][]float64, del, ins []float64) (map[int]int, error) {
 		cost[i] = row
 	}
 	for i := range n {
-		copy(cost[i][:m], sub[i])
-		cost[i][m+i] = del[i]
+		for j := range m {
+			cost[i][j] = snap(sub[i][j])
+		}
+		cost[i][m+i] = snap(del[i])
 	}
 	for j := range m {
-		cost[n+j][j] = ins[j]
+		cost[n+j][j] = snap(ins[j])
 		for k := m; k < size; k++ {
 			cost[n+j][k] = 0
 		}
@@ -53,6 +67,16 @@ func bipartiteMatch(sub [][]float64, del, ins []float64) (map[int]int, error) {
 		}
 	}
 	return out, nil
+}
+
+// costBits is the number of fractional bits of the assignment cost grid. With |cost| < 2^22 (the duals are sums of
+// at most n + m costs) every sum and difference of grid values is exact in a float64.
+const costBits = 30
+
+// snap rounds c to the nearest multiple of 2^−costBits.
+func snap(c float64) float64 {
+	const scale = 1 << costBits
+	return math.Round(c*scale) / scale
 }
 
 // linearSumAssignment solves the minimum-cost perfect assignment of a square cost matrix and returns the column assigned to each row i.

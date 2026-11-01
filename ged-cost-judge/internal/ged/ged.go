@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -151,8 +152,29 @@ func typePair(a, b string) int {
 	return -1
 }
 
+// canon returns a copy of g with propositions sorted by ID and edges sorted by (From, To, Kind), so the assignment
+// solver and the edge passes see the same input order however the graph was built (decisions §11.5: the tie-breaking
+// of the matching must not depend on the order the simulator, the loader or the fit happen to use).
+func canon(g Graph) Graph {
+	c := g.Clone()
+	sort.SliceStable(c.Props, func(i, j int) bool { return c.Props[i].ID < c.Props[j].ID })
+	sort.SliceStable(c.Edges, func(i, j int) bool {
+		a, b := c.Edges[i], c.Edges[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.To != b.To {
+			return a.To < b.To
+		}
+		return a.Kind < b.Kind
+	})
+	return c
+}
+
 // Compute optimally matches propositions at θ and returns the resulting features. ref is the reference (source argument S); v is the variant.
+// Assign is indexed in the canonical (ID-sorted) proposition order.
 func Compute(ref, v Graph, sim Sim, t Theta) (Features, error) {
+	ref, v = canon(ref), canon(v)
 	n, m := len(v.Props), len(ref.Props)
 	sub := make([][]float64, n)
 	del := make([]float64, n)

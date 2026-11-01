@@ -14,8 +14,8 @@ import (
 )
 
 // Confirmatory is the single entry point of the pre-registered analysis (decisions-stats §2–§4, §6, §7, §9, §9.1,
-// §11, §12b; review-fit-impl B1). It runs, in this order: the mechanical judge QC on the unfiltered data
-// (before any θ is fitted), the triplet/judgment filters, the informative counts, the multi-start working-independence
+// §11, §12b; review-fit-impl B1). It runs, in this order: the mechanical judge QC on the QC set (every triplet but
+// pilot and qt30, before any θ is fitted), the triplet/judgment filters, the informative counts, the multi-start working-independence
 // and random-intercept fits, the paired stratified bootstrap with its metadata, the sum normalization, the §3
 // decision rule with every safeguard (information floor on the anchored replicates, replicate floor, boundary rule,
 // scale identification, model agreement), the confirmatory contrasts with Holm, the nested-bootstrap D, the verdict,
@@ -50,11 +50,9 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 	res.Deviations = Preregistered(co, opts)
 	res.Used = summarise(co, opts)
 
-	// 1. Judge QC before θ (decisions §9, §9.1, §13 item 5), on the triplets that survive the flag filter (not the
-	// judgment-level family filter): pilot, QT30 and the other excluded sets stay out of the gate, the tie share and α.
-	qcOpts := opts
-	qcOpts.ExcludeSameFamily, qcOpts.CohZeroOnly, qcOpts.Weights = false, false, nil
-	qcT, qcJ, _ := Filter(trips, js, qcOpts)
+	// 1. Judge QC before θ (decisions §9, §9.1, §13 item 5) on the QC set: every triplet but pilot and qt30 (re-review
+	// N3), fixed regardless of opts so that a sensitivity fit's exclusions cannot move the gate, the tie share or α.
+	qcT, qcJ := qcSet(trips, js)
 	res.QC = JudgeQCStats(qcT, qcJ, co.JudgeNames, QCOptions{GateDelta: co.GateDelta, RMax: co.RMax, Conf: co.GateConf})
 	names := co.JudgeNames
 	if co.ApplyExclusions {
@@ -153,7 +151,8 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 		}
 		mixedInit = &res.Mixed.Params
 		if res.Mixed.Params.Sigma > co.HighNodesSigma {
-			// Quadrature check: refit from the estimate with more nodes and report the largest change (review-fit-impl M3).
+			// Grid check: refit from the estimate at the finer resolution co.HighNodes (80 → spacing ≤ 0.15 logit) and
+			// report the largest change (review-fit-impl M3).
 			ho := opts
 			ho.Quadrature = co.HighNodes
 			hr, err := FitMixed(trips, js, ho, mixedInit)
@@ -186,13 +185,19 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 	if err != nil {
 		return res, err
 	}
-	res.HolmFamily = len(res.Hypotheses)
+	if len(res.Hypotheses) != HolmFamily {
+		return res, fmt.Errorf("confirmatory: Holm family has %d members, want %d (decisions §4; re-review N5)", len(res.Hypotheses), HolmFamily)
+	}
+	res.HolmFamily = HolmFamily
 	if res.C4Missing {
 		res.Notes = append(res.Notes, "C4 baseline (B1, whole-text embedding) not supplied: C4 enters the Holm family of 6 with p = 1")
 	}
 	if !res.ScaleIdentified {
+		// Only the contrasts on the normalized scale lose their meaning; the C-family compares agreement rates.
 		for i := range res.Hypotheses {
-			res.Hypotheses[i].NotEvaluable, res.Hypotheses[i].Supported = true, false
+			if h := &res.Hypotheses[i]; h.ID == "H1" || h.ID == "H2" || h.ID == "H4a" || h.ID == "H4b" {
+				h.NotEvaluable, h.Supported = true, false
+			}
 		}
 	}
 
@@ -205,8 +210,8 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 		res.D = &d
 	}
 
-	// 9. Verdict (decisions §3).
-	res.Verdict, res.Missing = verdict(res, co)
+	// 9. Verdict (decisions §3), before and after the deviation cap.
+	res.VerdictUncapped, res.Verdict, res.Missing = verdict(res, co)
 
 	// 10. Leave-one-judge-out (decisions §9).
 	if !co.SkipLOJO && opts.Judges >= 2 {
@@ -251,6 +256,20 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 	return res, nil
 }
 
+// QCGateExclude are the flags kept out of the judge QC set (decisions §13, §15.9; re-review N3): the pilot and the
+// QT30 transfer triplets. Nothing else is excluded, whatever the fit's own filters are.
+var QCGateExclude = []string{"pilot", "qt30"}
+
+// qcSet is the judge QC set: every triplet but QCGateExclude, with all judgments.
+func qcSet(trips []Triplet, js []Judgment) ([]Triplet, []Judgment) {
+	t, j, _ := Filter(trips, js, Options{Exclude: QCGateExclude})
+	return t, j
+}
+
+// HolmFamily is the size of the Holm family of decisions §4: H1, H2, H4a, H4b, C1, C4 (C4 with p = 1 when its
+// baseline is missing; re-review N5).
+const HolmFamily = 6
+
 func mixedOrNil(r ConfirmResult) *Result {
 	if r.Mixed.Params.Beta == nil {
 		return nil
@@ -289,8 +308,9 @@ type ConfirmOptions struct {
 	// Untied keeps the three type costs free (diagnostic fit of §12b); the primary analysis is tied.
 	Untied  bool
 	Workers int
-	// HighNodes and HighNodesSigma control the quadrature check: when σ̂ > HighNodesSigma (0 → 2) the mixed fit is
-	// refitted with HighNodes nodes (0 → 80) and the change is reported.
+	// HighNodes and HighNodesSigma control the grid check: when σ̂ > HighNodesSigma (0 → 2) the mixed fit is refitted
+	// at the finer grid resolution HighNodes (0 → 80, i.e. spacing ≤ 0.15 logit; Options.Quadrature) and the change
+	// in θ̂ and σ̂ is reported.
 	HighNodes      int
 	HighNodesSigma float64
 	// Gate parameters of §9.1 (0 → 2.0, 0.20, 0.90); MinGateTriplets is the n_T below which the gate is not evaluable
@@ -366,8 +386,9 @@ type OptionsUsed struct {
 	ExcludeSameFamily bool
 	CohZeroOnly       bool
 	NoLapse           bool
-	Quadrature        int
-	Judges            int
+	// Quadrature is the grid resolution of the random-intercept integration (Options.Quadrature; 20 → spacing ≤ 0.6).
+	Quadrature int
+	Judges     int
 }
 
 func summarise(co ConfirmOptions, opts Options) OptionsUsed {
@@ -436,12 +457,13 @@ func Preregistered(co ConfirmOptions, opts Options) []string {
 		add("type tie off (diagnostic fit)")
 	}
 	if co.HighNodes != 80 || co.HighNodesSigma != 2 {
-		add("quadrature check settings differ from 80 nodes at σ̂ > 2")
+		add("grid check settings differ from resolution 80 at σ̂ > 2")
 	}
 	if co.GateDelta != 2 || co.RMax != stats.GateRMax || co.GateConf != stats.GateConf || co.MinGateTriplets != 100 {
 		add("T1 gate settings differ from §9.1")
 	}
 	if opts.Lambda != 0 {
+		// Cannot fire from Confirmatory (it forces λ = 0 first); kept for callers that list their own options.
 		add("λ = %g (pre-registered 0)", opts.Lambda)
 	}
 	if len(opts.Fixed) > 0 {
@@ -449,6 +471,12 @@ func Preregistered(co ConfirmOptions, opts Options) []string {
 	}
 	if opts.FixTheta {
 		add("θ fixed")
+	}
+	if opts.MaxOuter != 0 && opts.MaxOuter != 20 {
+		add("MaxOuter = %d (pre-registered 20)", opts.MaxOuter)
+	}
+	if opts.Tie != nil && !equalIntMap(opts.Tie, TypeTie()) {
+		add("custom cost tie (pre-registered: the three type costs tied to RA↔MA)")
 	}
 	excl := opts.Exclude
 	if excl == nil && !opts.IncludeAll {
@@ -473,7 +501,7 @@ func Preregistered(co ConfirmOptions, opts Options) []string {
 		add("lapse mixture off (pre-2026-10-29 model)")
 	}
 	if opts.Quadrature != 0 && opts.Quadrature != 20 {
-		add("quadrature nodes = %d (pre-registered 20 adaptive)", opts.Quadrature)
+		add("integration grid resolution = %d (pre-registered 20: spacing ≤ 0.6 logit)", opts.Quadrature)
 	}
 	if opts.AuxRidge != 0 && opts.AuxRidge != 1e-4 {
 		add("AuxRidge = %g (pre-registered 1e-4)", opts.AuxRidge)
@@ -531,12 +559,12 @@ type ConfirmResult struct {
 	Used       OptionsUsed
 	Deviations []string
 	Notes      []string
-	// Quadrature is the Gauss–Hermite node count of the mixed fit.
+	// Quadrature is the grid resolution of the mixed fit's integration (OptionsUsed.Quadrature).
 	Quadrature int
-	// HolmFamily is the size of the Holm family (6: C4 is kept with p = 1 when its baseline is missing, C4Missing).
+	// HolmFamily is the size of the Holm family (the constant HolmFamily; C4 is kept with p = 1 when its baseline is missing, C4Missing).
 	HolmFamily int
 	C4Missing  bool
-	// Judge QC (on the unfiltered data, before θ) and the judges dropped by it.
+	// Judge QC (on the QC set: every triplet but pilot and qt30, before θ) and the judges dropped by it.
 	QC             JudgeQCResult
 	ExcludedJudges []string
 	JudgeNames     []string
@@ -562,7 +590,11 @@ type ConfirmResult struct {
 	Extrapolated    []ExtrapolatedRow
 	Hypotheses      []HypothesisResult
 	D               *DResult
+	// Verdict is the §3 verdict after every cap; VerdictUncapped is the same verdict before the deviation cap (every
+	// data-dependent element applied: labels, H1/H2, D, the gate floor, valid primary fits, the co-primary fit), so a
+	// run with non-pre-registered settings (the simulations) still shows what the data say. Missing lists the reasons.
 	Verdict         stats.VerdictLabel
+	VerdictUncapped stats.VerdictLabel
 	Missing         []string
 	LOJO            []LOJOResult
 	// Stability is the share of triplets whose matching changes anywhere in the θ̂ ± 3·SD box.
@@ -661,8 +693,8 @@ func decisions(ind Result, boot [][]float64, meta []RepMeta, mix *Result, mboot 
 		if truthN != nil {
 			row.Truth = truthN[i]
 		}
-		mk := func(est []float64, rows [][]float64, anchored [][]float64, s Shares, total int) stats.ParamDecision {
-			di := stats.DecisionInput{Est: est[i], Boot: Column(rows, i), Theta0: th0[i], M: co.M, TotalReps: total}
+		mk := func(est []float64, rows [][]float64, anchored [][]float64, s Shares, ms []RepMeta) stats.ParamDecision {
+			di := stats.DecisionInput{Est: est[i], Boot: columnOf(rows, i), Valid: validMask(ms), Theta0: th0[i], M: co.M, TotalReps: len(rows)}
 			switch {
 			case i == NormNeg:
 				di.NInformative = negInf
@@ -684,10 +716,10 @@ func decisions(ind Result, boot [][]float64, meta []RepMeta, mix *Result, mboot 
 			}
 			return stats.Decide(di)
 		}
-		row.Indep = mk(estN, bootN, boot, sh, len(boot))
+		row.Indep = mk(estN, bootN, boot, sh, meta)
 		row.Combined = row.Indep.Label
 		if mix != nil {
-			d := mk(estM, bootM, mboot, shM, len(mboot))
+			d := mk(estM, bootM, mboot, shM, mmeta)
 			row.Mixed = &d
 			row.Combined = stats.Combine(row.Indep.Label, d.Label)
 		}
@@ -739,6 +771,27 @@ func decisions(ind Result, boot [][]float64, meta []RepMeta, mix *Result, mboot 
 	}
 	slices.Sort(col)
 	return rows, sHat, [2]float64{Quantile(col, 0.05), Quantile(col, 0.95)}, identified
+}
+
+// columnOf is column p of rows in replicate order (NaN where a replicate has no row), so a per-replicate mask aligns with it.
+func columnOf(rows [][]float64, p int) []float64 {
+	col := make([]float64, len(rows))
+	for r, row := range rows {
+		col[r] = math.NaN()
+		if p < len(row) {
+			col[r] = row[p]
+		}
+	}
+	return col
+}
+
+// validMask marks, per replicate, whether its iterate is valid (decisions §11.2, §6).
+func validMask(meta []RepMeta) []bool {
+	mask := make([]bool, len(meta))
+	for r, m := range meta {
+		mask[r] = m.Valid()
+	}
+	return mask
 }
 
 // contrastBoot computes a contrast f on the estimate and on every normalized replicate.
@@ -863,7 +916,9 @@ func (d *DResult) DBounds() (lower, upper float64) {
 	return Quantile(col, 0.05), Quantile(col, 0.95)
 }
 
-func verdict(res ConfirmResult, co ConfirmOptions) (stats.VerdictLabel, []string) {
+// verdict applies the §3 rule and the caps. It returns the verdict before the deviation cap (every data-dependent
+// cap applied) and after it, with the reasons.
+func verdict(res ConfirmResult, co ConfirmOptions) (uncapped, capped stats.VerdictLabel, missing []string) {
 	in := stats.VerdictInput{DLower95: math.NaN(), DUpper95: math.NaN()}
 	for _, r := range res.Params {
 		if r.Margin {
@@ -881,28 +936,36 @@ func verdict(res ConfirmResult, co ConfirmOptions) (stats.VerdictLabel, []string
 	}
 	in.DLower95, in.DUpper95 = res.D.DBounds()
 	v, missing := stats.Verdict(in)
-	if res.QC.NT < co.MinGateTriplets {
-		missing = append(missing, fmt.Sprintf("T1 gate not evaluable: n_T = %d < %d (§9.1 data requirement)", res.QC.NT, co.MinGateTriplets))
+	block := func(reason string) {
+		missing = append(missing, reason)
 		if v == stats.Validated {
 			v = stats.NotContradicted
 		}
 	}
-	if len(res.Deviations) > 0 {
-		missing = append(missing, "non-pre-registered settings (see the deviations list): the verdict is capped at \"not contradicted\"")
-		if v == stats.Validated {
-			v = stats.NotContradicted
+	if res.QC.NT < co.MinGateTriplets {
+		block(fmt.Sprintf("T1 gate not evaluable: n_T = %d < %d (§9.1 data requirement)", res.QC.NT, co.MinGateTriplets))
+	}
+	// An invalid primary iterate (decisions §11.2) leaves the estimate undetermined and blocks "validated".
+	for _, f := range []struct {
+		name string
+		r    *Result
+	}{{"independence fit", &res.Indep}, {"random-intercept fit", mixedOrNil(res)}, {"high-resolution refit", res.MixedCheck}} {
+		if f.r != nil && !f.r.Valid() {
+			block(fmt.Sprintf("%s is not a valid iterate (§11.2): converged %v, cycled %v (spread %.4f ≥ %g), capped %v, inner converged %v",
+				f.name, f.r.Converged, f.r.Cycled, f.r.CycleSpread, CycleTol, f.r.Capped, f.r.InnerConverged))
 		}
 	}
 	if co.SkipMixed {
-		missing = append(missing, "random-intercept fit skipped: no co-primary agreement")
-		if v == stats.Validated {
-			v = stats.NotContradicted
-		}
+		block("random-intercept fit skipped: no co-primary agreement")
+	}
+	uncapped = v
+	if len(res.Deviations) > 0 {
+		block("non-pre-registered settings (see the deviations list): the verdict is capped at \"not contradicted\"")
 	}
 	if !res.ScaleIdentified {
 		missing = append(missing, "normalization scale not identified")
 	}
-	return v, missing
+	return uncapped, v, missing
 }
 
 // DefaultStrata labels every triplet for the per-stratum D: T1, T2, T4, and T3 split into "T3-near" (|Δ(θ₀)| < 0.5)

@@ -10,7 +10,7 @@
 //
 //   - working independence (Fit): the judgments are treated as independent;
 //   - random intercept (FitMixed): the judgments of one triplet share u_t ~ N(0, σ²) added to every z_k,
-//     integrated out by Gauss–Hermite quadrature.
+//     integrated out numerically on an adaptive uniform grid per triplet (see objective).
 //
 // GED is a minimum over proposition matchings, so it has points where it is not differentiable in θ.
 // With the matching fixed it is linear in θ, so "solve the matching → fix it and fit" is repeated until the
@@ -29,7 +29,6 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 
@@ -177,6 +176,14 @@ const ThetaMax = 10.0
 // BoundaryEps is the threshold below which a cost counts as "at the boundary" (decisions §6).
 const BoundaryEps = 1e-3
 
+// CycleTol bounds Result.CycleSpread for a cycling iterate to count as valid (decisions §11.2; the bootstrap
+// replicate floor of §6 counts on the same rule, Result.Valid). It is on the anchored scale (edge-extra = 1, θ_neg
+// included). GED is piecewise linear in θ, so an estimate can sit on a boundary between two matchings: the loop then
+// alternates between the two (a cycle) although the candidate rounds' costs agree to far below the anchored bootstrap
+// SD of the margin-judged costs (≈ 0.03 at the design size, P1) and far below the margin m = 0.25 (normalized; ŝ ≈ 1,
+// so the scales are comparable). 0.01 is a third of that SD; a wider cycle is not valid, as a cap is.
+const CycleTol = 0.01
+
 // Options configures estimation.
 type Options struct {
 	Judges int
@@ -224,7 +231,8 @@ type Options struct {
 	// StartNames labels Starts in Result.Starts (optional).
 	StartNames []string
 
-	// Quadrature is the number of Gauss–Hermite nodes for FitMixed (0 → 20).
+	// Quadrature is the resolution of the random-intercept integration grid (0 → 20: spacing ≤ 0.6 logit units;
+	// see objective). It is not a node count.
 	Quadrature int
 	// Sigma0 is the initial random-intercept SD for FitMixed (0 → 1).
 	Sigma0 float64
@@ -287,9 +295,11 @@ type RoundTrace struct {
 	Changed       int
 	MaxDeltaShift float64
 	SumDeltaShift float64
-	Theta         ged.Theta
-	InnerIters    int
-	InnerConv     bool
+	// Flipped lists the indices (after filtering) of the triplets whose matching changed.
+	Flipped    []int
+	Theta      ged.Theta
+	InnerIters int
+	InnerConv  bool
 }
 
 // StartResult records one start of a multi-start fit.
@@ -314,6 +324,10 @@ type Result struct {
 	// Cycled indicates the matching returned to an earlier state (the alternating optimization cycled).
 	// In that case, the round with the smallest true objective, re-solving the matching at each round's θ, is returned.
 	Cycled bool
+	// CycleSpread is the largest range (max − min) of any anchored coordinate (θ and θ_neg) over the rounds the loop
+	// would keep producing (the cycle) together with the returned round, so it bounds the distance between the
+	// returned estimate and every other candidate; 0 unless Cycled. Below CycleTol the estimate counts as determined (Valid).
+	CycleSpread float64
 	// Capped indicates the outer loop hit MaxOuter without converging or cycling.
 	Capped bool
 	// InnerConverged is false if the bound-constrained inner solver of the returned round stopped on a line-search
@@ -334,6 +348,13 @@ type Result struct {
 	Triplets, Judgments int
 }
 
+// Valid is the one statement of the validity rule of decisions §11.2 (RepMeta.Valid and the §6 replicate floor
+// delegate to it): the inner solver stopped on its tolerances and the outer loop ended at a matching fixed point,
+// at a stationary objective, or in a cycle narrower than CycleTol. A wider cycle or a cap is not valid.
+func (r Result) Valid() bool {
+	return r.InnerConverged && (r.Converged || (r.Cycled && r.CycleSpread < CycleTol))
+}
+
 // AnyBoundary reports whether any free cost is at the lower boundary.
 func (r Result) AnyBoundary() bool {
 	for p, b := range r.Boundary {
@@ -351,25 +372,6 @@ type diff struct {
 	sig  string
 }
 
-// canon returns a copy of g with propositions sorted by ID and edges sorted by (From, To, Kind), so the
-// assignment solver sees the same input order regardless of how the graph was built (decisions §11.5:
-// deterministic tie-breaking, reproducible signatures).
-func canon(g ged.Graph) ged.Graph {
-	c := g.Clone()
-	sort.SliceStable(c.Props, func(i, j int) bool { return c.Props[i].ID < c.Props[j].ID })
-	sort.SliceStable(c.Edges, func(i, j int) bool {
-		a, b := c.Edges[i], c.Edges[j]
-		if a.From != b.From {
-			return a.From < b.From
-		}
-		if a.To != b.To {
-			return a.To < b.To
-		}
-		return a.Kind < b.Kind
-	})
-	return c
-}
-
 // features re-solves the matching of every triplet at θ and returns the linearization of Δ.
 func features(trips []Triplet, th ged.Theta) ([]diff, error) {
 	out := make([]diff, len(trips))
@@ -382,13 +384,12 @@ func features(trips []Triplet, th ged.Theta) ([]diff, error) {
 		go func(i int) {
 			defer func() { <-sem; wg.Done() }()
 			t := trips[i]
-			ref := canon(t.Ref)
-			fa, err := ged.Compute(ref, canon(t.A), t.SimA, th)
+			fa, err := ged.Compute(t.Ref, t.A, t.SimA, th)
 			if err != nil {
 				errs[i] = err
 				return
 			}
-			fb, err := ged.Compute(ref, canon(t.B), t.SimB, th)
+			fb, err := ged.Compute(t.Ref, t.B, t.SimB, th)
 			if err != nil {
 				errs[i] = err
 				return
@@ -553,12 +554,12 @@ func (l layout) pack(p Params, mixed bool) []float64 {
 	return x
 }
 
-func (l layout) unpack(x []float64, tie map[int]int, mixed bool) Params {
+func (l layout) unpack(x []float64, opts Options, mixed bool) Params {
 	p := Params{Beta: make([]float64, l.j), Tau: make([]float64, l.j), Pi: make([]float64, l.j), Lapse: make([]float64, l.j)}
 	for i := range ged.NumParams {
 		p.Theta[i] = x[i]
 	}
-	for i, m := range tie {
+	for i, m := range opts.Tie {
 		p.Theta[i] = x[m]
 	}
 	p.ThetaNeg = x[l.neg()]
@@ -566,7 +567,9 @@ func (l layout) unpack(x []float64, tie map[int]int, mixed bool) Params {
 		p.Beta[j] = math.Exp(x[l.beta(j)])
 		p.Tau[j] = math.Exp(x[l.tau(j)])
 		p.Pi[j] = x[l.pi(j)]
-		p.Lapse[j] = sigmoid(x[l.lapse(j)])
+		if !opts.NoLapse {
+			p.Lapse[j] = sigmoid(x[l.lapse(j)]) // NoLapse: ℓ_j = 0 exactly; the (fixed) logit coordinate is unused
+		}
 	}
 	p.Gamma = x[l.gamma()]
 	if mixed {
@@ -648,7 +651,8 @@ func answerLogLik(y Answer, z, tau float64) (ll, dz, dtau float64) {
 func mixLogLik(y Answer, z, tau, lapse float64) (ll, dz, dtau, dl float64) {
 	ll0, dz0, dtau0 := answerLogLik(y, z, tau)
 	if lapse <= 0 {
-		return ll0, dz0, dtau0, 1/3.0/math.Exp(ll0) - 1
+		// ℓ = 0 only under Options.NoLapse, where ℓ is fixed: no ℓ gradient (1/(3p) − 1 would overflow as p → 0).
+		return ll0, dz0, dtau0, 0
 	}
 	p := math.Exp(ll0)
 	pm := (1-lapse)*p + lapse/3
@@ -714,17 +718,22 @@ type objective struct {
 	opts   Options
 	ridge  float64
 	mixed  bool
-	ghX    []float64
-	ghLogW []float64
-	// Adaptive quadrature (review-fit-impl M3, N12): per triplet, a trapezoid rule on the integrand
-	// Π_k P'(y_k | z_k + u)·φ(u; σ) over [−7σ, 7σ] ∪ [û_t − 8 s_t, û_t + 8 s_t] with spacing min(broadStep·20/nq, s_t, σ/3),
-	// where û_t and s_t are the mode and curvature scale of the log-integrand (Liu & Pierce 1994). The trapezoid rule converges exponentially on smooth integrands with Gaussian tails, resolves the
-	// logistic-scale structure of contradictory judgments and the broad prior-shaped plateau that the lapse mixture's
-	// floor ℓ/3 produces (which mode-centred Gauss–Hermite nodes, spaced ≈ σ apart, cannot), and the spacing bound s_t
-	// resolves a narrow posterior. nodes[t][q] is the node and logc[t][q] = log(spacing): the integrand's own
-	// log φ(u; σ) and Σ_k log P(y_k | z_k + u) are added in eval, so σ keeps an exact gradient. The nodes are computed
-	// once per outer round at the round's starting parameters and held fixed inside the inner optimizer, so the inner
-	// objective is smooth with exact gradients. nq (Options.Quadrature) is a resolution knob: 20 → spacing ≤ 0.6.
+	// nq is the grid resolution (Options.Quadrature): 20 → spacing ≤ broadStep.
+	nq int
+	// Adaptive grid integration (review-fit-impl M3, N12; a revision of the pre-registered 20-node adaptive
+	// Gauss–Hermite rule, which was off by 0.2–1.7 nats per triplet at σ = 3–5 on contradictory judgments,
+	// TestAdaptiveQuadrature): per triplet, a Riemann sum Σ_i h·f(u_i) on the uniform grid u_i = lo + i·h over
+	// [−7σ, 7σ] ∪ [û_t − 8 s_t, û_t + 8 s_t] with h = min(broadStep·20/nq, max(s_t, minStep), σ/3), where û_t and s_t
+	// are the mode and curvature scale of the log-integrand (Liu & Pierce 1994). It is not the trapezoid rule (the two
+	// end nodes keep the full weight h), but the end nodes lie where the integrand is ≤ e^{−24.5} of its peak, so the
+	// two rules agree to machine precision and the exponential convergence of the trapezoid rule on analytic,
+	// Gaussian-tailed integrands carries over. A fixed spacing on the logistic scale resolves contradictory judgments
+	// and the broad prior-shaped plateau that the lapse floor ℓ/3 produces (which σ-spaced Gauss–Hermite nodes cannot);
+	// the bound s_t resolves a narrow posterior. nodes[t][q] is the node and logc[t][q] = log h: the integrand's own
+	// log φ(u; σ) and Σ_k log P(y_k | z_k + u) are added in eval, so σ keeps an exact gradient. Nodes whose
+	// log-integrand at the round's start parameters lies more than pruneMargin below the maximum are dropped. The
+	// nodes are computed once per outer round at the round's starting parameters and held fixed inside the inner
+	// optimizer, so the inner objective is smooth with exact gradients.
 	nodes, logc [][]float64
 	nllRaw      float64
 }
@@ -746,11 +755,10 @@ func newObjective(l layout, ds []diff, trips []Triplet, js []Judgment, opts Opti
 		for k, j := range js {
 			o.byTrip[j.Triplet] = append(o.byTrip[j.Triplet], k)
 		}
-		nq := opts.Quadrature
-		if nq <= 0 {
-			nq = 20
+		o.nq = opts.Quadrature
+		if o.nq <= 0 {
+			o.nq = 20
 		}
-		o.ghX = make([]float64, nq) // only the length (the resolution knob) is used by recenter
 		o.recenter(at)
 	}
 	return o
@@ -763,13 +771,12 @@ func (o *objective) recenter(p Params) {
 	n := len(o.byTrip)
 	o.nodes, o.logc = make([][]float64, n), make([][]float64, n)
 	sigma := math.Max(p.Sigma, 1e-8)
-	nq := len(o.ghX)
+	nq := o.nq
 	build := func(t int, center, scale float64, logf func(u float64) float64) {
 		// Support: the prior confines u to ±7σ (L ≤ 1), and the mode ± 8 s_t covers a likelihood-pulled posterior;
-		// spacing: the logistic scale (broadStep at nq = 20), the posterior scale and the prior scale. Nodes whose
-		// log-integrand at the round's start parameters lies more than pruneMargin below the maximum are dropped
-		// (their total weight is < e^{−pruneMargin}·n; the inner optimizer moves the integrand little, and every
-		// outer round rebuilds the nodes).
+		// spacing: the logistic scale (broadStep at nq = 20), the posterior scale and the prior scale. Pruned nodes
+		// carry a total weight < e^{−pruneMargin}·n; the inner optimizer moves the integrand little, and every outer
+		// round rebuilds the nodes.
 		step := math.Min(math.Min(broadStep*20/float64(nq), math.Max(scale, minStep)), sigma/3)
 		lo := math.Min(-7*sigma, center-8*scale)
 		hi := math.Max(7*sigma, center+8*scale)
@@ -860,7 +867,7 @@ func (o *objective) accum(g []float64, k Judgment, p Params, D, dz, dtau, dl, w 
 
 func (o *objective) eval(x, grad []float64) float64 {
 	l := o.l
-	p := l.unpack(x, o.opts.Tie, o.mixed)
+	p := l.unpack(x, o.opts, o.mixed)
 	if grad != nil {
 		clear(grad)
 	}
@@ -1010,7 +1017,7 @@ func Init(opts Options) Params {
 	for j := range opts.Judges {
 		p.Beta[j], p.Tau[j], p.Lapse[j] = 1, 0.5, LapseInit
 		if opts.NoLapse {
-			p.Lapse[j] = LapseMin
+			p.Lapse[j] = 0
 		}
 	}
 	if opts.Gamma == GammaFixed {
@@ -1030,7 +1037,7 @@ func Fit(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, er
 }
 
 // FitMixed is the random-intercept fit (Appendix A.6): one Gaussian offset per triplet shared by its judgments,
-// integrated by Gauss–Hermite quadrature; parameters (θ, θ_neg, β, τ, π, γ, log σ).
+// integrated out on the adaptive grid of objective; parameters (θ, θ_neg, β, τ, π, γ, log σ).
 func FitMixed(trips []Triplet, js []Judgment, opts Options, init *Params) (Result, error) {
 	return fitMulti(trips, js, opts, init, true)
 }
@@ -1158,7 +1165,7 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 	}
 	if opts.NoLapse {
 		for j := range p.Lapse {
-			p.Lapse[j] = LapseMin
+			p.Lapse[j] = 0
 		}
 	}
 	if mixed && p.Sigma <= 0 {
@@ -1181,8 +1188,9 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 	if ridge <= 0 {
 		ridge = 1e-4
 	}
-	seen := map[string]bool{sigOf(ds): true}
-	best, bestF := Result{}, math.Inf(1)
+	seen := map[string]int{sigOf(ds): 0} // matching signature → the round that produced it
+	rounds := [][]float64{ThetaVec(p)}   // (θ, θ_neg) per round (index 0: the start)
+	best, bestF, bestRound := Result{}, math.Inf(1), 0
 	prevTrue := math.Inf(1)
 	finish := func(r Result) Result {
 		r.Free = FreeTheta(opts)
@@ -1206,7 +1214,7 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 		if math.IsNaN(br.F) || math.IsInf(br.F, 0) {
 			return best, errors.New("fit: objective is not finite")
 		}
-		p = l.unpack(br.X, opts.Tie, mixed)
+		p = l.unpack(br.X, opts, mixed)
 
 		// Re-solve the matching at this θ (and re-centre the quadrature) and measure the objective under real GED.
 		next, err := features(trips, p.Theta)
@@ -1217,14 +1225,16 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 		f := trueObj.eval(br.X, nil)
 		cur := Result{Params: p, NegLogLik: trueObj.nllRaw, Objective: f, Outer: outer, InnerConverged: br.Converged}
 		if f < bestF {
-			best, bestF = cur, f
+			best, bestF, bestRound = cur, f, outer
 		}
+		rounds = append(rounds, ThetaVec(p))
 		sig := sigOf(next)
 		if opts.Trace != nil {
 			tr := RoundTrace{Outer: outer, Inner: br.F, True: f, Theta: p.Theta, InnerIters: br.Iter, InnerConv: br.Converged}
 			for i := range next {
 				if next[i].sig != ds[i].sig {
 					tr.Changed++
+					tr.Flipped = append(tr.Flipped, i)
 					sh := math.Abs(next[i].value(p.Theta) - ds[i].value(p.Theta))
 					tr.MaxDeltaShift = math.Max(tr.MaxDeltaShift, sh)
 					tr.SumDeltaShift += sh
@@ -1248,11 +1258,21 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 			best.Outer = outer
 			return finish(best), nil
 		}
-		if seen[sig] {
+		if first, ok := seen[sig]; ok {
+			// The matchings of rounds first..outer repeat from here on, so the costs the loop would keep producing are
+			// those of rounds first+1..outer; the returned (best) round may lie before the cycle and is included so the
+			// spread bounds its distance to every candidate.
 			best.Cycled, best.Outer = true, outer
+			for q := range ged.NumParams + 1 {
+				lo, hi := rounds[bestRound][q], rounds[bestRound][q]
+				for _, v := range rounds[first+1 : outer+1] {
+					lo, hi = math.Min(lo, v[q]), math.Max(hi, v[q])
+				}
+				best.CycleSpread = math.Max(best.CycleSpread, hi-lo)
+			}
 			return finish(best), nil
 		}
-		seen[sig] = true
+		seen[sig] = outer
 		ds = next
 		prevTrue = f
 	}
@@ -1323,7 +1343,8 @@ func LogLik(trips []Triplet, js []Judgment, p Params) ([]float64, error) {
 	return out, nil
 }
 
-// NegLogLikMixed is the marginal negative log-likelihood of the random-intercept model at p (no penalty).
+// NegLogLikMixed is the marginal negative log-likelihood of the random-intercept model at p (no penalty); nodes is
+// the grid resolution (Options.Quadrature).
 func NegLogLikMixed(trips []Triplet, js []Judgment, p Params, nodes int) (float64, error) {
 	ds, err := features(trips, p.Theta)
 	if err != nil {

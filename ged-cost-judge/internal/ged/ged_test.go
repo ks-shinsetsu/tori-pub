@@ -74,6 +74,58 @@ func TestSubstitutionIsOneMinusCosAboveKnot(t *testing.T) {
 	}
 }
 
+// An exactly tied node assignment (two variant propositions below the last substitution knot competing for one
+// reference proposition, whose edge costs differ) must be broken the same way at every θ and in every input order;
+// otherwise the estimation loop sees a matching that flips with rounding noise (decisions §11.5).
+func TestTieBreakIsStable(t *testing.T) {
+	ref := Graph{Props: []Prop{{ID: "s.p0"}, {ID: "s.p1"}}, Edges: []Edge{{From: "s.p1", To: "s.p0", Kind: RA}}}
+	// s.p1 is shifted far from its origin (cos 0.28) and n1 is an added, unrelated proposition (cos 0.2 to s.p1):
+	// both substitutions cost Σ knots, so "s.p1 → s.p1, n1 extra" and "n1 → s.p1, s.p1 extra" tie on node cost.
+	v := Graph{Props: []Prop{{ID: "s.p0"}, {ID: "s.p1"}, {ID: "n1"}}, Edges: []Edge{{From: "s.p1", To: "s.p0", Kind: RA}}}
+	sim := func(r, a string) float64 {
+		switch {
+		case r == a:
+			if r == "s.p1" {
+				return 0.28
+			}
+			return 1
+		case r == "s.p1" && a == "n1":
+			return 0.2
+		}
+		return 0.15
+	}
+	th := Current()
+	base, err := Compute(ref, v, sim, th)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.Phi[PNodeExtra] != 1 || base.Phi[PSub03] != 1 {
+		t.Fatalf("unexpected features %+v", base.Phi)
+	}
+	rev := Graph{Props: []Prop{v.Props[2], v.Props[1], v.Props[0]}, Edges: v.Edges}
+	for k := range 200 {
+		// Walk the knots and the unit costs by small amounts (the scale of one outer round) around θ₀.
+		p := th
+		for i := range p {
+			p[i] += 0.01 * float64((k*7+i*3)%11-5) / 5
+		}
+		f, err := Compute(ref, v, sim, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Signature() != base.Signature() || f.Phi != base.Phi {
+			t.Fatalf("θ = %v: matching %s (phi %v), want %s (phi %v)", p, f.Signature(), f.Phi, base.Signature(), base.Phi)
+		}
+		g, err := Compute(ref, rev, sim, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.Signature() != base.Signature() || g.Phi != base.Phi {
+			t.Fatalf("θ = %v, reversed order: matching %s, want %s", p, g.Signature(), base.Signature())
+		}
+	}
+}
+
 // The linearization must agree: with the same matching, Cost(θ) equals the GED from Compute(θ).
 func TestFeaturesAreLinear(t *testing.T) {
 	s := uniform()

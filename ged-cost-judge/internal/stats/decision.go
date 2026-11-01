@@ -48,6 +48,10 @@ type DecisionInput struct {
 	BoundaryShare, DivergentShare float64
 	// TotalReps is B, the number of replicates attempted; fewer than MinRepsShare·B valid replicates is "not estimable" (0 disables).
 	TotalReps int
+	// Valid, if non-nil, is aligned with Boot and marks the replicates whose iterate is valid (decisions §11.2, §6);
+	// nil means every replicate. Invalid replicates stay in the interval; the floor counts the finite entries of
+	// Boot that are valid.
+	Valid []bool
 	// AnchoredIQR is the IQR of the parameter's own anchored replicates (before the sum normalization). The
 	// normalization spreads the other costs' variation onto a frozen coordinate, so the information floor must be
 	// checked on the anchored column too. It is used only when CheckAnchored is true.
@@ -72,9 +76,11 @@ type ParamDecision struct {
 	N, MinN        int
 	BoundaryShare  float64
 	DivergentShare float64
-	Reps           int
-	TotalReps      int
-	Reason         string
+	// Reps is the number of replicates in the interval; Valid those among them with a valid iterate (§11.2).
+	Reps      int
+	Valid     int
+	TotalReps int
+	Reason    string
 }
 
 // Thresholds of decisions §3 and §6.
@@ -124,8 +130,14 @@ func mean(v []float64) float64 {
 // Summary computes the interval statistics without a label.
 func Summary(in DecisionInput) ParamDecision {
 	col := cleanSorted(in.Boot)
+	valid := 0
+	for k, x := range in.Boot {
+		if !math.IsNaN(x) && !math.IsInf(x, 0) && (in.Valid == nil || (k < len(in.Valid) && in.Valid[k])) {
+			valid++
+		}
+	}
 	d := ParamDecision{Est: in.Est, Theta0: in.Theta0, M: in.M, N: in.NInformative, MinN: in.MinInformative,
-		BoundaryShare: in.BoundaryShare, DivergentShare: in.DivergentShare, Reps: len(col), TotalReps: in.TotalReps}
+		BoundaryShare: in.BoundaryShare, DivergentShare: in.DivergentShare, Reps: len(col), Valid: valid, TotalReps: in.TotalReps}
 	d.CI90 = Interval{Quantile(col, 0.05), Quantile(col, 0.95)}
 	d.CI95 = Interval{Quantile(col, 0.025), Quantile(col, 0.975)}
 	d.Upper = Quantile(col, 0.95)
@@ -148,7 +160,7 @@ func Decide(in DecisionInput) ParamDecision {
 	case d.Reps == 0:
 		d.Label, d.Reason = NotEstimable, "no bootstrap replicates"
 		return d
-	case in.TotalReps > 0 && float64(d.Reps) < MinRepsShare*float64(in.TotalReps):
+	case in.TotalReps > 0 && float64(d.Valid) < MinRepsShare*float64(in.TotalReps):
 		d.Label, d.Reason = NotEstimable, "fewer than 95% of the replicates are valid"
 		return d
 	case in.MinInformative > 0 && in.NInformative < in.MinInformative:

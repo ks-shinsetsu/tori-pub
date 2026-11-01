@@ -102,7 +102,7 @@ func TestProjLBFGSCorrelated(t *testing.T) {
 }
 
 // TestAdaptiveQuadrature checks the per-triplet marginal log-likelihood (lapse mixture on) against a dense reference
-// at σ = 1, 3 and 5 (review-fit-impl M3, N12): the adaptive trapezoid rule must be accurate where the plain 20-node
+// at σ = 1, 3 and 5 (review-fit-impl M3, N12): the adaptive grid Riemann sum must be accurate where the plain 20-node
 // Gauss–Hermite rule was off by 0.2–1.7 and a mode-centred Gauss–Hermite rule by up to 0.9 on contradictory triplets.
 func TestAdaptiveQuadrature(t *testing.T) {
 	for _, c := range []struct {
@@ -151,7 +151,7 @@ func TestAdaptiveQuadrature(t *testing.T) {
 			}
 			ref = logSumExp(vals) + math.Log(h)
 			// Quadrature value of this triplet alone.
-			one := &objective{l: l, ds: ds, fold: o.fold, trips: trips, js: js, opts: opts, mixed: true, ghX: o.ghX, nodes: o.nodes, logc: o.logc}
+			one := &objective{l: l, ds: ds, fold: o.fold, trips: trips, js: js, opts: opts, mixed: true, nq: o.nq, nodes: o.nodes, logc: o.logc}
 			one.byTrip = make([][]int, len(trips))
 			one.byTrip[tt] = ks
 			got := -one.eval(l.pack(p, true), nil)

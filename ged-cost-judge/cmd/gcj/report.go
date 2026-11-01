@@ -34,9 +34,9 @@ func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
 	writeProvenance(w, prov)
 	fmt.Fprintln(w, "\n## 実際に使った設定（結果から出力、呼び出し側の値ではない）")
 	fmt.Fprintf(w, "\n- m = %g、U = {%s}、B = %d、D の反復 %d（CV %d 回）、LOJO の B = %d、乱数 seed = %d、無作為開始 %d 点\n", co.M, uNames(co.U), co.B, co.DReps, co.DRepeats, co.LOJOReps, co.Seed, co.RandomStarts)
-	fmt.Fprintf(w, "- λ = %g、種別の結び %v、除外フラグ {%s}、重み付け %v、γ %d、系列の結合フィルタ %v、Δcoh = 0 のみ %v、無作為回答の混合 %v、ガウス–エルミート %d 点、判定者 %d\n",
+	fmt.Fprintf(w, "- λ = %g、種別の結び %v、除外フラグ {%s}、重み付け %v、γ %d、系列の結合フィルタ %v、Δcoh = 0 のみ %v、無作為回答の混合 %v、切片の数値積分の分解能 %d（三つ組ごとの適応一様格子の Riemann 和、20 で刻み ≤ 0.6 logit）、判定者 %d\n",
 		r.Used.Lambda, r.Used.Tie, strings.Join(r.Used.Exclude, ", "), r.Used.Weighted, r.Used.Gamma, r.Used.ExcludeSameFamily, r.Used.CohZeroOnly, !r.Used.NoLapse, r.Used.Quadrature, r.Used.Judges)
-	fmt.Fprintf(w, "- 情報量の下限: %v; ゲート Δ(θ₀) ≥ %g、r_max %g、信頼 %g、n_T ≥ %d; 高精度求積 %d 点（σ̂ > %g）\n", co.MinInformative, co.GateDelta, co.RMax, co.GateConf, co.MinGateTriplets, co.HighNodes, co.HighNodesSigma)
+	fmt.Fprintf(w, "- 情報量の下限: %v; ゲート Δ(θ₀) ≥ %g、r_max %g、信頼 %g、n_T ≥ %d; 格子の確認: σ̂ > %g なら分解能 %d で再当てはめ\n", co.MinInformative, co.GateDelta, co.RMax, co.GateConf, co.MinGateTriplets, co.HighNodesSigma, co.HighNodes)
 	if len(r.Deviations) > 0 {
 		fmt.Fprintln(w, "\n**事前登録からの逸脱（判定は「否定されず」までに制限）:**")
 		for _, d := range r.Deviations {
@@ -82,16 +82,16 @@ func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
 
 	// Fits.
 	fmt.Fprintln(w, "\n## 当てはめ（決定文書 §11）")
-	fmt.Fprintf(w, "\n- 作業独立: 交互最適化 %d 回（収束 %v、循環 %v、上限 %v、内側の収束 %v）、NLL = %.2f、多点開始 %d 点の最大のずれ %.3f%s\n",
-		r.Indep.Outer, r.Indep.Converged, r.Indep.Cycled, r.Indep.Capped, r.Indep.InnerConverged, r.Indep.NegLogLik, len(r.Indep.Starts), r.Indep.StartSpread, spreadFlag(r.Indep.StartSpread))
+	fmt.Fprintf(w, "\n- 作業独立: 交互最適化 %d 回（収束 %v、循環 %v、上限 %v、内側の収束 %v）、%s、NLL = %.2f、多点開始 %d 点の最大のずれ %.3f%s\n",
+		r.Indep.Outer, r.Indep.Converged, r.Indep.Cycled, r.Indep.Capped, r.Indep.InnerConverged, validText(r.Indep), r.Indep.NegLogLik, len(r.Indep.Starts), r.Indep.StartSpread, spreadFlag(r.Indep.StartSpread))
 	for _, st := range r.Indep.Starts {
 		fmt.Fprintf(w, "  - %s: 目的関数 %.2f（収束 %v、循環 %v）\n", st.Name, st.Objective, st.Converged, st.Cycled)
 	}
 	if r.Mixed.Params.Beta != nil {
-		fmt.Fprintf(w, "- ランダム切片（適応ガウス–エルミート %d 点）: %d 回（収束 %v、循環 %v）、NLL = %.2f、σ̂ = %.3f、多点開始の最大のずれ %.3f%s\n",
-			r.Quadrature, r.Mixed.Outer, r.Mixed.Converged, r.Mixed.Cycled, r.Mixed.NegLogLik, r.Mixed.Params.Sigma, r.Mixed.StartSpread, spreadFlag(r.Mixed.StartSpread))
+		fmt.Fprintf(w, "- ランダム切片（適応一様格子の Riemann 和、分解能 %d）: %d 回（収束 %v、循環 %v）、%s、NLL = %.2f、σ̂ = %.3f、多点開始の最大のずれ %.3f%s\n",
+			r.Quadrature, r.Mixed.Outer, r.Mixed.Converged, r.Mixed.Cycled, validText(r.Mixed), r.Mixed.NegLogLik, r.Mixed.Params.Sigma, r.Mixed.StartSpread, spreadFlag(r.Mixed.StartSpread))
 		if r.MixedCheck != nil {
-			fmt.Fprintf(w, "  - σ̂ > %.1f なので %d 点で再当てはめ: θ の最大の変化 %.4f、σ̂ の変化 %+.4f\n", co.HighNodesSigma, co.HighNodes, r.MixedCheckMaxDiff, r.MixedCheckSigmaDiff)
+			fmt.Fprintf(w, "  - σ̂ > %.1f なので分解能 %d で再当てはめ（%s）: θ の最大の変化 %.4f、σ̂ の変化 %+.4f\n", co.HighNodesSigma, co.HighNodes, validText(*r.MixedCheck), r.MixedCheckMaxDiff, r.MixedCheckSigmaDiff)
 		}
 	} else {
 		fmt.Fprintln(w, "- **ランダム切片の当てはめは省略（共主要の一致が取れないので「妥当」にはならない）**")
@@ -180,13 +180,13 @@ func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
 			flag = "|偏り| > 0.5 SD"
 		}
 		fmt.Fprintf(w, "| %s | %.3f | %+.3f | %s | %.1f%% | %.1f%% | %.2e | %d/%d | [%s, %s] | [%s, %s] |\n", p.Name, p.Anchored, d.Bias, flag,
-			100*d.BoundaryShare, 100*d.DivergentShare, d.IQR, d.Reps, d.TotalReps, num(p.WarmCI[0]), num(p.WarmCI[1]), num(p.ColdCI[0]), num(p.ColdCI[1]))
+			100*d.BoundaryShare, 100*d.DivergentShare, d.IQR, d.Valid, d.TotalReps, num(p.WarmCI[0]), num(p.WarmCI[1]), num(p.ColdCI[0]), num(p.ColdCI[1]))
 	}
 	sh := fit.Summarise(r.Boot.Meta)
-	fmt.Fprintf(w, "\n反復の内訳（作業独立）: 循環 %.1f%%、上限到達 %.1f%%、非収束 %.1f%%、コールドスタート %d 回（θ₀ と全 0.5 から、ウォームの推定値は使わない）。", 100*sh.Cycled, 100*sh.Capped, 100*sh.NotConverged, sh.Cold)
+	fmt.Fprintf(w, "\n反復の内訳（作業独立）: 循環 %.1f%%、上限到達 %.1f%%、無効 %.1f%%（§11.2: 幅 ≥ %g の循環・上限到達・内側の非収束・失敗）、非収束 %.1f%%（旧指標: 不動点でも停留でもない、幅の狭い循環を含む）、コールドスタート %d 回（θ₀ と全 0.5 から、ウォームの推定値は使わない）。", 100*sh.Cycled, 100*sh.Capped, 100*sh.Invalid, fit.CycleTol, 100*sh.NotConverged, sh.Cold)
 	if r.Boot.MixedMeta != nil {
 		shm := fit.Summarise(r.Boot.MixedMeta)
-		fmt.Fprintf(w, " ランダム切片: 循環 %.1f%%、上限到達 %.1f%%、非収束 %.1f%%。", 100*shm.Cycled, 100*shm.Capped, 100*shm.NotConverged)
+		fmt.Fprintf(w, " ランダム切片: 循環 %.1f%%、上限到達 %.1f%%、無効 %.1f%%、非収束（旧指標） %.1f%%。", 100*shm.Cycled, 100*shm.Capped, 100*shm.Invalid, 100*shm.NotConverged)
 	}
 	fmt.Fprintln(w)
 	for _, p := range r.Params {
@@ -249,6 +249,11 @@ func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
 		fmt.Fprintln(w, "\n- **D は省略（「妥当」にはならない）**")
 	}
 	fmt.Fprintf(w, "\n**判定: %s（%s）**\n", r.Verdict.JA(), r.Verdict)
+	fmt.Fprintf(w, "\n逸脱による制限の前の判定（データに依る要素はすべて適用済み）: %s（%s）。", r.VerdictUncapped.JA(), r.VerdictUncapped)
+	if r.VerdictUncapped != r.Verdict {
+		fmt.Fprint(w, " 事前登録からの逸脱があるので最終の判定は「否定されず」までに制限した。")
+	}
+	fmt.Fprintln(w)
 	if len(r.Missing) > 0 {
 		fmt.Fprintln(w, "\n欠けている要素:")
 		for _, m := range r.Missing {
@@ -317,6 +322,14 @@ func nCell(d stats.ParamDecision) string {
 		s += fmt.Sprintf(" (≥%d)", d.MinN)
 	}
 	return s
+}
+
+// validText states whether a primary fit is a valid iterate (decisions §11.2) and the width of its cycle.
+func validText(r fit.Result) string {
+	if r.Cycled {
+		return fmt.Sprintf("有効な反復 %v（循環の幅 %.4f、許容 %g）", r.Valid(), r.CycleSpread, fit.CycleTol)
+	}
+	return fmt.Sprintf("有効な反復 %v", r.Valid())
 }
 
 func spreadFlag(s float64) string {
