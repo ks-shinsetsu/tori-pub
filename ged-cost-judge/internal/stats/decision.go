@@ -48,9 +48,9 @@ type DecisionInput struct {
 	BoundaryShare, DivergentShare float64
 	// TotalReps is B, the number of replicates attempted; fewer than MinRepsShare·B valid replicates is "not estimable" (0 disables).
 	TotalReps int
-	// Valid, if non-nil, is aligned with Boot and marks the replicates whose iterate is valid (decisions §11.2, §6);
-	// nil means every replicate. Invalid replicates stay in the interval; the floor counts the finite entries of
-	// Boot that are valid.
+	// Valid, if non-nil, is aligned with Boot and marks the replicates whose iterate is valid (decisions §11.2, §6:
+	// not capped, inner solver converged, fit returned); nil means every replicate. Invalid replicates stay in the
+	// interval; the floor counts the finite entries of Boot that are valid.
 	Valid []bool
 	// AnchoredIQR is the IQR of the parameter's own anchored replicates (before the sum normalization). The
 	// normalization spreads the other costs' variation onto a frozen coordinate, so the information floor must be

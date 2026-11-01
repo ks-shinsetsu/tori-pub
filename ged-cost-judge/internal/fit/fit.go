@@ -176,14 +176,6 @@ const ThetaMax = 10.0
 // BoundaryEps is the threshold below which a cost counts as "at the boundary" (decisions §6).
 const BoundaryEps = 1e-3
 
-// CycleTol bounds Result.CycleSpread for a cycling iterate to count as valid (decisions §11.2; the bootstrap
-// replicate floor of §6 counts on the same rule, Result.Valid). It is on the anchored scale (edge-extra = 1, θ_neg
-// included). GED is piecewise linear in θ, so an estimate can sit on a boundary between two matchings: the loop then
-// alternates between the two (a cycle) although the candidate rounds' costs agree to far below the anchored bootstrap
-// SD of the margin-judged costs (≈ 0.03 at the design size, P1) and far below the margin m = 0.25 (normalized; ŝ ≈ 1,
-// so the scales are comparable). 0.01 is a third of that SD; a wider cycle is not valid, as a cap is.
-const CycleTol = 0.01
-
 // Options configures estimation.
 type Options struct {
 	Judges int
@@ -326,7 +318,7 @@ type Result struct {
 	Cycled bool
 	// CycleSpread is the largest range (max − min) of any anchored coordinate (θ and θ_neg) over the rounds the loop
 	// would keep producing (the cycle) together with the returned round, so it bounds the distance between the
-	// returned estimate and every other candidate; 0 unless Cycled. Below CycleTol the estimate counts as determined (Valid).
+	// returned estimate and every other candidate; 0 unless Cycled. Reported, not a validity criterion (§11.2).
 	CycleSpread float64
 	// Capped indicates the outer loop hit MaxOuter without converging or cycling.
 	Capped bool
@@ -349,10 +341,11 @@ type Result struct {
 }
 
 // Valid is the one statement of the validity rule of decisions §11.2 (RepMeta.Valid and the §6 replicate floor
-// delegate to it): the inner solver stopped on its tolerances and the outer loop ended at a matching fixed point,
-// at a stationary objective, or in a cycle narrower than CycleTol. A wider cycle or a cap is not valid.
+// delegate to it): the inner solver stopped on its tolerances and the outer loop did not hit the round cap. A cycle
+// of any width is valid: it returns the round with the smallest objective, a tie on a kink of the piecewise-linear
+// GED, not a failure (§11 item 2); its width is recorded in CycleSpread and reported.
 func (r Result) Valid() bool {
-	return r.InnerConverged && (r.Converged || (r.Cycled && r.CycleSpread < CycleTol))
+	return r.InnerConverged && !r.Capped && (r.Converged || r.Cycled)
 }
 
 // AnyBoundary reports whether any free cost is at the lower boundary.

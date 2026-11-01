@@ -23,8 +23,11 @@ import (
 // substitution knot, say) are then equal in every sum and difference the solver forms, so a tie between two
 // assignments is broken by the solver's fixed rule and not by rounding noise that moves with θ (decisions §11.5:
 // the matching must be a deterministic, piecewise-constant function of θ; the estimation loop cannot converge
-// if it is not). The features returned by Compute are those of the chosen assignment, so the GED value itself
-// is not rounded; only a genuine difference below the grid can change which of two near-equal assignments is taken.
+// if it is not). That rule visits columns in an order that depends on the other entries, so an exact tie can still
+// be resolved differently at two θ; Compute therefore separates ties by cosine (tieEps1, tieEps2) and only entries
+// with identical cos remain with the solver's rule. The features returned by Compute are those of the chosen
+// assignment, so the GED value itself is not rounded; only a genuine difference below the grid can change which of
+// two near-equal assignments is taken.
 // The forbidden sentinel 1e9 lies outside the exact range (see costBits), so reduced costs that involve it are
 // inexact; that is harmless because a forbidden entry is never selected on a feasible instance (the feasible
 // entries always contain a perfect matching, so Dijkstra reaches a free column through them first) and the dual
@@ -69,9 +72,13 @@ func bipartiteMatch(sub [][]float64, del, ins []float64) (map[int]int, error) {
 	return out, nil
 }
 
-// costBits is the number of fractional bits of the assignment cost grid. With |cost| < 2^22 (the duals are sums of
-// at most n + m costs) every sum and difference of grid values is exact in a float64.
-const costBits = 30
+// costBits is the number of fractional bits of the assignment cost grid. A sum or difference of two grid values is
+// exact in a float64 while both are below 2^12 in magnitude (40 + 12 + 1 ≤ 53 bits). A cost is at most
+// 4·ThetaMax plus the tie key (≈ 40) and the duals are sums of at most n + m costs, far below 2^12 at this
+// experiment's sizes (≤ 18 propositions per graph; 55 was the largest magnitude seen in 3,000 random instances).
+// The 1e9 sentinel of forbidden entries is not snapped; reduced costs involving it are inexact but never selected.
+// The grid is fine enough for the tie-breaking keys of Compute (see tieEps1) to resolve cos differences of 2^−18.
+const costBits = 40
 
 // snap rounds c to the nearest multiple of 2^−costBits.
 func snap(c float64) float64 {
