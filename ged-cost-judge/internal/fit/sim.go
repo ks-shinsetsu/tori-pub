@@ -40,6 +40,9 @@ func SimulateJudgments(trips []Triplet, design []Judgment, p Params, rng *rand.R
 		case r < pa+pb:
 			k.Answer = AnswerB
 		}
+		if l := p.lapse(k.Judge); l > 0 && rng.Float64() < l {
+			k.Answer = Answer(rng.IntN(3))
+		}
 		out[i] = k
 	}
 	return out, nil

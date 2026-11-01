@@ -66,6 +66,7 @@ func TestGradient(t *testing.T) {
 		p.ThetaNeg = 0.7
 		p.Gamma = 0.2
 		p.Sigma = 0.9
+		p.Lapse = []float64{0.05, 0.1, 0.02}
 		for j := range 3 {
 			p.Beta[j], p.Tau[j], p.Pi[j] = 1.5+0.3*float64(j), 0.5+0.1*float64(j), 0.1*float64(j)
 		}
