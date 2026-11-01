@@ -183,7 +183,7 @@ func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
 			100*d.BoundaryShare, 100*d.DivergentShare, d.IQR, d.Valid, d.TotalReps, num(p.WarmCI[0]), num(p.WarmCI[1]), num(p.ColdCI[0]), num(p.ColdCI[1]))
 	}
 	sh := fit.Summarise(r.Boot.Meta)
-	fmt.Fprintf(w, "\n反復の内訳（作業独立）: 循環 %.1f%%、上限到達 %.1f%%、無効 %.1f%%（§11.2: 幅 ≥ %g の循環・上限到達・内側の非収束・失敗）、非収束 %.1f%%（旧指標: 不動点でも停留でもない、幅の狭い循環を含む）、コールドスタート %d 回（θ₀ と全 0.5 から、ウォームの推定値は使わない）。", 100*sh.Cycled, 100*sh.Capped, 100*sh.Invalid, fit.CycleTol, 100*sh.NotConverged, sh.Cold)
+	fmt.Fprintf(w, "\n反復の内訳（作業独立）: 循環 %.1f%%（最良の反復を返す。折れ点上の同点であり失敗ではない、§11.2）、上限到達 %.1f%%、無効 %.1f%%（§11.2・§6: 上限到達・内側の非収束・失敗）、非収束 %.1f%%（旧指標: 不動点でも停留でもない、循環を含む）、コールドスタート %d 回（θ₀ と全 0.5 から、ウォームの推定値は使わない）。", 100*sh.Cycled, 100*sh.Capped, 100*sh.Invalid, 100*sh.NotConverged, sh.Cold)
 	if r.Boot.MixedMeta != nil {
 		shm := fit.Summarise(r.Boot.MixedMeta)
 		fmt.Fprintf(w, " ランダム切片: 循環 %.1f%%、上限到達 %.1f%%、無効 %.1f%%、非収束（旧指標） %.1f%%。", 100*shm.Cycled, 100*shm.Capped, 100*shm.Invalid, 100*shm.NotConverged)
@@ -327,7 +327,7 @@ func nCell(d stats.ParamDecision) string {
 // validText states whether a primary fit is a valid iterate (decisions §11.2) and the width of its cycle.
 func validText(r fit.Result) string {
 	if r.Cycled {
-		return fmt.Sprintf("有効な反復 %v（循環の幅 %.4f、許容 %g）", r.Valid(), r.CycleSpread, fit.CycleTol)
+		return fmt.Sprintf("有効な反復 %v（循環の幅 %.4f、固定尺度）", r.Valid(), r.CycleSpread)
 	}
 	return fmt.Sprintf("有効な反復 %v", r.Valid())
 }

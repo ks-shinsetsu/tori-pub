@@ -227,9 +227,9 @@ func (m RepMeta) Valid() bool {
 }
 
 // Shares summarises the replicate metadata per cost: boundary and divergent shares, and overall cycled/capped
-// shares. Invalid is the share of replicates that are not valid (decisions §11.2, incl. failed fits);
-// NotConverged keeps the older metric (outer loop not converged or inner solver not converged, incl. failed fits;
-// a narrow cycle counts here but is valid) so earlier summaries stay comparable.
+// shares. Invalid is the share of replicates that are not valid (decisions §11.2, §6: capped, inner solver not
+// converged, or failed); NotConverged keeps the older metric (outer loop not converged or inner solver not
+// converged, incl. failed fits; a cycle counts here but is valid) so earlier summaries stay comparable.
 type Shares struct {
 	Boundary     [ged.NumParams]float64
 	Divergent    [ged.NumParams]float64

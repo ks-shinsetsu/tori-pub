@@ -156,8 +156,9 @@ func TestRecovery(t *testing.T) {
 	}
 }
 
-// TestValidIterate: the §11.2 validity of an iterate — a fixed point or stationary objective, a cycle narrower than
-// CycleTol, but not a wider cycle, a cap or an inner solver that stopped on a cap — and its summary over replicates.
+// TestValidIterate: the §11.2 validity of an iterate — a fixed point, a stationary objective or a cycle of any width
+// (best round returned), but not a cap or an inner solver that did not stop on its tolerances — and its summary over
+// replicates.
 func TestValidIterate(t *testing.T) {
 	cases := []struct {
 		r    Result
@@ -165,8 +166,8 @@ func TestValidIterate(t *testing.T) {
 	}{
 		{Result{Converged: true, InnerConverged: true}, true},
 		{Result{Converged: true, InnerConverged: false}, false},
-		{Result{Cycled: true, CycleSpread: CycleTol / 2, InnerConverged: true}, true},
-		{Result{Cycled: true, CycleSpread: CycleTol, InnerConverged: true}, false},
+		{Result{Cycled: true, CycleSpread: 0.005, InnerConverged: true}, true},
+		{Result{Cycled: true, CycleSpread: 0.24, InnerConverged: true}, true},
 		{Result{Capped: true, InnerConverged: true}, false},
 	}
 	var meta []RepMeta
@@ -180,18 +181,18 @@ func TestValidIterate(t *testing.T) {
 		}
 	}
 	meta = append(meta, RepMeta{Err: "boom"})
-	// Invalid: cases 1, 3, 4 and the failed one; the old NotConverged metric also counts the narrow cycle (case 2).
-	if sh := Summarise(meta); math.Abs(sh.Invalid-4.0/6) > 1e-12 || math.Abs(sh.NotConverged-5.0/6) > 1e-12 || math.Abs(sh.Cycled-2.0/6) > 1e-12 || math.Abs(sh.Capped-1.0/6) > 1e-12 {
+	// Invalid: cases 1, 4 and the failed one; the old NotConverged metric also counts the two cycles.
+	if sh := Summarise(meta); math.Abs(sh.Invalid-3.0/6) > 1e-12 || math.Abs(sh.NotConverged-5.0/6) > 1e-12 || math.Abs(sh.Cycled-2.0/6) > 1e-12 || math.Abs(sh.Capped-1.0/6) > 1e-12 {
 		t.Errorf("shares: %+v", sh)
 	}
-	if got, want := validMask(meta), []bool{true, false, true, false, false, false}; !slices.Equal(got, want) {
+	if got, want := validMask(meta), []bool{true, false, true, true, false, false}; !slices.Equal(got, want) {
 		t.Errorf("validMask = %v, want %v", got, want)
 	}
 	// The replicate floor counts valid replicates per column without double counting a replicate that has no row.
 	rows := [][]float64{{1}, {1}, {1}, {1}, {1}, nil}
 	d := stats.Decide(stats.DecisionInput{Est: 1, Boot: columnOf(rows, 0), Valid: validMask(meta), Theta0: 1, M: 0.25, TotalReps: len(rows)})
-	if d.Reps != 5 || d.Valid != 2 {
-		t.Errorf("reps %d valid %d, want 5 and 2", d.Reps, d.Valid)
+	if d.Reps != 5 || d.Valid != 3 {
+		t.Errorf("reps %d valid %d, want 5 and 3", d.Reps, d.Valid)
 	}
 }
 

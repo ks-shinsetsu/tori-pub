@@ -951,8 +951,8 @@ func verdict(res ConfirmResult, co ConfirmOptions) (uncapped, capped stats.Verdi
 		r    *Result
 	}{{"independence fit", &res.Indep}, {"random-intercept fit", mixedOrNil(res)}, {"high-resolution refit", res.MixedCheck}} {
 		if f.r != nil && !f.r.Valid() {
-			block(fmt.Sprintf("%s is not a valid iterate (§11.2): converged %v, cycled %v (spread %.4f ≥ %g), capped %v, inner converged %v",
-				f.name, f.r.Converged, f.r.Cycled, f.r.CycleSpread, CycleTol, f.r.Capped, f.r.InnerConverged))
+			block(fmt.Sprintf("%s is not a valid iterate (§11.2): converged %v, cycled %v, capped %v, inner converged %v",
+				f.name, f.r.Converged, f.r.Cycled, f.r.Capped, f.r.InnerConverged))
 		}
 	}
 	if co.SkipMixed {

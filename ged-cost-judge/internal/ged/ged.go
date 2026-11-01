@@ -80,6 +80,43 @@ var ParamNames = [NumParams]string{
 // EdgeExtraCost is the cost of an extra edge. β and θ scales cannot be separated, so it is fixed at 1 (the scale reference).
 const EdgeExtraCost = 1.0
 
+// Tie-breaking of the node assignment (decisions §11 item 5). The assignment solver sees
+//
+//	Sub(cos) + tieEps1·Σ_k h_k(cos) + tieEps2·(1 − cos)
+//
+// for every substitution entry; the features (and so the GED value) are those of the chosen assignment at the true
+// costs, so the two terms only choose among assignments. Why: the substitution function is flat below a knot whose
+// increment θ_k is 0 (at the lower bound) — with θ_cos0.3 = 0 every pair with cos ≤ 0.5 costs the same — so an
+// unrelated proposition and a strongly shifted one tie for the same reference proposition, the node matching (which
+// ignores the edges) is arbitrary there and the edge costs jump by 2–10 per triplet; the alternating fit then
+// cycled between the boundary and the interior (A.5 null seeds 104/110: 25% and 21% of the bootstrap replicates).
+// The matching at the boundary must therefore be the limit of the interior matchings, which makes the fitted
+// objective right-continuous in θ. Just inside the boundary (θ_k = δ) the cost of an assignment differs from the
+// tied value by δ·Σ_pairs h_k(cos), and within the flat interval of knot k the sum Σ_j h_j(cos) equals a constant
+// plus h_k(cos), so the first term reproduces the interior order for any knot at 0, including several at once. The
+// second term orders what the interior leaves tied (equal Σh), toward the higher cosine; in the always-flat region
+// cos ≤ 0.3 every h_j is 1, so there is no interior order to reproduce and the cosine alone orders. The two keys are not strictly lexicographic: the
+// cosine term can outweigh a difference in Σh smaller than n·tieEps2/tieEps1 = n·2^−10 (n = pairs involved, i.e.
+// cos differences of a few 10^−4), where the interior preference is itself marginal; a two-level solver is not
+// worth that. Magnitudes: both terms are above the 2^−costBits grid of bipartiteMatch — the first resolves Σh
+// differences ≥ 2^−28, the second cos differences ≥ 2^−18 ≈ 4·10^−6 per entry; only entries with identical cos
+// (a duplicated proposition) are left to the solver's own rule, whose pick can change with θ (A.5 null seed 106:
+// cos 0.260 against 0.263 fell below a 2^−30 grid and cycled in 20% of the replicates) — and the total
+// perturbation of an entry is at most 4·tieEps1 + tieEps2 ≈ 10^−3, so only a genuine cost difference below that
+// can change which assignment is taken.
+// Delete and insert entries carry no perturbation: at an exact tie with a substitution, delete + insert wins, and a
+// substitution beats delete + insert only when it is cheaper by more than its own perturbation.
+const (
+	tieEps1 = 1.0 / (1 << 12)
+	tieEps2 = 1.0 / (1 << 22)
+)
+
+// tieKey is the tie-breaking perturbation of a substitution entry (assignment only; see tieEps1).
+func tieKey(c float64) float64 {
+	h := SubBasis(c)
+	return tieEps1*(h[0]+h[1]+h[2]+h[3]) + tieEps2*(1-c)
+}
+
 // Knots are the knots (cos) of the substitution function.
 var Knots = [5]float64{1, 0.9, 0.7, 0.5, 0.3}
 
@@ -186,7 +223,7 @@ func Compute(ref, v Graph, sim Sim, t Theta) (Features, error) {
 		for j, b := range ref.Props {
 			c := math.Min(1, math.Max(0, sim(b.ID, a.ID)))
 			cos[i][j] = c
-			sub[i][j] = t.Sub(c)
+			sub[i][j] = t.Sub(c) + tieKey(c) // assignment only; Phi below uses SubBasis(c) at the true costs
 		}
 	}
 	ins := make([]float64, m)

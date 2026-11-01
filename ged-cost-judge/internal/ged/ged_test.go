@@ -126,6 +126,131 @@ func TestTieBreakIsStable(t *testing.T) {
 	}
 }
 
+// A knot increment at 0 flattens the substitution function below that knot, so candidates with different cos tie
+// exactly; the tie must go the way the interior (increment > 0) goes, the GED value must come from the true costs,
+// and the choice must not depend on proposition IDs or move under small θ perturbations (decisions §11 item 5).
+func TestBoundaryTieMatchesInterior(t *testing.T) {
+	// Single pair: s.p1 shifted far from its origin (cos 0.40) against an added proposition (cos 0.20 to s.p1); the
+	// added proposition's ID sorts before, between and after the others, so the solver's index rule cannot help.
+	for _, extra := range []string{"a1", "n1", "z1"} {
+		ref := Graph{Props: []Prop{{ID: "s.p0"}, {ID: "s.p1"}}, Edges: []Edge{{From: "s.p1", To: "s.p0", Kind: RA}}}
+		v := Graph{Props: []Prop{{ID: "s.p0"}, {ID: "s.p1"}, {ID: extra}}, Edges: []Edge{{From: "s.p1", To: "s.p0", Kind: RA}}}
+		sim := func(r, a string) float64 {
+			switch {
+			case r == a && r == "s.p1":
+				return 0.40
+			case r == a:
+				return 1
+			case r == "s.p1" && a == extra:
+				return 0.20
+			}
+			return 0.15
+		}
+		th := Current()
+		th[PSub03] = 0
+		f, err := Compute(ref, v, sim, th)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Phi[PEdgeMissing] != 0 || f.EdgeExtra != 0 || f.Phi[PNodeExtra] != 1 {
+			t.Fatalf("extra %s: boundary tie not broken as in the interior: phi %v extra %v", extra, f.Phi, f.EdgeExtra)
+		}
+		// The GED value is the true cost of that assignment: Sub(0.40) + θ_extra, with no trace of the ε terms.
+		if want := th.Sub(0.40) + th[PNodeExtra]; math.Abs(f.Cost(th)-want) > 1e-12 {
+			t.Fatalf("extra %s: cost %v, want %v", extra, f.Cost(th), want)
+		}
+		for k := range 100 {
+			p := th
+			for i := range p {
+				p[i] = math.Max(0, p[i]+0.01*float64((k*5+i*7)%9-4)/4)
+			}
+			p[PSub03] = 1e-6 * float64(k%3)
+			g, err := Compute(ref, v, sim, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if g.Signature() != f.Signature() {
+				t.Fatalf("extra %s, θ = %v: matching %s, want %s", extra, p, g.Signature(), f.Signature())
+			}
+		}
+	}
+
+	// Two pairs whose cos straddle the knot: {0.10, 0.35} against {0.25, 0.31}. In the interior the first wins
+	// (h₀.₃ sums 1 + 0.75 < 1 + 0.95) although its cos sum is lower, so a tie-break by cos alone would pick the second.
+	two := func(c map[[2]string]float64) Sim {
+		return func(r, a string) float64 {
+			if x, ok := c[[2]string{r, a}]; ok {
+				return x
+			}
+			return 0.05
+		}
+	}
+	ref := Graph{Props: []Prop{{ID: "p"}, {ID: "q"}}}
+	v := Graph{Props: []Prop{{ID: "a"}, {ID: "b"}}}
+	sim := two(map[[2]string]float64{{"p", "a"}: 0.10, {"q", "b"}: 0.35, {"q", "a"}: 0.25, {"p", "b"}: 0.31})
+	th := Current()
+	th[PSub03] = 0
+	f, err := Compute(ref, v, sim, th)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []float64{1e-6, 1e-4, 1e-2} {
+		p := th
+		p[PSub03] = d
+		g, err := Compute(ref, v, sim, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.Signature() != f.Signature() {
+			t.Fatalf("θ_cos0.3 = %g: matching %s, boundary %s", d, g.Signature(), f.Signature())
+		}
+	}
+	if f.Assign[0] != 0 || f.Assign[1] != 1 {
+		t.Fatalf("boundary matching %v, want a→p, b→q (the interior order)", f.Assign)
+	}
+
+	// The first knot at 0 flattens [0.9, 1]: {0.92, 0.99} against {0.95, 0.95}; the interior prefers the first.
+	sim = two(map[[2]string]float64{{"p", "a"}: 0.92, {"q", "b"}: 0.99, {"q", "a"}: 0.95, {"p", "b"}: 0.95})
+	th = Current()
+	th[PSub09] = 0
+	f, err = Compute(ref, v, sim, th)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []float64{1e-6, 1e-4, 1e-2} {
+		p := th
+		p[PSub09] = d
+		g, err := Compute(ref, v, sim, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.Signature() != f.Signature() || f.Assign[0] != 0 {
+			t.Fatalf("θ_cos0.9 = %g: matching %s, boundary %s (assign %v)", d, g.Signature(), f.Signature(), f.Assign)
+		}
+	}
+}
+
+// The tie-break terms live on the substitution entries only: a substitution that is genuinely cheaper or dearer than
+// delete + insert (by more than its perturbation) is not flipped, and an exact tie goes to delete + insert.
+func TestTieBreakDoesNotFlipDeleteInsert(t *testing.T) {
+	ref := Graph{Props: []Prop{{ID: "p"}}}
+	v := Graph{Props: []Prop{{ID: "a"}}}
+	sim := func(string, string) float64 { return 0.1 } // Sub(0.1) = Σ knots
+	for _, c := range []struct {
+		knots float64 // each knot increment; Sub = 4·knots against delete + insert = 2
+		sub   bool    // substitution expected
+	}{{0.5 - 0.0025, true}, {0.5 + 0.0025, false}, {0.5, false}} {
+		th := Theta{1, 1, c.knots, c.knots, c.knots, c.knots, 1, 0.75, 0.75, 0.75, 1}
+		f, err := Compute(ref, v, sim, th)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := f.Assign[0] == 0; got != c.sub {
+			t.Errorf("knots %v: substitution %v, want %v (phi %v)", c.knots, got, c.sub, f.Phi)
+		}
+	}
+}
+
 // The linearization must agree: with the same matching, Cost(θ) equals the GED from Compute(θ).
 func TestFeaturesAreLinear(t *testing.T) {
 	s := uniform()
