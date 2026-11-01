@@ -32,7 +32,7 @@ func TestConfirmatoryEndToEnd(t *testing.T) {
 	if res.Triplets != len(trips)-len(fit.DefaultExclude) {
 		t.Errorf("estimation set %d", res.Triplets)
 	}
-	if len(res.Params) != fit.NormLen-2 || len(res.Hypotheses) != 5 || len(res.LOJO) != 3 || res.D == nil {
+	if len(res.Params) != fit.NormLen-2 || len(res.Hypotheses) != 6 || res.HolmFamily != 6 || !res.C4Missing || len(res.LOJO) != 3 || res.D == nil {
 		t.Fatalf("shape: params %d hyps %d lojo %d D %v", len(res.Params), len(res.Hypotheses), len(res.LOJO), res.D != nil)
 	}
 	if res.Mixed.Params.Sigma <= 0 {
@@ -48,6 +48,13 @@ func TestConfirmatoryEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(out, res.Verdict.JA()) {
 		t.Errorf("verdict label %q not printed", res.Verdict.JA())
+	}
+	// Reduced B / D reps / empty floor are deviations: listed in the report and the verdict is capped.
+	if len(res.Deviations) == 0 || res.Verdict == stats.Validated || !strings.Contains(out, "事前登録からの逸脱") {
+		t.Errorf("deviations %v, verdict %v", res.Deviations, res.Verdict)
+	}
+	if !strings.Contains(out, "基準線なし（p = 1）") || !strings.Contains(out, "ℓ（無作為回答率）") {
+		t.Errorf("report lacks the C4 placeholder row or the lapse column")
 	}
 	t.Logf("verdict %s; missing %v; scale identified %v", res.Verdict, res.Missing, res.ScaleIdentified)
 }

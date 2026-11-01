@@ -59,8 +59,8 @@ func t1Stratum(d float64) string {
 // JudgeQCStats computes the mechanical judge QC on the unfiltered data, before any θ is fitted: the T1 reversal
 // gate of §9.1 (gate set = T1 triplets with Δ(θ₀) ≥ GateDelta, "same" in the denominator only, n_eff = gate
 // triplets), the tie share (≤ 40%) and Krippendorff's α with each other judge (≥ 0.4) as mechanical criteria, and
-// order consistency as a descriptive statistic. A judge is Excluded when it fails the gate, the tie share or the α
-// criterion with every other judge (an α that is not evaluable does not count against the judge).
+// order consistency and Krippendorff's α as descriptive statistics. A judge is Excluded when it fails the gate or
+// the tie share.
 func JudgeQCStats(trips []Triplet, js []Judgment, names []string, o QCOptions) JudgeQCResult {
 	if o.GateDelta <= 0 {
 		o.GateDelta = 2
@@ -183,21 +183,8 @@ func JudgeQCStats(trips []Triplet, js []Judgment, names []string, o QCOptions) J
 		if !math.IsNaN(r.TieShare[j]) && r.TieShare[j] > o.MaxTieShare {
 			reasons = append(reasons, "tie share")
 		}
-		if J >= 2 {
-			allBelow, any := true, false
-			for b := range J {
-				if b == j || math.IsNaN(r.Alpha[j][b]) {
-					continue
-				}
-				any = true
-				if r.Alpha[j][b] >= o.MinAlpha {
-					allBelow = false
-				}
-			}
-			if any && allBelow {
-				reasons = append(reasons, "Krippendorff α below 0.4 with every other judge")
-			}
-		}
+		// Krippendorff's α is descriptive (decisions §9 as revised 2026-10-29): at the design's Δ mix the reference
+		// judges of the power analysis sit at pairwise α ≈ 0.25–0.34, so a fixed bar is not calibrated.
 		r.Excluded[j] = len(reasons) > 0
 		if len(reasons) > 0 {
 			r.Reasons[j] = joinReasons(reasons)

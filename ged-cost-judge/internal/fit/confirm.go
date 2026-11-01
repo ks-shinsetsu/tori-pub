@@ -47,8 +47,15 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 		res.Options.JudgeNames = co.JudgeNames
 	}
 
-	// 1. Judge QC before θ (decisions §9, §9.1, §13 item 5).
-	res.QC = JudgeQCStats(trips, js, co.JudgeNames, QCOptions{GateDelta: co.GateDelta, RMax: co.RMax, Conf: co.GateConf})
+	res.Deviations = Preregistered(co, opts)
+	res.Used = summarise(co, opts)
+
+	// 1. Judge QC before θ (decisions §9, §9.1, §13 item 5), on the triplets that survive the flag filter (not the
+	// judgment-level family filter): pilot, QT30 and the other excluded sets stay out of the gate, the tie share and α.
+	qcOpts := opts
+	qcOpts.ExcludeSameFamily, qcOpts.CohZeroOnly, qcOpts.Weights = false, false, nil
+	qcT, qcJ, _ := Filter(trips, js, qcOpts)
+	res.QC = JudgeQCStats(qcT, qcJ, co.JudgeNames, QCOptions{GateDelta: co.GateDelta, RMax: co.RMax, Conf: co.GateConf})
 	names := co.JudgeNames
 	if co.ApplyExclusions {
 		for j := opts.Judges - 1; j >= 0; j-- {
@@ -122,6 +129,8 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 		}
 	}
 
+	res.Quadrature = res.Used.Quadrature
+
 	// 4. Multi-start fits (decisions §11.3; random starts stand in for the CMA-ES check).
 	starts, startNames := DefaultStarts(co.Theta0)
 	if co.RandomStarts > 0 {
@@ -173,9 +182,18 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 	sort.Slice(res.Extrapolated, func(i, j int) bool { return res.Extrapolated[i].Index < res.Extrapolated[j].Index })
 
 	// 7. Confirmatory contrasts (decisions §4).
-	res.Hypotheses, err = hypotheses(trips, js, res, baselines, co)
+	res.Hypotheses, res.C4Missing, err = hypotheses(trips, js, res, baselines, co)
 	if err != nil {
 		return res, err
+	}
+	res.HolmFamily = len(res.Hypotheses)
+	if res.C4Missing {
+		res.Notes = append(res.Notes, "C4 baseline (B1, whole-text embedding) not supplied: C4 enters the Holm family of 6 with p = 1")
+	}
+	if !res.ScaleIdentified {
+		for i := range res.Hypotheses {
+			res.Hypotheses[i].NotEvaluable, res.Hypotheses[i].Supported = true, false
+		}
 	}
 
 	// 8. D criterion (decisions §7).
@@ -226,7 +244,7 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 		col := Column(res.Boot.Theta, p)
 		half[p] = 3 * (Quantile(col, 0.8413) - Quantile(col, 0.1587)) / 2
 	}
-	res.Stability, err = MatchingStability(trips, res.Indep.Params.Theta, half, 64, co.Seed+400)
+	res.Stability, err = MatchingStability(trips, res.Indep.Params.Theta, half, 64, co.Seed+400, opts.Tie)
 	if err != nil {
 		return res, err
 	}
@@ -266,7 +284,7 @@ type ConfirmOptions struct {
 	// ApplyExclusions drops judges that fail the mechanical QC before θ is fitted (default true; set SkipExclusions to keep them).
 	ApplyExclusions bool
 	SkipExclusions  bool
-	// SkipMixed / SkipD / SkipLOJO omit parts for quick runs; the verdict then cannot be "validated".
+	// SkipMixed / SkipD / SkipLOJO omit parts for quick runs; every skip is a deviation (the verdict then cannot be "validated").
 	SkipMixed, SkipD, SkipLOJO bool
 	// Untied keeps the three type costs free (diagnostic fit of §12b); the primary analysis is tied.
 	Untied  bool
@@ -275,8 +293,10 @@ type ConfirmOptions struct {
 	// refitted with HighNodes nodes (0 → 80) and the change is reported.
 	HighNodes      int
 	HighNodesSigma float64
-	// Gate parameters of §9.1 (0 → 2.0, 0.20, 0.90).
+	// Gate parameters of §9.1 (0 → 2.0, 0.20, 0.90); MinGateTriplets is the n_T below which the gate is not evaluable
+	// and "validated" is blocked (0 → 100; < 0 → no floor).
 	GateDelta, RMax, GateConf float64
+	MinGateTriplets           int
 	// Truth (simulation only) adds the true values to the table.
 	Truth   *ged.Theta
 	TrueNeg *float64
@@ -330,7 +350,163 @@ func (co ConfirmOptions) withDefaults(opts Options) ConfirmOptions {
 	if co.GateConf <= 0 {
 		co.GateConf = stats.GateConf
 	}
+	if co.MinGateTriplets == 0 {
+		co.MinGateTriplets = 100
+	}
 	return co
+}
+
+// OptionsUsed summarises the fit options actually applied by Confirmatory.
+type OptionsUsed struct {
+	Lambda            float64
+	Tie               bool
+	Exclude           []string
+	Weighted          bool
+	Gamma             GammaMode
+	ExcludeSameFamily bool
+	CohZeroOnly       bool
+	NoLapse           bool
+	Quadrature        int
+	Judges            int
+}
+
+func summarise(co ConfirmOptions, opts Options) OptionsUsed {
+	excl := opts.Exclude
+	if excl == nil && !opts.IncludeAll {
+		excl = DefaultExclude
+	}
+	if opts.IncludeAll {
+		excl = nil
+	}
+	q := opts.Quadrature
+	if q <= 0 {
+		q = 20
+	}
+	return OptionsUsed{Lambda: opts.Lambda, Tie: !co.Untied, Exclude: slices.Clone(excl), Weighted: opts.Weighted, Gamma: opts.Gamma,
+		ExcludeSameFamily: opts.ExcludeSameFamily, CohZeroOnly: opts.CohZeroOnly, NoLapse: opts.NoLapse, Quadrature: q, Judges: opts.Judges}
+}
+
+// Preregistered lists every departure of (co, opts) from the pre-registered primary settings of decisions-stats
+// (§1 #1, #5, #6, #7, #9, #12, #15; §3; §9; §11; §12b; §12c; §16 #16). Confirmatory records the list and caps the
+// verdict at "not contradicted" when it is not empty; the §12c sensitivity fits are expected to appear here.
+func Preregistered(co ConfirmOptions, opts Options) []string {
+	co = co.withDefaults(opts)
+	var d []string
+	add := func(format string, a ...any) { d = append(d, fmt.Sprintf(format, a...)) }
+	if co.Theta0 != ged.Current() {
+		add("θ₀ is not the current table")
+	}
+	if co.M != 0.25 {
+		add("m = %g (pre-registered 0.25)", co.M)
+	}
+	if !slices.Equal(co.U, DefaultU) {
+		add("normalization set U differs from the pre-registered six unit-type costs")
+	}
+	if co.B != 1000 {
+		add("B = %d (pre-registered 1000)", co.B)
+	}
+	if co.DReps != 200 {
+		add("nested-D replicates = %d (pre-registered 200)", co.DReps)
+	}
+	if co.DRepeats != 4 {
+		add("CV repeats = %d (pre-registered 4)", co.DRepeats)
+	}
+	if co.LOJOReps != co.B {
+		add("leave-one-judge-out bootstrap B = %d ≠ B", co.LOJOReps)
+	}
+	if !equalIntMap(co.MinInformative, DefaultMinInformative()) {
+		add("minimum informative counts differ from §15.3 (or the floor is off)")
+	}
+	if co.RandomStarts != 2 {
+		add("random starts = %d (pre-registered 2)", co.RandomStarts)
+	}
+	if co.SkipExclusions {
+		add("judge QC exclusions not applied")
+	}
+	if co.SkipMixed {
+		add("random-intercept fit skipped")
+	}
+	if co.SkipD {
+		add("D criterion skipped")
+	}
+	if co.SkipLOJO {
+		add("leave-one-judge-out skipped")
+	}
+	if co.Untied {
+		add("type tie off (diagnostic fit)")
+	}
+	if co.HighNodes != 80 || co.HighNodesSigma != 2 {
+		add("quadrature check settings differ from 80 nodes at σ̂ > 2")
+	}
+	if co.GateDelta != 2 || co.RMax != stats.GateRMax || co.GateConf != stats.GateConf || co.MinGateTriplets != 100 {
+		add("T1 gate settings differ from §9.1")
+	}
+	if opts.Lambda != 0 {
+		add("λ = %g (pre-registered 0)", opts.Lambda)
+	}
+	if len(opts.Fixed) > 0 {
+		add("fixed cost coordinates")
+	}
+	if opts.FixTheta {
+		add("θ fixed")
+	}
+	excl := opts.Exclude
+	if excl == nil && !opts.IncludeAll {
+		excl = DefaultExclude
+	}
+	if opts.IncludeAll || !sameSet(excl, DefaultExclude) {
+		add("triplet exclusion list differs from the default (x_spk, diag_ca_type, qt30, del_add_cooccur, pilot)")
+	}
+	if opts.Weighted || opts.Weights != nil {
+		add("importance-weighted likelihood (§12c sensitivity)")
+	}
+	if opts.Gamma != GammaOff {
+		add("coherence covariate γ in the model (§10 sensitivity)")
+	}
+	if opts.ExcludeSameFamily {
+		add("family-coupling filter on (§12c sensitivity)")
+	}
+	if opts.CohZeroOnly {
+		add("restricted to Δcoh = 0 (§10 sensitivity b)")
+	}
+	if opts.NoLapse {
+		add("lapse mixture off (pre-2026-10-29 model)")
+	}
+	if opts.Quadrature != 0 && opts.Quadrature != 20 {
+		add("quadrature nodes = %d (pre-registered 20 adaptive)", opts.Quadrature)
+	}
+	if opts.AuxRidge != 0 && opts.AuxRidge != 1e-4 {
+		add("AuxRidge = %g (pre-registered 1e-4)", opts.AuxRidge)
+	}
+	return d
+}
+
+func equalIntMap(a, b map[int]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := map[string]bool{}
+	for _, x := range a {
+		m[x] = true
+	}
+	for _, x := range b {
+		if !m[x] {
+			return false
+		}
+	}
+	return true
 }
 
 // DefaultMinInformative are the §15.3 minimum informative counts at 3,000 triplets (normalized indices).
@@ -350,6 +526,16 @@ type RuleDelta struct {
 // ConfirmResult is everything the confirmatory report prints.
 type ConfirmResult struct {
 	Options ConfirmOptions
+	// Used summarises the fit options actually applied; Deviations lists every departure from the pre-registered
+	// settings (non-empty caps the verdict at "not contradicted"); Notes are non-capping remarks.
+	Used       OptionsUsed
+	Deviations []string
+	Notes      []string
+	// Quadrature is the Gauss–Hermite node count of the mixed fit.
+	Quadrature int
+	// HolmFamily is the size of the Holm family (6: C4 is kept with p = 1 when its baseline is missing, C4Missing).
+	HolmFamily int
+	C4Missing  bool
 	// Judge QC (on the unfiltered data, before θ) and the judges dropped by it.
 	QC             JudgeQCResult
 	ExcludedJudges []string
@@ -396,6 +582,9 @@ type ParamResult struct {
 	Combined stats.Label
 	// WarmCI / ColdCI are the 5%/95% quantiles of the warm- and cold-started replicates (independence, normalized).
 	WarmCI, ColdCI [2]float64
+	// CI90NoDivergent is the 90% interval without the divergent replicates (independence), set when the divergent
+	// share exceeds 2% (decisions §6).
+	CI90NoDivergent *stats.Interval
 }
 
 // ExtrapolatedRow is a tied type cost reported "extrapolated from Master, not calibrated" (decisions §12b).
@@ -415,6 +604,9 @@ type HypothesisResult struct {
 	ExactP      float64
 	ZeroDropped int
 	Eligible    int
+	// Missing marks a placeholder (C4 without a baseline: p = 1); NotEvaluable marks a contrast on an unidentified scale.
+	Missing      bool
+	NotEvaluable bool
 }
 
 // LOJOResult is the decision table with one judge removed.
@@ -500,6 +692,20 @@ func decisions(ind Result, boot [][]float64, meta []RepMeta, mix *Result, mboot 
 			row.Combined = stats.Combine(row.Indep.Label, d.Label)
 		}
 		row.WarmCI, row.ColdCI = br.WarmCold(bootN, meta, i)
+		if row.Indep.DivergentShare > stats.DivergentReport {
+			var keep [][]float64
+			for r, m := range meta {
+				div := false
+				for p := range ged.NumParams {
+					div = div || m.Divergent[p]
+				}
+				if !div && r < len(bootN) {
+					keep = append(keep, bootN[r])
+				}
+			}
+			col := Column(keep, i)
+			row.CI90NoDivergent = &stats.Interval{Lo: Quantile(col, 0.05), Hi: Quantile(col, 0.95)}
+		}
 		rows = append(rows, row)
 	}
 	// Scale identification (decisions §2/§3 as revised): if any member of U is not estimable, ŝ is not identified
@@ -549,7 +755,7 @@ func contrastBoot(p Params, boot [][]float64, U []int, f func(v []float64) float
 }
 
 // hypotheses runs H1, H2, H4a, H4b and the C-family with their stated null values and Holm over the family.
-func hypotheses(trips []Triplet, js []Judgment, res ConfirmResult, baselines []RuleDelta, co ConfirmOptions) ([]HypothesisResult, error) {
+func hypotheses(trips []Triplet, js []Judgment, res ConfirmResult, baselines []RuleDelta, co ConfirmOptions) ([]HypothesisResult, bool, error) {
 	type spec struct {
 		id, name string
 		f        func(v []float64) float64
@@ -578,13 +784,19 @@ func hypotheses(trips []Triplet, js []Judgment, res ConfirmResult, baselines []R
 	// C-family: R0 against R1 (C1) and the supplied baselines (C4 = B1).
 	d0, err := Delta(trips, co.Theta0)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	d1, err := Delta(trips, R1())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	rules := append([]RuleDelta{{ID: "C1", Name: "R1 (naive uniform costs)", Delta: d1}}, baselines...)
+	c4 := false
+	for _, b := range baselines {
+		if b.ID == "C4" {
+			c4 = true
+		}
+	}
 	nonNeg := make([]bool, len(trips))
 	cluster := make([]int, len(trips))
 	strata := make([]string, len(trips))
@@ -615,6 +827,10 @@ func hypotheses(trips []Triplet, js []Judgment, res ConfirmResult, baselines []R
 			Discordant: [2]int{b, c}, ExactP: stats.McNemarExact(b, c, true), ZeroDropped: dropped, Eligible: n + dropped}
 		out = append(out, h)
 	}
+	if !c4 {
+		out = append(out, HypothesisResult{ID: "C4", Name: "agree(R0) − agree(B1) > 0 (baseline not supplied)", Missing: true,
+			Indep: stats.ContrastResult{P: 1, Null: 0, Side: stats.Greater}})
+	}
 	ps := make([]float64, len(out))
 	for i, h := range out {
 		ps[i] = h.Indep.P
@@ -629,7 +845,7 @@ func hypotheses(trips []Triplet, js []Judgment, res ConfirmResult, baselines []R
 	for i := range out {
 		out[i].PHolm, out[i].Reject = adj[i], rej[i]
 	}
-	return out, nil
+	return out, !c4, nil
 }
 
 // DBounds returns the one-sided 95% lower and upper bounds (q₀.₀₅, q₀.₉₅) of the agreement form of D (decisions §7 as revised).
@@ -665,6 +881,18 @@ func verdict(res ConfirmResult, co ConfirmOptions) (stats.VerdictLabel, []string
 	}
 	in.DLower95, in.DUpper95 = res.D.DBounds()
 	v, missing := stats.Verdict(in)
+	if res.QC.NT < co.MinGateTriplets {
+		missing = append(missing, fmt.Sprintf("T1 gate not evaluable: n_T = %d < %d (§9.1 data requirement)", res.QC.NT, co.MinGateTriplets))
+		if v == stats.Validated {
+			v = stats.NotContradicted
+		}
+	}
+	if len(res.Deviations) > 0 {
+		missing = append(missing, "non-pre-registered settings (see the deviations list): the verdict is capped at \"not contradicted\"")
+		if v == stats.Validated {
+			v = stats.NotContradicted
+		}
+	}
 	if co.SkipMixed {
 		missing = append(missing, "random-intercept fit skipped: no co-primary agreement")
 		if v == stats.Validated {
@@ -706,7 +934,7 @@ func DefaultStrata(trips []Triplet, th0 ged.Theta) ([]string, error) {
 
 // MatchingStability is the share of triplets whose matching signature changes anywhere in the box
 // center ± halfWidth: it checks the 2·11 axis points and corners random corners of the box (decisions §11.6).
-func MatchingStability(trips []Triplet, center ged.Theta, halfWidth [ged.NumParams]float64, corners int, seed uint64) (float64, error) {
+func MatchingStability(trips []Triplet, center ged.Theta, halfWidth [ged.NumParams]float64, corners int, seed uint64, tie map[int]int) (float64, error) {
 	if len(trips) == 0 {
 		return math.NaN(), nil
 	}
@@ -718,6 +946,9 @@ func MatchingStability(trips []Triplet, center ged.Theta, halfWidth [ged.NumPara
 	check := func(th ged.Theta) error {
 		for p := range th {
 			th[p] = clampTo(th[p], 0, ThetaMax)
+		}
+		for p, m := range tie {
+			th[p] = th[m] // tied coordinates follow their master, as unpack does
 		}
 		s, err := Signatures(trips, th)
 		if err != nil {
