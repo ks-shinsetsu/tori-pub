@@ -228,6 +228,8 @@ type Options struct {
 	Quadrature int
 	// Sigma0 is the initial random-intercept SD for FitMixed (0 → 1).
 	Sigma0 float64
+	// Trace, if set, receives one record per outer round (diagnostics only; no effect on the fit).
+	Trace func(RoundTrace)
 	// NoLapse fixes every ℓ_j at 0 (the pre-2026-10-29 model; a recorded deviation in Confirmatory).
 	NoLapse bool
 }
@@ -273,6 +275,21 @@ func NumFree(opts Options) int {
 		}
 	}
 	return n
+}
+
+// RoundTrace is one outer round of the alternating optimization (Options.Trace).
+type RoundTrace struct {
+	Outer int
+	// Inner is the objective at the end of the inner solve (old matching); True the objective after re-solving the matching.
+	Inner, True float64
+	// Changed is the number of triplets whose matching changed; MaxDeltaShift the largest |Δ_new − Δ_old| at the new θ
+	// among them, and SumDeltaShift the sum of those absolute shifts.
+	Changed       int
+	MaxDeltaShift float64
+	SumDeltaShift float64
+	Theta         ged.Theta
+	InnerIters    int
+	InnerConv     bool
 }
 
 // StartResult records one start of a multi-start fit.
@@ -1203,6 +1220,18 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 			best, bestF = cur, f
 		}
 		sig := sigOf(next)
+		if opts.Trace != nil {
+			tr := RoundTrace{Outer: outer, Inner: br.F, True: f, Theta: p.Theta, InnerIters: br.Iter, InnerConv: br.Converged}
+			for i := range next {
+				if next[i].sig != ds[i].sig {
+					tr.Changed++
+					sh := math.Abs(next[i].value(p.Theta) - ds[i].value(p.Theta))
+					tr.MaxDeltaShift = math.Max(tr.MaxDeltaShift, sh)
+					tr.SumDeltaShift += sh
+				}
+			}
+			opts.Trace(tr)
+		}
 		centersStable := !mixed || math.Abs(f-br.F) < 1e-6*math.Max(1, math.Abs(f))
 		if sig == sigOf(ds) {
 			if centersStable {
