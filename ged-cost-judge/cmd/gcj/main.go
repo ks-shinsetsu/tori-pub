@@ -28,7 +28,8 @@ import (
 const (
 	defJudgeEffort   = "gpt-5.6-luna=low,claude-sonnet-5-5=low,claude-haiku-5-5=low"
 	defJudgeThinking = "claude-sonnet-5-5=adaptive,claude-haiku-5-5=adaptive"
-	defGenEffort     = "claude-sonnet-5-5=medium"
+	defGenEffort     = "claude-sonnet-5-5=medium,claude-haiku-5-5=medium"
+	defGenThinking   = "claude-haiku-5-5=adaptive"
 )
 
 func main() {
@@ -49,12 +50,13 @@ func main() {
 		outDir    = flag.String("out", "out", "出力先")
 		budget    = flag.Float64("budget", -1, "API の費用の上限（USD）。超えたら以降の呼び出しを止め、バッチは投げる前に見込みを確かめる。負なら既定（-sources 750 で $260 = dataset-spec §4.5 の定価の 1.5 倍、件数に比例。-topics は $2、-audit は $5。0 は API を使わない）")
 		promptVer = flag.String("prompt-version", synth.V2, "v2: 改訂版のパイプライン（例示つきの生成、realize_v3、盲検の再注釈、2 系列）。v1: パイロット 2 の手順（luna のみ。応答のキャッシュで再現する）")
-		gens      = flag.String("generators", "gpt-5.6-luna,claude-sonnet-5-5", "v2: 生成モデル（半数ずつ。検証者は別系列の方）")
+		gens      = flag.String("generators", "gpt-5.6-luna,claude-sonnet-5-5", "v2: 生成モデル（半数ずつ）")
+		verifier  = flag.String("verifier", defaultVerifier, "v2: 検証者（G1 の再注釈・G4 の検証・-audit の再注釈。どの生成モデルの出力もこのモデルが検証する）。既定は費用のため Haiku 5.5（書き手と同じ系列の Sonnet 5.5 の出力も検証する）")
 		judges    = flag.String("judges", "gpt-5.6-luna,claude-sonnet-5-5,claude-haiku-5-5", "v2: 判定者（全三つ組 × 提示順 2。Anthropic はバッチ）")
 		jEffort   = flag.String("judge-effort", defJudgeEffort, "v2: 判定者ごとの effort（model=low|medium|high|xhigh|max、カンマ区切り）。既定は luna・Sonnet 5.5・Haiku 5.5 とも low")
 		jThinking = flag.String("judge-thinking", defJudgeThinking, "v2: 判定者ごとの拡張思考（model=adaptive|off）。既定は Sonnet 5.5・Haiku 5.5 とも adaptive（Haiku 5.5 は既定で思考するので明示して固定する）。luna には指定できない")
-		gEffort   = flag.String("gen-effort", defGenEffort, "v2: 生成・書き下し・検証のモデルごとの effort（model=…）。既定は Sonnet 5.5 が medium、luna は API の既定")
-		gThinking = flag.String("gen-thinking", "", "v2: 生成・書き下し・検証のモデルごとの拡張思考（model=adaptive|off）")
+		gEffort   = flag.String("gen-effort", defGenEffort, "v2: 生成・書き下し・検証のモデルごとの effort（model=…）。既定は Sonnet 5.5・Haiku 5.5 とも medium、luna は API の既定")
+		gThinking = flag.String("gen-thinking", defGenThinking, "v2: 生成・書き下し・検証のモデルごとの拡張思考（model=adaptive|off）。既定は Haiku 5.5 が adaptive（既定で思考するので明示して固定する）")
 		topicBank = flag.String("topic-bank", "", "v2: 話題バンクのファイル（既定 <out>/topics.json）")
 		p2        = flag.Bool("p2", false, "v2: P2 パイロットとして実行する（記録に pilot=true、θ を出さず補助パラメータ・QC・破棄率・例示の組と領域の ICC を報告）")
 		withQT30  = flag.Bool("with-qt30", false, "v2: <out>/qt30_sources.json（-import-qt30）を転移セットとして加える")
@@ -66,7 +68,7 @@ func main() {
 	}
 	po := pilotOptions{
 		sources: *sources, seed: *seed, boot: *boot, lambda: *lambda, m: *margin, out: *outDir, budget: *budget, verify: *verify,
-		promptVersion: *promptVer, generators: parseList(*gens), judges: parseList(*judges),
+		promptVersion: *promptVer, generators: parseList(*gens), judges: parseList(*judges), verifier: *verifier,
 		genEffort: parseModelMap(*gEffort), genThinking: parseModelMap(*gThinking),
 		judgeEffort: parseModelMap(*jEffort), judgeThinking: parseModelMap(*jThinking),
 		topicBank: *topicBank, p2: *p2, withQT30: *withQT30, aifdb: *aifdb,

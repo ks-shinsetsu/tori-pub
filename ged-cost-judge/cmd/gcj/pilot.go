@@ -46,6 +46,8 @@ type pilotOptions struct {
 	promptDir     string
 	generators    []string
 	judges        []string
+	// verifier verifies every generator's output (G1 re-annotation, G4, the -audit re-annotations); "" → defaultVerifier.
+	verifier      string
 	genEffort     map[string]string
 	genThinking   map[string]string
 	judgeEffort   map[string]string
@@ -70,9 +72,16 @@ type pilotOptions struct {
 
 // Defaults of the revised pipeline (dataset-spec §4.1, plan §5.1).
 var (
-	defaultGenerators = []string{"gpt-5.6-luna", "claude-sonnet-5-5"}
+	defaultGenerators = []string{"gpt-5.6-luna", "claude-sonnet-5-5", "claude-haiku-5-5"}
 	defaultJudges     = []string{"gpt-5.6-luna", "claude-sonnet-5-5", "claude-haiku-5-5"}
+	// defaultVerifier is the one verifier of every generator (user decision 2026-11-11, for cost: Haiku 5.5 is 1/20
+	// of Sonnet 5.5's price). It replaces the other-family verifier of dataset-spec §4.1, so Sonnet's output is
+	// verified within its family; §12c's family-coupling filter reports the consequence.
+	defaultVerifier = "claude-haiku-5-5"
 )
+
+// verifierModel is the configured verifier (defaultVerifier when unset).
+func (o pilotOptions) verifierModel() string { return cmp(o.verifier, defaultVerifier) }
 
 // listBudget is the §4.5 list-price total for 750 sources; -budget defaults to 1.5× that, scaled by -sources.
 const (
@@ -802,7 +811,7 @@ type pilotEnv struct {
 
 func (o pilotOptions) allModels() []string {
 	var ms []string
-	for _, m := range append(slices.Clone(o.generators), o.judges...) {
+	for _, m := range append(append(slices.Clone(o.generators), o.judges...), o.verifierModel()) {
 		if !slices.Contains(ms, m) {
 			ms = append(ms, m)
 		}
@@ -870,6 +879,15 @@ func (e *limitedEmbedder) Embed(ctx context.Context, texts []string) ([][]float3
 	}
 	defer func() { <-e.sem }()
 	return e.Embedder.Embed(ctx, texts)
+}
+
+// agent is model as a generation-side agent (writer or verifier) with its -gen-effort / -gen-thinking setting.
+func (r *v2run) agent(model string) (synth.Agent, error) {
+	c, ok := r.env.clients[model]
+	if !ok {
+		return synth.Agent{}, fmt.Errorf("pilot: no client for %s", model)
+	}
+	return synth.NewAgent(c, model, r.o.genEffort[model], r.o.genThinking[model]), nil
 }
 
 // batched reports whether the generators or their verifiers send through a Coalescer.
@@ -962,7 +980,7 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 	if len(o.generators) == 0 {
 		return nil, errors.New("pilot: no generator")
 	}
-	for i, m := range o.generators {
+	for _, m := range o.generators {
 		c, ok := env.clients[m]
 		if !ok {
 			return nil, fmt.Errorf("pilot: no client for %s", m)
@@ -971,18 +989,12 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 			SourcePrompt: r.prompts["synth_source_v2"], RealizePrompt: r.prompts["realize_v3"], VerifyPrompt: r.prompts["verify_v2"],
 			VerifySourcePrompt: r.prompts["verify_source_v1"], JudgePrompt: r.prompts["judge_v1"], TopicPrompt: r.prompts["synth_topics_v1"],
 			Exemplars: exs}
-		// The verifier is the other family (dataset-spec §4.1): the next generator of a different family.
-		for k := 1; k < len(o.generators); k++ {
-			v := o.generators[(i+k)%len(o.generators)]
-			if synth.FamilyOf(v) != synth.FamilyOf(m) {
-				a := synth.NewAgent(env.clients[v], v, o.genEffort[v], o.genThinking[v])
-				g.Verifier = &a
-				break
-			}
+		// One verifier for every generator (defaultVerifier); it may share the writer's family.
+		a, err := r.agent(o.verifierModel())
+		if err != nil {
+			return nil, err
 		}
-		if g.Verifier == nil {
-			return nil, fmt.Errorf("pilot: no generator of another family than %s to verify it (dataset-spec §4.1: the verifier is never the realizer's family); add one to -generators", m)
-		}
+		g.Verifier = &a
 		r.gens[m] = g
 	}
 	for _, m := range o.judges {
@@ -2139,6 +2151,8 @@ type projection struct {
 	budget             float64
 	// genBatch: the Anthropic generation and verification calls go through Message Batches too.
 	genBatch bool
+	// verifier takes every verification call (G1 verify, G4 verify) and the audits.
+	verifier string
 }
 
 func projectionFor(o pilotOptions, pricing *llm.PriceTable) projection {
@@ -2152,7 +2166,7 @@ func projectionFor(o pilotOptions, pricing *llm.PriceTable) projection {
 	if pricing == nil {
 		pricing = llm.DefaultPricing()
 	}
-	return projection{generators: gens, judges: judges, pricing: pricing, budget: defaultBudget(750)}
+	return projection{generators: gens, judges: judges, pricing: pricing, budget: defaultBudget(750), verifier: o.verifierModel()}
 }
 
 // projPhase is one row of the §4.5 table: call count and the default tokens per call (pilot-2 luna
@@ -2162,16 +2176,17 @@ type projPhase struct {
 	calls         float64
 	judge         bool
 	defIn, defOut float64
+	verify        bool // taken by the verifier, not split over the generators
 }
 
 var projPhases = []projPhase{
-	{"G0 話題バンク", "synth_topics", 24, false, 400, 2500},
-	{"G1 生成", "synth_source", 940, false, 590 + 1900, 1870},
-	{"G1 検証（別系列）", "verify_source", 940, false, 1500, 900},
-	{"G3 書き下し", "realize", 9200, false, 1407 + 300, 859 + 200},
-	{"G4 検証（別系列）", "verify", 9200, false, 1252 + 300, 434 + 200},
-	{"監査", "qc", 150, false, 1500, 900},
-	{"J 判定", "judge", 19800, true, 833, 95},
+	{"G0 話題バンク", "synth_topics", 24, false, 400, 2500, false},
+	{"G1 生成", "synth_source", 940, false, 590 + 1900, 1870, false},
+	{"G1 検証", "verify_source", 940, false, 1500, 900, true},
+	{"G3 書き下し", "realize", 9200, false, 1407 + 300, 859 + 200, false},
+	{"G4 検証", "verify", 9200, false, 1252 + 300, 434 + 200, true},
+	{"監査", "qc", 150, false, 1500, 900, false},
+	{"J 判定", "judge", 19800, true, 833, 95, false},
 }
 
 // writeCostProjection projects the single-stage cost with the §4.5 call counts (3,300 triplets,
@@ -2188,8 +2203,11 @@ func writeCostProjection(b *bytes.Buffer, mt *meter, p projection) {
 	byModel := map[string]float64{}
 	for _, ph := range projPhases {
 		models := p.generators
-		if ph.judge {
+		switch {
+		case ph.judge:
 			models = p.judges
+		case ph.verify && p.verifier != "":
+			models = []string{p.verifier}
 		}
 		for _, m := range models {
 			n := ph.calls / float64(len(models))
@@ -2412,8 +2430,13 @@ func (r *v2run) qcExemplars(ctx context.Context, b *bytes.Buffer) {
 	fmt.Fprintln(b, "\n## 例示の再注釈（G1 の検証者の固定の検査）")
 	fmt.Fprintln(b, "\n| 例示 | 検証者 | 一致 / 金 | 種別違い | 向き違い | 余分 | 合格 |")
 	fmt.Fprintln(b, "| --- | --- | --: | --: | --: | --: | --- |")
-	for _, m := range r.o.generators {
-		g := &synth.Generator{Client: r.gens[m].Client, Model: m, Effort: r.gens[m].Effort, Thinking: r.gens[m].Thinking,
+	for _, m := range []string{r.o.verifierModel()} {
+		ag, err := r.agent(m)
+		if err != nil {
+			fmt.Fprintf(b, "| — | %s | エラー: %v | | | | |\n", m, err)
+			return
+		}
+		g := &synth.Generator{Client: ag.Client, Model: m, Effort: ag.Effort, Thinking: ag.Thinking,
 			VerifySourcePrompt: r.prompts["verify_source_v1"]}
 		for _, ex := range r.exemplars {
 			if r.mt.check() != nil {
@@ -2479,12 +2502,12 @@ func (r *v2run) qcLabels(ctx context.Context, b *bytes.Buffer, trips []pilotTrip
 		if c.side == 1 {
 			d, plan = c.t.TextB, c.t.PlanB
 		}
-		// the audit uses the triplet's verifier family
+		// the audit uses the triplet's verifier (records made before the single verifier name a generator)
 		vm := c.t.VerifierModel
 		var ag synth.Agent
-		for _, m := range r.o.generators {
+		for _, m := range append(slices.Clone(r.o.generators), r.o.verifierModel()) {
 			if strings.HasPrefix(vm, m) || (vm == "" && synth.FamilyOf(m) == c.t.VerifierFamily) {
-				ag = synth.NewAgent(r.gens[m].Client, m, r.gens[m].Effort, r.gens[m].Thinking)
+				ag, _ = r.agent(m)
 			}
 		}
 		if ag.Client == nil {

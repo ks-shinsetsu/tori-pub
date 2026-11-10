@@ -661,7 +661,8 @@ func TestPilotV2Offline(t *testing.T) {
 	for _, s := range srcs {
 		if s.Accepted {
 			acc++
-			if s.Verifier == nil || s.Verifier.Family == s.GeneratorFamily || s.ExemplarPair == 0 || !s.Pilot {
+			// every generator's output is verified by the one verifier (defaultVerifier), whatever its family
+			if s.Verifier == nil || !strings.HasPrefix(s.Verifier.Model, defaultVerifier) || s.ExemplarPair == 0 || !s.Pilot {
 				t.Errorf("source %s: verifier %+v generator %s pair %d", s.SourceID, s.Verifier, s.GeneratorFamily, s.ExemplarPair)
 			}
 		}
@@ -684,7 +685,7 @@ func TestPilotV2Offline(t *testing.T) {
 			continue
 		}
 		ok++
-		if tr.VerifierFamily == "" || tr.VerifierFamily == tr.GeneratorFamily || tr.RealizeA == nil || tr.Delta0 == nil || !tr.Flags.Pilot || tr.Plan == nil {
+		if !strings.HasPrefix(tr.VerifierModel, defaultVerifier) || tr.VerifierFamily != "anthropic" || tr.RealizeA == nil || tr.Delta0 == nil || !tr.Flags.Pilot || tr.Plan == nil {
 			t.Errorf("%s: %+v", tr.ID, tr)
 			continue
 		}
@@ -1340,10 +1341,31 @@ func TestJudgePartialBatchAndReservation(t *testing.T) {
 }
 
 // v2 refuses to let a generator's own family verify it (dataset-spec §4.1, review M4).
-func TestNoSelfVerification(t *testing.T) {
+// TestSingleVerifier: every generator, Sonnet 5.5 included, is verified by the configured verifier (Haiku 5.5 by
+// default, user decision 2026-11-11), with its -gen-effort / -gen-thinking setting; -verifier overrides it.
+func TestSingleVerifier(t *testing.T) {
 	o := testOptions(t)
-	o.generators = []string{"claude-sonnet-5-5"}
-	if _, err := newV2Run(o, testEnv(newFakeLLM(), o.allModels())); err == nil || !strings.Contains(err.Error(), "another family") {
-		t.Fatalf("self-verification allowed: %v", err)
+	o.genThinking = parseModelMap(defGenThinking)
+	r, err := newV2Run(o, testEnv(newFakeLLM(), o.allModels()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for m, g := range r.gens {
+		if g.Verifier == nil || g.Verifier.Model != "claude-haiku-5-5" || g.Verifier.Effort != "medium" || g.Verifier.Thinking != "adaptive" {
+			t.Errorf("%s: verifier %+v", m, g.Verifier)
+		}
+	}
+	o.verifier = "gpt-5.6-luna"
+	r, err = newV2Run(o, testEnv(newFakeLLM(), o.allModels()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for m, g := range r.gens {
+		if g.Verifier == nil || g.Verifier.Model != "gpt-5.6-luna" {
+			t.Errorf("-verifier ignored for %s: %+v", m, g.Verifier)
+		}
+	}
+	if p := projectionFor(o, nil); p.verifier != "gpt-5.6-luna" {
+		t.Errorf("projection verifier %q", p.verifier)
 	}
 }
