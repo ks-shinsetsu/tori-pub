@@ -182,11 +182,11 @@ func (g *Generator) prepareRealize(in RealizeInput) (realizePrep, error) {
 	var pr realizePrep
 	base := in.Base
 	utts := slices.Clone(base.Utterances)
-	if swapsSpeakers(in.Edits) {
+	if i, j, ok := speakerSwap(in.Edits); ok {
 		if in.Incremental {
 			return pr, errors.New("synth: speaker swap in an incremental realization")
 		}
-		utts = swapSpeakers(utts)
+		utts = swapSpeakers(utts, i, j)
 	}
 	baseText := map[string]string{}
 	for _, p := range base.Graph.Props {
@@ -308,14 +308,19 @@ func (g *Generator) Realize(ctx context.Context, in RealizeInput) (RealizeResult
 	}
 
 	// Utterances allowed to change: those stating a touched proposition and their direct neighbours.
-	// P-add and X-surf may change any utterance.
+	// P-add and an untargeted X-surf may change any utterance; a targeted X-surf its utterance and the neighbours.
+	// A change elsewhere is counted as collateral (and is an error in an incremental realization).
 	anyOK := false
+	allowed := map[int]bool{}
 	for _, e := range in.Edits {
-		if e.Kind == perturb.PAdd || e.Kind == perturb.XSurf {
+		switch {
+		case e.Kind == perturb.XSurf && e.Utterance != nil:
+			u := *e.Utterance
+			allowed[u-1], allowed[u], allowed[u+1] = true, true, true
+		case e.Kind == perturb.PAdd || e.Kind == perturb.XSurf:
 			anyOK = true
 		}
 	}
-	allowed := map[int]bool{}
 	for _, id := range TouchedProps(in.Edits) {
 		if u, ok := base.PropUtterance[id]; ok {
 			allowed[u-1], allowed[u], allowed[u+1] = true, true, true

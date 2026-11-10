@@ -45,8 +45,8 @@ func (g *Generator) RealizeV1(ctx context.Context, src Discussion, v perturb.Var
 	instr := Instructions(v)
 	needLLM := len(instr) > 0
 	utts := slices.Clone(src.Utterances)
-	if swapsSpeakers(v.Edits) {
-		utts = swapSpeakers(utts)
+	if i, j, ok := speakerSwap(v.Edits); ok {
+		utts = swapSpeakers(utts, i, j)
 	}
 	srcText := map[string]string{}
 	for _, p := range src.Graph.Props {
@@ -196,7 +196,7 @@ func (g *Generator) VerifyV1(ctx context.Context, src Discussion, d Discussion, 
 	b.WriteString("\nEDITED DISCUSSION\n\n")
 	b.WriteString(d.Render())
 	b.WriteString("\nREQUESTED EDITS\n\n" + strings.Join(Instructions(v), "\n") + "\n")
-	if swapsSpeakers(v.Edits) {
+	if _, _, ok := speakerSwap(v.Edits); ok {
 		b.WriteString("\nSpeaker names were swapped on purpose.\n")
 	}
 	return llm.CompleteJSON[VerificationV1](ctx, g.Client, llm.Request{

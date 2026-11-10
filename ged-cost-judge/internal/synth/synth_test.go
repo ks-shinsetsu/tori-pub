@@ -468,3 +468,55 @@ func TestImportQT30(t *testing.T) {
 		t.Fatalf("multi-premise RA not folded: %v", d.Graph.Edges)
 	}
 }
+
+// TestSurfaceTargets: the two sides of a graph-invariant triplet are realized differently. A targeted X-surf
+// names its utterance (so the two requests, and their cache keys, differ) and may change only that
+// neighbourhood; an X-spk swaps the pair of speakers its edit names.
+func TestSurfaceTargets(t *testing.T) {
+	base := baseDiscussion()
+	u1, u3 := 1, 3
+	v := perturb.Variant{Graph: base.Graph.Clone()}
+	c := realizeClient(map[string]any{"changes": []any{map[string]any{"utterance": 3, "op": "replace", "speaker": "Gareth", "text": "When streets are closed to cars, footfall goes up.", "role": "edit"}},
+		"propositions": []any{map[string]any{"id": "p3", "unchanged": true}}})
+	g := &Generator{Client: c, Model: "m", Version: V2}
+	inA := RealizeInput{Base: base, Target: v, Edits: []perturb.Edit{{Kind: perturb.XSurf, Utterance: &u1}}, Prefix: "s0."}
+	inB := RealizeInput{Base: base, Target: v, Edits: []perturb.Edit{{Kind: perturb.XSurf, Utterance: &u3}}, Prefix: "s0."}
+	if g.RealizeKey(inA) == g.RealizeKey(inB) {
+		t.Error("X-surf on different utterances has the same realization request")
+	}
+	// The realizer rewrites utterance 3: on target for inB, collateral (counted, as for any other edit) for a target of 0.
+	if res, _, err := g.Realize(context.Background(), inB); err != nil || res.Stats.Collateral != 0 {
+		t.Errorf("reword of the target utterance: collateral %d, err %v", res.Stats.Collateral, err)
+	}
+	inFar := RealizeInput{Base: base, Target: v, Edits: []perturb.Edit{{Kind: perturb.XSurf, Utterance: new(int)}}, Prefix: "s0."}
+	if res, _, err := g.Realize(context.Background(), inFar); err != nil || res.Stats.Collateral != 1 {
+		t.Errorf("reword of utterance 3 for an X-surf that targets utterance 0: collateral %d, err %v", res.Stats.Collateral, err)
+	}
+
+	names := func(us []Utterance) (out []string) {
+		for _, u := range us {
+			out = append(out, u.Speaker)
+		}
+		return out
+	}
+	// Speakers in order of first appearance: Host, Priya, Gareth, Noor.
+	a, _, err := g.Realize(context.Background(), RealizeInput{Base: base, Target: v, Edits: []perturb.Edit{{Kind: perturb.XSpk, Speakers: []int{1, 2}}}, Prefix: "s0."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := g.Realize(context.Background(), RealizeInput{Base: base, Target: v, Edits: []perturb.Edit{{Kind: perturb.XSpk, Speakers: []int{0, 3}}}, Prefix: "s0."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := names(a.Discussion.Utterances), []string{"Host", "Gareth", "Host", "Priya", "Host", "Noor"}; !slices.Equal(got, want) {
+		t.Errorf("swap of speakers 1 and 2: %v, want %v", got, want)
+	}
+	if got, want := names(b.Discussion.Utterances), []string{"Noor", "Priya", "Noor", "Gareth", "Noor", "Host"}; !slices.Equal(got, want) {
+		t.Errorf("swap of speakers 0 and 3: %v, want %v", got, want)
+	}
+	// An X-spk without a pair swaps the first two speakers, as before.
+	old, _, _ := g.Realize(context.Background(), RealizeInput{Base: base, Target: v, Edits: []perturb.Edit{{Kind: perturb.XSpk}}, Prefix: "s0."})
+	if got, want := names(old.Discussion.Utterances), []string{"Priya", "Host", "Priya", "Gareth", "Priya", "Noor"}; !slices.Equal(got, want) {
+		t.Errorf("default swap: %v, want %v", got, want)
+	}
+}

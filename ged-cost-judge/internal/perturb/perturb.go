@@ -53,6 +53,11 @@ type Edit struct {
 	Degree []int `json:"degree,omitempty"`
 	// EdgesRemoved is the number of edges removed with the proposition (P-del+R).
 	EdgesRemoved int `json:"edges_removed,omitempty"`
+	// Utterance is the index of the utterance X-surf rewords (set by AssignSurface; nil: the realizer chooses).
+	Utterance *int `json:"utterance,omitempty"`
+	// Speakers are the two speakers X-spk swaps, as indices into the speakers in order of first appearance
+	// (set by AssignSurface; empty: the first two).
+	Speakers []int `json:"speakers,omitempty"`
 	// Infeasible is the reason the edit could not be applied (catalogue redraws, or a realizer's "infeasible" answer).
 	Infeasible string `json:"infeasible,omitempty"`
 }

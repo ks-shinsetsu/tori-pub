@@ -483,6 +483,11 @@ func describe(e perturb.Edit) string {
 		return fmt.Sprintf("Reverse the relation \"%s %s %s\" so that %s now %s %s.",
 			short(e.Edge.From), verbs[e.Edge.Kind], short(e.Edge.To), short(e.Edge.To), verbs[e.Edge.Kind], short(e.Edge.From))
 	case perturb.XSurf:
+		if e.Utterance != nil {
+			// A targeted reword (perturb.AssignSurface): the two sides of a triplet reword different utterances.
+			// New case, so the wording (and cache keys) of an untargeted X-surf is unchanged.
+			return fmt.Sprintf("Reword utterance [%d] without changing any proposition or relation. Leave every other utterance as it is.", *e.Utterance)
+		}
 		return "Reword one utterance of your choice without changing any proposition or relation."
 	}
 	return ""
@@ -502,15 +507,6 @@ func Instructions(v perturb.Variant) []string {
 // NeedsLLM reports whether the variant needs LLM realization (speaker swaps alone are handled by the harness).
 func NeedsLLM(v perturb.Variant) bool { return len(Instructions(v)) > 0 }
 
-func swapsSpeakers(edits []perturb.Edit) bool {
-	for _, e := range edits {
-		if e.Kind == perturb.XSpk {
-			return true
-		}
-	}
-	return false
-}
-
 // describeSource writes the source argument's utterances, propositions and relations with numbers.
 func describeSource(b *strings.Builder, utts []Utterance, src Discussion) {
 	b.WriteString("Utterances:\n")
@@ -527,7 +523,22 @@ func describeSource(b *strings.Builder, utts []Utterance, src Discussion) {
 	}
 }
 
-func swapSpeakers(us []Utterance) []Utterance {
+// speakerSwap is the pair of speakers the X-spk edit among edits swaps (perturb.Edit.Speakers; the first two
+// speakers when the edit names none), and whether there is such an edit.
+func speakerSwap(edits []perturb.Edit) (i, j int, ok bool) {
+	for _, e := range edits {
+		if e.Kind == perturb.XSpk {
+			if len(e.Speakers) == 2 {
+				return e.Speakers[0], e.Speakers[1], true
+			}
+			return 0, 1, true
+		}
+	}
+	return 0, 0, false
+}
+
+// swapSpeakers swaps the i-th and j-th speakers of us, counted in order of first appearance.
+func swapSpeakers(us []Utterance, i, j int) []Utterance {
 	out := slices.Clone(us)
 	var names []string
 	for _, u := range us {
@@ -535,10 +546,10 @@ func swapSpeakers(us []Utterance) []Utterance {
 			names = append(names, u.Speaker)
 		}
 	}
-	if len(names) < 2 {
+	if i == j || i < 0 || j < 0 || i >= len(names) || j >= len(names) {
 		return out
 	}
-	a, b := names[0], names[1]
+	a, b := names[i], names[j]
 	for i, u := range out {
 		switch u.Speaker {
 		case a:

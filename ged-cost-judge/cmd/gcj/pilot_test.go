@@ -514,8 +514,14 @@ func (f *fakeLLM) realize(user string) any {
 	for _, id := range fresh {
 		changes = append(changes, map[string]any{"utterance": len(utts) - 1, "op": "insert_after", "speaker": "Lars", "text": newText[id] + fmt.Sprintf(" #n%d", nonce), "role": "edit"})
 	}
-	if len(changes) == 0 && len(utts) > 0 { // X-surf
-		changes = append(changes, map[string]any{"utterance": 0, "op": "replace", "speaker": utts[0].Speaker, "text": utts[0].Text + fmt.Sprintf(" Indeed. #n%d", nonce), "role": "edit"})
+	if len(changes) == 0 && len(utts) > 0 { // X-surf: the utterance the instruction names
+		u := 0
+		for _, e := range edits {
+			if _, rest, ok := strings.Cut(e, "Reword utterance ["); ok {
+				u, _ = strconv.Atoi(strings.SplitN(rest, "]", 2)[0])
+			}
+		}
+		changes = append(changes, map[string]any{"utterance": u, "op": "replace", "speaker": utts[u].Speaker, "text": utts[u].Text + fmt.Sprintf(" Indeed. #n%d", nonce), "role": "edit"})
 	}
 	for id, t := range propText {
 		v.ids[t] = id
@@ -1367,5 +1373,67 @@ func TestSingleVerifier(t *testing.T) {
 	}
 	if p := projectionFor(o, nil); p.verifier != "gpt-5.6-luna" {
 		t.Errorf("projection verifier %q", p.verifier)
+	}
+}
+
+// TestVariantTextsDiffer runs the pipeline as the real environment wires it, with every client behind the
+// response cache: the two variants of a triplet must be different texts, and neither may be the source's.
+// Before perturb.AssignSurface the two sides of X-surf vs X-surf and X-spk vs X-spk carried the same edit
+// list, so B's realization was A's cached response and the judges compared a text with itself.
+func TestVariantTextsDiffer(t *testing.T) {
+	f := newFakeLLM()
+	o := testOptions(t)
+	o.sources = 48
+	var bank []synth.Topic
+	for _, d := range synth.Domains {
+		for k := range 12 {
+			bank = append(bank, synth.Topic{ID: fmt.Sprintf("%s-%d", d, k), Domain: d, Question: fmt.Sprintf("Should %s question %d be settled?", d, k)})
+		}
+	}
+	if err := writeJSON(filepath.Join(o.out, "topics.json"), bank); err != nil {
+		t.Fatal(err)
+	}
+	env := testEnv(f, o.allModels())
+	cache := llm.NewFileCache(filepath.Join(t.TempDir(), "llm"))
+	for m, c := range env.clients {
+		env.clients[m] = llm.NewCachingClient(c, cache)
+	}
+	if err := runPilotV2(context.Background(), o, env); err != nil {
+		t.Fatal(err)
+	}
+	trips, err := readJSONL[pilotTriplet](filepath.Join(o.out, "pilot_triplets.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcs, err := readJSONL[sourceRecord](filepath.Join(o.out, "pilot_sources.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcText := map[string]string{}
+	for _, s := range srcs {
+		srcText[s.SourceID] = s.Discussion.Render()
+	}
+	cells := map[perturb.T4Cell]int{}
+	for _, tr := range trips {
+		if tr.Err != "" {
+			continue
+		}
+		a, b := tr.TextA.Render(), tr.TextB.Render()
+		if a == b || a == srcText[tr.SourceID] || b == srcText[tr.SourceID] {
+			t.Errorf("%s %s (%v): the source and the two variants are not three different texts", tr.SourceID, tr.Type, tr.Plan.T4Cell)
+		}
+		if tr.Plan != nil && tr.Plan.T4Cell != "" {
+			cells[tr.Plan.T4Cell]++
+		}
+		keys := map[string]int{} // judge + cache key → order
+		for _, j := range tr.Judgments {
+			if o, dup := keys[j.Judge+" "+j.CacheKey]; dup && o != j.Order {
+				t.Errorf("%s: judge %s was sent the same request for both orders", tr.SourceID, j.Judge)
+			}
+			keys[j.Judge+" "+j.CacheKey] = j.Order
+		}
+	}
+	if cells[perturb.T4SurfSurf] == 0 || cells[perturb.T4SurfSpk]+cells[perturb.T4SpkSpk] == 0 {
+		t.Errorf("the run kept no X-surf vs X-surf or no X-spk triplet (cells %v); the test does not cover them", cells)
 	}
 }

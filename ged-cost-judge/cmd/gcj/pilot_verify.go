@@ -824,7 +824,7 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 			rec.Passed, rec.FirstPass = true, r == 0
 			return res.Discussion, rec, outcomeOK
 		}
-		if changesGraph(in.Edits) && slices.Equal(res.Discussion.Utterances, in.Base.Utterances) {
+		if slices.Equal(res.Discussion.Utterances, in.Base.Utterances) {
 			att.Problems = []string{"the text was left unchanged"}
 			rec.Attempts = append(rec.Attempts, att)
 			in.Feedback = "the text was left unchanged; every edit must be visible in the text"
@@ -916,20 +916,34 @@ func propCos(g ged.Graph, vec map[string][]float32) func(a, b string) float64 {
 // drawPlan draws the plan of slot s from the catalogue (perturb.DrawTriplet). A T3 slot keeps the sub-stratum
 // sub (drawn once per slot); an ordinary T3 slot is redrawn until the predicted Δ(θ₀) hits the slot's near /
 // clear target (≤ 50 redraws, plan §4.3), as the simulator does with its simulated cos.
-func (pp *pipelineV2) drawPlan(rng *rand.Rand, s slotSpec, sub perturb.T3Sub) perturb.TripletPlan {
+//
+// The graph-invariant edits then get their place in the text (perturb.AssignSurface: the utterance an X-surf
+// rewords, the speakers an X-spk swaps, different on the two sides). ok is false when the source has too few
+// utterances for that; the plan is then discarded.
+func (pp *pipelineV2) drawPlan(rng *rand.Rand, s slotSpec, sub perturb.T3Sub) (tp perturb.TripletPlan, ok bool) {
 	o := pp.srcOpts[s.source]
-	src := pp.sources[s.source].Discussion.Graph
+	d := pp.sources[s.source].Discussion
+	src := d.Graph
 	if s.typ != perturb.T3Contrast {
-		return perturb.DrawTriplet(rng, src, s.typ, o)
-	}
-	o.Sub = &sub
-	near := s.k%2 == 0
-	for attempt := 0; ; attempt++ {
-		tp := perturb.DrawTriplet(rng, src, s.typ, o)
-		if tp.T3Ident || tp.T3Diag || (math.Abs(tp.PredDelta0) < nearThreshold) == near || attempt >= 50 {
-			return tp
+		tp = perturb.DrawTriplet(rng, src, s.typ, o)
+	} else {
+		o.Sub = &sub
+		near := s.k%2 == 0
+		for attempt := 0; ; attempt++ {
+			tp = perturb.DrawTriplet(rng, src, s.typ, o)
+			if tp.T3Ident || tp.T3Diag || (math.Abs(tp.PredDelta0) < nearThreshold) == near || attempt >= 50 {
+				break
+			}
 		}
 	}
+	var names []string
+	for _, u := range d.Utterances {
+		if !slices.Contains(names, u.Speaker) {
+			names = append(names, u.Speaker)
+		}
+	}
+	ok = perturb.AssignSurface(rng, &tp, len(d.Utterances), len(names), d.PropUtterance)
+	return tp, ok
 }
 
 // setPlan makes tp the plan being realized.
@@ -1067,6 +1081,20 @@ func (pp *pipelineV2) redrawRelabel(rng *rand.Rand, source int, tp perturb.Tripl
 	return tp, false
 }
 
+// identicalTexts names the pair among the source and the two realized variants whose utterances are the same
+// ("" when the three differ).
+func identicalTexts(src, a, b synth.Discussion) string {
+	switch {
+	case slices.Equal(a.Utterances, b.Utterances):
+		return "A and B have the same text"
+	case slices.Equal(a.Utterances, src.Utterances):
+		return "A has the source's text"
+	case slices.Equal(b.Utterances, src.Utterances):
+		return "B has the source's text"
+	}
+	return ""
+}
+
 // realizedSide is a variant realized and verified in an earlier plan of the slot, reused when only the other
 // side's relabel is redrawn.
 type realizedSide struct {
@@ -1100,13 +1128,22 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 		}
 		t.Replans = attempt
 		var tp perturb.TripletPlan
+		placed := true
 		if next != nil {
 			tp, next = *next, nil
 		} else {
-			tp, keptA = pp.drawPlan(rng, s, sub), nil
+			tp, placed = pp.drawPlan(rng, s, sub)
+			keptA = nil
 		}
 		t.setPlan(tp, s.k)
 		dp := discardedPlan{Plan: attempt, Info: t.Plan, EditsA: slices.Clone(t.PlanA), EditsB: slices.Clone(t.PlanB)}
+		if !placed {
+			dp.Reason, dp.Details = "surface_target", []string{"fewer utterances than X-surf edits"}
+			t.Discarded = append(t.Discarded, dp)
+			lastReason = dp.Reason
+			plans++
+			continue
+		}
 		// diagRedraw handles a relabel returned infeasible (the edit e on side A when onA): the relabel alone is
 		// redrawn; after maxDiagInfeasible returns on the source, or with no relabel left, the slot is ordinary T3.
 		diagRedraw := func(e perturb.Edit, onA bool) {
@@ -1169,6 +1206,15 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 				}
 				continue
 			}
+			plans++
+			continue
+		}
+		// The judge must see three different texts: two variants with the same wording (or a variant equal to the
+		// source) carry no judgment about the edits and would be answered "same" whatever the costs are.
+		if same := identicalTexts(src, da, db); same != "" {
+			dp.Reason, dp.Details = "identical_texts", []string{same}
+			t.Discarded = append(t.Discarded, dp)
+			lastReason = dp.Reason
 			plans++
 			continue
 		}

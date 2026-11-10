@@ -525,3 +525,125 @@ func drawT1(rng *rand.Rand, src ged.Graph, o *BuildOptions, info *PlanInfo) (a, 
 	info.T1Delta0, info.T1Stratum, info.T1Extra, info.Redraws = fbDelta, T1StratumOf(fbDelta), len(fallback.edits)-len(a.edits), attempts
 	return a, fallback
 }
+
+// AssignSurface gives the graph-invariant edits of tp their place in the text: every X-surf edit gets the
+// utterance it rewords and every X-spk edit the pair of speakers it swaps, different on the two sides. Without
+// this both sides of an X-surf vs X-surf or X-spk vs X-spk triplet carry the same edit list, the realization
+// requests are identical, and the two variants come out as the same text (dataset-spec §3: T4 compares two
+// different graph-invariant variants). utterances and speakers are the source's counts (speakers = distinct
+// names); utt maps a proposition to its utterance, so that X-surf avoids an utterance the side's other edits
+// rewrite where it can.
+//
+// An X-spk that has no pair left becomes an X-surf and the T4 cell is renamed: with fewer than two speakers
+// every X-spk, with exactly two speakers one side of X-spk vs X-spk (chosen at random). The conversions are
+// listed in tp.Infeasible. It reports false when the source has fewer utterances than the plan has X-surf
+// edits; the plan cannot be realized as two different texts and the caller discards it.
+//
+// It is a separate step, with the caller's rng, because the graph side of the plan does not depend on it: the
+// simulator never calls it, so the simulated datasets of decisions-stats Appendix A.5 are unchanged.
+func AssignSurface(rng *rand.Rand, tp *TripletPlan, utterances, speakers int, utt map[string]int) bool {
+	// In T1, B's first len(A) edits are A's (B is realized from A's text): assign A and copy.
+	shared := 0
+	if tp.Type == T1Monotone {
+		shared = len(tp.A.Edits)
+	}
+	sides := [2]*Variant{&tp.A, &tp.B}
+	count := func(k Kind) (n [2]int) {
+		for s, v := range sides {
+			for i, e := range v.Edits {
+				if e.Kind == k && !(s == 1 && i < shared) {
+					n[s]++
+				}
+			}
+		}
+		return n
+	}
+	toSurf := func(s int, why string) {
+		for i := range sides[s].Edits {
+			if e := &sides[s].Edits[i]; e.Kind == XSpk {
+				tp.Infeasible = append(tp.Infeasible, Edit{Kind: XSpk, Infeasible: why})
+				*e = Edit{Kind: XSurf}
+			}
+		}
+	}
+	if n := count(XSpk); n[0]+n[1] > 0 {
+		switch {
+		case speakers < 2:
+			toSurf(0, "fewer than two speakers")
+			toSurf(1, "fewer than two speakers")
+		case speakers == 2 && n[0] > 0 && n[1] > 0:
+			toSurf(rng.IntN(2), "one pair of speakers, used by the other side")
+		}
+		n = count(XSpk)
+		tp.XSpk = n[0]+n[1] > 0
+		if tp.Type == T4Invariant && (tp.T4Cell == T4SurfSpk || tp.T4Cell == T4SpkSpk) {
+			switch {
+			case n[0] > 0 && n[1] > 0:
+				tp.T4Cell = T4SpkSpk
+			case tp.XSpk:
+				tp.T4Cell = T4SurfSpk
+			default:
+				tp.T4Cell = T4SurfSurf
+			}
+		}
+		var pairs [][]int
+		for i := range speakers {
+			for j := i + 1; j < speakers; j++ {
+				pairs = append(pairs, []int{i, j})
+			}
+		}
+		for s, v := range sides {
+			for i := range v.Edits {
+				if e := &v.Edits[i]; e.Kind == XSpk && !(s == 1 && i < shared) {
+					k := rng.IntN(len(pairs))
+					e.Speakers = pairs[k]
+					pairs = slices.Delete(pairs, k, k+1)
+				}
+			}
+		}
+	}
+
+	used := map[int]bool{}
+	for s, v := range sides {
+		busy := map[int]bool{} // utterances the side's other edits rewrite
+		for _, e := range v.Edits {
+			if u, ok := utt[e.Prop]; ok {
+				busy[u] = true
+			}
+			if e.Edge != nil {
+				for _, id := range []string{e.Edge.From, e.Edge.To} {
+					if u, ok := utt[id]; ok {
+						busy[u] = true
+					}
+				}
+			}
+		}
+		for i := range v.Edits {
+			e := &v.Edits[i]
+			if e.Kind != XSurf || (s == 1 && i < shared) {
+				continue
+			}
+			var free, any []int
+			for u := range utterances {
+				if used[u] {
+					continue
+				}
+				any = append(any, u)
+				if !busy[u] {
+					free = append(free, u)
+				}
+			}
+			if len(free) == 0 {
+				free = any
+			}
+			if len(free) == 0 {
+				return false
+			}
+			u := free[rng.IntN(len(free))]
+			used[u] = true
+			e.Utterance = &u
+		}
+	}
+	copy(tp.B.Edits[:min(shared, len(tp.B.Edits))], tp.A.Edits)
+	return true
+}

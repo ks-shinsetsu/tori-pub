@@ -412,3 +412,91 @@ func TestPlanKindLevel(t *testing.T) {
 		t.Fatalf("Build returned %d steps", len(steps))
 	}
 }
+
+// TestAssignSurface: the two sides of a triplet never carry the same graph-invariant edit. X-surf edits get
+// different utterances, X-spk edits different speaker pairs, and an X-spk without a pair left becomes an X-surf.
+func TestAssignSurface(t *testing.T) {
+	plans, srcs := drawPlansSrc(11, 4000, T4Invariant)
+	t3, srcs3 := drawPlansSrc(12, 2000, T3Contrast)
+	t1, srcs1 := drawPlansSrc(13, 1000, T1Monotone)
+	plans, srcs = append(append(plans, t3...), t1...), append(append(srcs, srcs3...), srcs1...)
+	rng := rand.New(rand.NewPCG(5, 5))
+	cells := map[T4Cell]int{}
+	for i, tp := range plans {
+		speakers := 1 + i%4
+		n := len(srcs[i].Props) // testSource: one proposition per utterance
+		utt := map[string]int{}
+		for j, p := range srcs[i].Props {
+			utt[p.ID] = j
+		}
+		before := tp.T4Cell
+		if !AssignSurface(rng, &tp, n, speakers, utt) {
+			t.Fatalf("plan %d: no utterance left on a source with %d utterances", i, n)
+		}
+		seenU, seenP := map[int]bool{}, map[[2]int]bool{}
+		spk := [2]int{}
+		for s, v := range []Variant{tp.A, tp.B} {
+			for k, e := range v.Edits {
+				shared := tp.Type == T1Monotone && s == 1 && k < len(tp.A.Edits)
+				switch e.Kind {
+				case XSurf:
+					if e.Utterance == nil || *e.Utterance < 0 || *e.Utterance >= n {
+						t.Fatalf("plan %d: X-surf without a valid utterance: %+v", i, e)
+					}
+					if shared != seenU[*e.Utterance] {
+						t.Fatalf("plan %d (%s): X-surf utterance %d, shared with A %v, already used %v", i, tp.Type, *e.Utterance, shared, seenU[*e.Utterance])
+					}
+					seenU[*e.Utterance] = true
+				case XSpk:
+					spk[s]++
+					if len(e.Speakers) != 2 || e.Speakers[0] == e.Speakers[1] || e.Speakers[0] < 0 || e.Speakers[1] >= speakers {
+						t.Fatalf("plan %d: X-spk pair %v with %d speakers", i, e.Speakers, speakers)
+					}
+					p := [2]int{e.Speakers[0], e.Speakers[1]}
+					if seenP[p] {
+						t.Fatalf("plan %d: both sides swap speakers %v", i, p)
+					}
+					seenP[p] = true
+				}
+			}
+		}
+		if tp.XSpk != (spk[0]+spk[1] > 0) || (speakers < 2 && tp.XSpk) || (speakers == 2 && spk[0] > 0 && spk[1] > 0) {
+			t.Fatalf("plan %d: %d speakers, X-spk edits %v, flag %v", i, speakers, spk, tp.XSpk)
+		}
+		if tp.Type == T4Invariant {
+			want := before
+			switch {
+			case before == T4SpkSpk && speakers == 2, before == T4SurfSpk && speakers < 2:
+				want = T4SurfSpk
+				if speakers < 2 {
+					want = T4SurfSurf
+				}
+			case before == T4SpkSpk && speakers < 2:
+				want = T4SurfSurf
+			}
+			if tp.T4Cell != want {
+				t.Fatalf("plan %d: cell %s with %d speakers became %s, want %s", i, before, speakers, tp.T4Cell, want)
+			}
+			cells[tp.T4Cell]++
+		}
+		if tp.Type == T1Monotone && !slices.EqualFunc(tp.A.Edits, tp.B.Edits[:len(tp.A.Edits)], func(a, b Edit) bool {
+			return a.Kind == b.Kind && (a.Utterance == nil) == (b.Utterance == nil) && (a.Utterance == nil || *a.Utterance == *b.Utterance)
+		}) {
+			t.Fatalf("plan %d: T1's B does not start with A's edits", i)
+		}
+	}
+	for _, c := range []T4Cell{T4SurfSurf, T4SurfSpk, T4SpkSpk} {
+		if cells[c] == 0 {
+			t.Errorf("no %s plan left; the test does not cover it", c)
+		}
+	}
+	// One utterance cannot host two different rewordings.
+	for _, tp := range plans {
+		if tp.T4Cell == T4SurfSurf {
+			if AssignSurface(rng, &tp, 1, 3, nil) {
+				t.Error("X-surf vs X-surf was placed on a one-utterance source")
+			}
+			break
+		}
+	}
+}
