@@ -762,6 +762,16 @@ type pipelineV2 struct {
 	// catalogue are the run's catalogue options; srcOpts adds each source's utterance map and proposition cos.
 	catalogue perturb.BuildOptions
 	srcOpts   []perturb.BuildOptions
+	// batched: Anthropic calls go through a Coalescer, so every slot is in flight at once (v2run.workers).
+	batched bool
+}
+
+// workers is the slot concurrency: all n when batched, else 8.
+func (pp *pipelineV2) workers(n int) int {
+	if pp.batched {
+		return max(n, 1)
+	}
+	return 8
 }
 
 // realizeOutcome is the result of realizing one variant.
@@ -1369,7 +1379,7 @@ func (pp *pipelineV2) buildAll(rng *rand.Rand) ([]*pilotTriplet, error) {
 		}
 	}
 	trips := make([]*pilotTriplet, len(slots))
-	parallel(len(slots), 8, func(i int) error {
+	parallel(len(slots), pp.workers(len(slots)), func(i int) error {
 		trips[i] = pp.slot(slots[i])
 		return nil
 	})
@@ -1393,7 +1403,7 @@ func (pp *pipelineV2) buildAll(rng *rand.Rand) ([]*pilotTriplet, error) {
 			rs[j] = r
 		}
 		rt := make([]*pilotTriplet, len(rs))
-		parallel(len(rs), 8, func(j int) error {
+		parallel(len(rs), pp.workers(len(rs)), func(j int) error {
 			rt[j] = pp.slot(rs[j])
 			return nil
 		})

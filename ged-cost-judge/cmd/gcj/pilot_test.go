@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/fit"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/ged"
@@ -177,7 +178,9 @@ type fakeLLM struct {
 	rejected     map[string]bool
 	// failRealize: every realization of the discussion containing this text is unusable (discarded slots).
 	failRealize string
-	// refuseEvery: every n-th judge request (by content hash) is refused (llm.FinishRefusal).
+	// refuseEvery: about one judge request in n (by content hash) is refused (llm.FinishRefusal). The three judges
+	// see the same content, so a 12-source run has only ≈ 96 distinct contents: n must be small enough that at
+	// least one is refused in every run ((1 − 1/n)^96).
 	refuseEvery int
 }
 
@@ -236,7 +239,7 @@ func (f *fakeLLM) complete(_ context.Context, req llm.Request) (*llm.Response, e
 		}
 		out = map[string]any{"questions": qs}
 	case "judge":
-		if h := sha256.Sum256([]byte(user)); f.refuseEvery > 0 && int(h[3])%f.refuseEvery == 0 {
+		if h := sha256.Sum256([]byte(user)); f.refuseEvery > 0 && (int(h[3])<<8|int(h[4]))%f.refuseEvery == 0 {
 			return &llm.Response{FinishReason: llm.FinishRefusal, Model: req.Model + "-test"}, nil
 		}
 		out = map[string]string{"answer": fakeJudge(user)}
@@ -635,8 +638,8 @@ func testOptions(t *testing.T) pilotOptions {
 func TestPilotV2Offline(t *testing.T) {
 	f := newFakeLLM()
 	o := testOptions(t)
-	o.diagShare = 0.5 // enough t3_diag slots to see the in-slot redraw
-	f.refuseEvery = 40
+	o.diagShare = 0.5  // enough t3_diag slots to see the in-slot redraw
+	f.refuseEvery = 12 // P(no refusal in a run) ≈ (11/12)^96 ≈ 2·10⁻⁴
 	env := testEnv(f, o.allModels())
 	null, _ := os.Open(os.DevNull)
 	stdout := os.Stdout
@@ -754,7 +757,11 @@ func TestPilotV2Offline(t *testing.T) {
 			if len(a) == 1 && a[0].Kind == perturb.RTypeCA {
 				side = b
 			}
-			js, _ := json.Marshal(side[0].Edit)
+			// Infeasible is the outcome recorded on the edit, not the edit: the kept estimation edit may itself be
+			// refused in the redrawn plan (the fake's answers depend on call order, so this happens in some runs).
+			e := side[0].Edit
+			e.Infeasible = ""
+			js, _ := json.Marshal(e)
 			return string(js)
 		}
 		if ordinary(redraw.EditsA, redraw.EditsB) != ordinary(nextA, nextB) {
@@ -803,6 +810,109 @@ func TestPilotV2Offline(t *testing.T) {
 		t.Errorf("refusals %d not reported", refusals)
 	}
 	t.Logf("sources %d/%d, triplets %d/%d (T1 %d, t3_diag redrawn %d), calls %v", acc, len(srcs), ok, len(trips), t1, diagOK, f.calls)
+}
+
+// sizedBatch records the size and tags of every batch sent to the fake Anthropic client.
+type sizedBatch struct {
+	fakeBatchClient
+	mu    sync.Mutex
+	sizes map[string][]int // first request's tag → batch sizes
+}
+
+func (c *sizedBatch) CompleteBatch(ctx context.Context, reqs []llm.Request) ([]llm.BatchResult, error) {
+	c.mu.Lock()
+	if len(reqs) > 0 {
+		c.sizes[reqs[0].Tag] = append(c.sizes[reqs[0].Tag], len(reqs))
+	}
+	c.mu.Unlock()
+	return c.fakeBatchClient.CompleteBatch(ctx, reqs)
+}
+
+// TestPilotV2Coalesced runs the offline pipeline with the Anthropic clients behind a Coalescer, as
+// newRealEnv does for -pilot (plan §10.3): every Anthropic generation, realization and verification call
+// goes out in a batch, the batches gather more calls than the request-by-request worker pool (8) had in
+// flight, and the run produces accepted triplets and records the route in the report.
+func TestPilotV2Coalesced(t *testing.T) {
+	f := newFakeLLM()
+	o := testOptions(t)
+	env := testEnv(f, o.allModels())
+	var batch []*sizedBatch
+	for m := range env.clients {
+		if synth.FamilyOf(m) != "anthropic" {
+			continue
+		}
+		sb := &sizedBatch{fakeBatchClient: fakeBatchClient{f}, sizes: map[string][]int{}}
+		co := llm.NewCoalescer(sb)
+		co.Quiet, co.MaxWait = 20*time.Millisecond, time.Second
+		env.clients[m] = co
+		batch = append(batch, sb)
+	}
+	null, _ := os.Open(os.DevNull)
+	stdout := os.Stdout
+	os.Stdout = null
+	err := runPilotV2(context.Background(), o, env)
+	os.Stdout = stdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	trips, err := readJSONL[pilotTriplet](filepath.Join(o.out, "pilot_triplets.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok := 0
+	for _, tr := range trips {
+		if tr.Err == "" && tr.RealizeA != nil && tr.Delta0 != nil {
+			ok++
+		}
+	}
+	if ok < 30 {
+		t.Fatalf("only %d of %d triplets accepted", ok, len(trips))
+	}
+	// Generation batches (everything but the judges) gather many calls each: more than the 8 the request-by-request
+	// pool kept in flight, and on average at least 4 per batch.
+	largest, calls, batches := 0, 0, 0
+	for _, sb := range batch {
+		for tag, ns := range sb.sizes {
+			if tag == "judge" {
+				continue
+			}
+			for _, n := range ns {
+				largest, calls, batches = max(largest, n), calls+n, batches+1
+			}
+		}
+	}
+	if largest <= 8 || batches == 0 || calls < 4*batches {
+		t.Errorf("generation calls %d in %d batches, largest %d: not gathered (%v)", calls, batches, largest, batch[0].sizes)
+	}
+	rep, err := os.ReadFile(filepath.Join(o.out, "pilot.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rep), "Message Batches にまとめた生成・書き下し・検証") || !strings.Contains(string(rep), "Anthropic の呼び出しはすべてバッチ") {
+		t.Error("the report does not record the batched generation route")
+	}
+}
+
+// TestCoalescedBudgetGuard: a flush whose projected batch cost exceeds the remaining budget is not sent.
+func TestCoalescedBudgetGuard(t *testing.T) {
+	f := newFakeLLM()
+	o := testOptions(t)
+	o.budget = 1e-6
+	env := testEnv(f, o.allModels())
+	co := llm.NewCoalescer(&fakeBatchClient{f})
+	co.Quiet = 10 * time.Millisecond
+	env.clients["claude-sonnet-5-5"] = co
+	r, err := newV2Run(o, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := llm.Request{Model: "claude-sonnet-5-5", Messages: []llm.Message{llm.User(strings.Repeat("words ", 200))}, Tag: "realize"}
+	if _, err := r.gens["claude-sonnet-5-5"].Client.Complete(context.Background(), req); !errors.Is(err, errBudget) || f.batches != 0 {
+		t.Fatalf("err %v, batches %d", err, f.batches)
+	}
+	if r.mt.pending() != 0 {
+		t.Fatalf("a refused flush left a reservation of $%g", r.mt.pending())
+	}
 }
 
 // The non-P2 run reports the confirmatory analysis (fit.Confirmatory + WriteConfirmatory) and the untied

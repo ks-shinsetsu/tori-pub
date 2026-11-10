@@ -370,7 +370,7 @@ func runPilot(o pilotOptions) error {
 	if o.promptVersion == synth.V1 {
 		return runPilotV1(o)
 	}
-	env, err := newRealEnv(o)
+	env, err := newRealEnv(o, true)
 	if err != nil {
 		return err
 	}
@@ -810,7 +810,10 @@ func (o pilotOptions) allModels() []string {
 	return ms
 }
 
-func newRealEnv(o pilotOptions) (*pilotEnv, error) {
+// newRealEnv builds the API clients. batch puts the Anthropic clients behind a Coalescer (the -pilot
+// pipeline); the topic bank and the audits call one request at a time and stay request by request,
+// since each call would otherwise wait for its own batch (together ≈ $1.3 at list price, dataset-spec §4.5).
+func newRealEnv(o pilotOptions, batch bool) (*pilotEnv, error) {
 	_ = godotenv.Load(".env")
 	_ = godotenv.Load("../aif-with-llm/.env")
 	cache := llm.NewFileCache(".cache/llm")
@@ -820,7 +823,14 @@ func newRealEnv(o pilotOptions) (*pilotEnv, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pilot: %s: %w", m, err)
 		}
-		env.clients[m] = llm.NewCachingClient(llm.NewThrottledClient(base, 4, 4, llm.DefaultRetryConfig()), cache)
+		cc := llm.NewCachingClient(llm.NewThrottledClient(base, 4, 4, llm.DefaultRetryConfig()), cache)
+		env.clients[m] = cc
+		if batch && synth.FamilyOf(m) == "anthropic" {
+			// Generation and verification call Complete request by request; the Coalescer sends those calls as
+			// Message Batches at half the list price, without which the Anthropic share does not fit one credit
+			// cycle (plan §10.3). Judges call CompleteBatch, which it forwards unchanged.
+			env.clients[m] = llm.NewCoalescer(cc)
+		}
 	}
 	env.cached = func(c llm.Client, req llm.Request) bool {
 		if d, ok := c.(llm.RequestDefaulter); ok {
@@ -840,8 +850,82 @@ func newRealEnv(o pilotOptions) (*pilotEnv, error) {
 	if err != nil {
 		return nil, err
 	}
-	env.emb = llm.NewCachingEmbedder(embBase, ".cache/embed")
+	// With batched generation every slot is in flight at once (v2run.workers), and a returning batch releases
+	// them together; the limit keeps the embedding calls at the concurrency the pipeline had before.
+	env.emb = &limitedEmbedder{Embedder: llm.NewCachingEmbedder(embBase, ".cache/embed"), sem: make(chan struct{}, 8)}
 	return env, nil
+}
+
+// limitedEmbedder bounds the number of concurrent Embed calls.
+type limitedEmbedder struct {
+	llm.Embedder
+	sem chan struct{}
+}
+
+func (e *limitedEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	select {
+	case e.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-e.sem }()
+	return e.Embedder.Embed(ctx, texts)
+}
+
+// batched reports whether the generators or their verifiers send through a Coalescer.
+func (r *v2run) batched() bool {
+	for _, g := range r.gens {
+		if _, ok := g.Client.(*llm.Coalescer); ok {
+			return true
+		}
+		if g.Verifier != nil {
+			if _, ok := g.Verifier.Client.(*llm.Coalescer); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// workers is the number of sources or slots worked on concurrently. With batched generation all n are in
+// flight, so that each step of every slot (realize, verify, retry) lands in the same batch; request by
+// request, 8 as before.
+func (r *v2run) workers(n int) int {
+	if r.batched() {
+		return max(n, 1)
+	}
+	return 8
+}
+
+// admitBatch is the Coalescer's BeforeFlush for model: the projected batch cost of the flush is checked
+// against the remaining budget and held in the meter until the results are handed out (as judgeAll does
+// for the judge batches). Input ≈ chars / 4 × 1.2 (Claude tokenizer); output = the run's mean for the
+// tag × model, else the §4.5 assumption for the tag.
+func (r *v2run) admitBatch(model string) func([]llm.Request) (func(), error) {
+	return func(reqs []llm.Request) (func(), error) {
+		proj := 0.0
+		for _, req := range reqs {
+			chars := 0
+			for _, m := range req.Messages {
+				chars += len(m.Content)
+			}
+			_, out, ok := r.mt.perCall(req.Tag, model)
+			if !ok {
+				out = 1000
+				for _, ph := range projPhases {
+					if ph.tag == req.Tag {
+						out = ph.defOut
+					}
+				}
+			}
+			proj += r.env.pricing.ChatCostBatch(model, llm.Usage{InputTokens: int64(float64(chars) / 4 * 1.2), OutputTokens: int64(out)})
+		}
+		if rem := r.mt.remaining(); proj > rem {
+			return nil, fmt.Errorf("%w: %s のバッチ %d 件（見込み $%.2f）が残りの予算 $%.2f を超えるので投げなかった", errBudget, model, len(reqs), proj, rem)
+		}
+		r.mt.reserve(proj)
+		return func() { r.mt.release(proj) }, nil
+	}
 }
 
 // v2run holds the configured models and prompts of a v2 run.
@@ -857,6 +941,11 @@ type v2run struct {
 
 func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 	r := &v2run{o: o, env: env, mt: newMeter(o.budget), gens: map[string]*synth.Generator{}, prompts: map[string]synth.Prompt{}}
+	for m, c := range env.clients {
+		if co, ok := c.(*llm.Coalescer); ok {
+			co.BeforeFlush = r.admitBatch(m)
+		}
+	}
 	dir := cmp(o.promptDir, "prompts")
 	for _, name := range []string{"synth_source_v2", "realize_v3", "verify_v2", "verify_source_v1", "judge_v1", "synth_topics_v1"} {
 		p, err := synth.LoadPrompt(dir, name)
@@ -976,7 +1065,7 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 
 	// ---- G2–G4 plans, realization, verification ----
 	pp := &pipelineV2{ctx: ctx, gens: r.gens, mt: mt, emb: env.emb, sources: accepted, seed: o.seed, stats: newV2Stats(),
-		catalogue: catalogueOptions(o.diagShare)}
+		catalogue: catalogueOptions(o.diagShare), batched: r.batched()}
 	trips, err := pp.buildAll(rand.New(rand.NewPCG(o.seed, 0xb11d)))
 	if err != nil {
 		return err
@@ -1010,7 +1099,9 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	fmt.Fprintf(&b, "# %s: 改訂版の生成パイプライン（元の議論 %d 件を割り付け）\n", title, o.sources)
 	r.writeProvenance(&b)
 	writeCostTable(&b, mt, []string{"synth_topics", "synth_source", "verify_source", "realize", "verify", "judge"})
-	writeCostProjection(&b, mt, projectionFor(o, env.pricing))
+	proj := projectionFor(o, env.pricing)
+	proj.genBatch = r.batched()
+	writeCostProjection(&b, mt, proj)
 	writeSourceReport(&b, all)
 	ft, d0 := fitTriplets(kept, accepted)
 	writeVerifyReportV2(&b, pp.stats, kept, d0)
@@ -1047,7 +1138,7 @@ type sourceJob struct {
 // the spec and its topic (the rejected topic goes first to the replacement, §1.3).
 func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*sourceRecord {
 	out := make([]*sourceRecord, len(jobs))
-	parallel(len(jobs), 8, func(j int) error {
+	parallel(len(jobs), r.workers(len(jobs)), func(j int) error {
 		sp, i := jobs[j].spec, jobs[j].index
 		g := r.gens[sp.Generator]
 		rec := &sourceRecord{SourceID: fmt.Sprintf("s%04d", i), Index: i, Spec: sp, Generator: sp.Generator,
@@ -1705,6 +1796,16 @@ func (r *v2run) writeProvenance(b *bytes.Buffer) {
 		fmt.Fprintf(b, "- 判定: %s（%s）\n", j.Model, j.Setting())
 	}
 	fmt.Fprintf(b, "- 埋め込み: %s\n", r.env.emb.Model())
+	var bs []string
+	for _, m := range sortedKeys(r.env.clients) {
+		if co, ok := r.env.clients[m].(*llm.Coalescer); ok {
+			bs = append(bs, fmt.Sprintf("%s（%s 待って新しい要求が無いか、最古の要求から %s で送る。1 回 ≤ %d 件、失敗した項目の再投入 ≤ %d 回）",
+				m, co.Quiet, co.MaxWait, co.MaxRequests, co.ItemRetries))
+		}
+	}
+	if len(bs) > 0 {
+		fmt.Fprintf(b, "- Message Batches にまとめた生成・書き下し・検証: %s。同時に扱う枠: すべて\n", strings.Join(bs, "、"))
+	}
 }
 
 func gitOut(args ...string) string {
@@ -2036,6 +2137,8 @@ type projection struct {
 	generators, judges []string
 	pricing            *llm.PriceTable
 	budget             float64
+	// genBatch: the Anthropic generation and verification calls go through Message Batches too.
+	genBatch bool
 }
 
 func projectionFor(o pilotOptions, pricing *llm.PriceTable) projection {
@@ -2106,10 +2209,10 @@ func writeCostProjection(b *bytes.Buffer, mt *meter, p projection) {
 			}
 			list += c
 			batchAll += cb
-			if ph.judge {
-				asRun += cb // the pipeline batches the Anthropic judges only
+			if ph.judge || p.genBatch {
+				asRun += cb
 			} else {
-				asRun += c
+				asRun += c // request by request: only the Anthropic judges are batched
 			}
 			byModel[m] += c
 			fmt.Fprintf(b, "| %s | %s | %.0f | %.0f / %.0f%s | $%.1f | $%.1f |\n", ph.name, m, n, in, out, mark, c, cb)
@@ -2121,7 +2224,11 @@ func writeCostProjection(b *bytes.Buffer, mt *meter, p projection) {
 		parts = append(parts, fmt.Sprintf("%s $%.1f", m, byModel[m]))
 	}
 	fmt.Fprintf(b, "\n- 定価の内訳: %s（埋め込み ≈ $0.5 は別）。dataset-spec §4.5 の定価の合計は $%.1f\n", strings.Join(parts, "、"), listBudget750)
-	fmt.Fprintf(b, "- このパイプラインの実際の経路（Anthropic の判定だけバッチ、書き下しと検証は逐次）: $%.1f\n", asRun)
+	route := "Anthropic の判定だけバッチ、生成・書き下し・検証は逐次"
+	if p.genBatch {
+		route = "Anthropic の呼び出しはすべてバッチ（生成・書き下し・検証は Coalescer がまとめる）"
+	}
+	fmt.Fprintf(b, "- このパイプラインの実際の経路（%s）: $%.1f\n", route, asRun)
 	fmt.Fprintf(b, "- -budget の既定値は 750 件で $%.0f（定価の 1.5 倍）。件数に比例して縮める\n", p.budget)
 }
 
@@ -2156,7 +2263,7 @@ func runTopics(o pilotOptions) error {
 	if o.budget < 0 {
 		o.budget = 2
 	}
-	env, err := newRealEnv(o)
+	env, err := newRealEnv(o, false)
 	if err != nil {
 		return err
 	}
@@ -2267,7 +2374,7 @@ func runAudit(o pilotOptions) error {
 	if o.budget < 0 {
 		o.budget = 5
 	}
-	env, err := newRealEnv(o)
+	env, err := newRealEnv(o, false)
 	if err != nil {
 		return err
 	}

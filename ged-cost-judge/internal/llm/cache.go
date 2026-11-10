@@ -165,6 +165,13 @@ func (c *CachingClient) lookup(tag, key string) (*Response, error) {
 	}
 }
 
+// Lookup returns the cached response for req (after the client defaults), or (nil, nil) on a miss.
+// Coalescer uses it to answer hits without waiting for a batch.
+func (c *CachingClient) Lookup(req Request) (*Response, error) {
+	req = c.ApplyDefaults(req)
+	return c.lookup(req.Tag, CacheKey(req))
+}
+
 // StoreBatchResult implements BatchStore: it writes resp to the cache unless it is truncated.
 func (c *CachingClient) StoreBatchResult(tag, key string, resp *Response) error {
 	if resp == nil || resp.Truncated() {
