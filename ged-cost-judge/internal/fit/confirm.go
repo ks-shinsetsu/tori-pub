@@ -15,7 +15,7 @@ import (
 
 // Confirmatory is the single entry point of the pre-registered analysis (decisions-stats §2–§4, §6, §7, §9, §9.1,
 // §11, §12b; review-fit-impl B1). It runs, in this order: the mechanical judge QC on the QC set (every triplet but
-// pilot and qt30, before any θ is fitted), the triplet/judgment filters, the informative counts, the multi-start working-independence
+// the default-excluded flags, before any θ is fitted), the triplet/judgment filters, the informative counts, the multi-start working-independence
 // and random-intercept fits, the paired stratified bootstrap with its metadata, the sum normalization, the §3
 // decision rule with every safeguard (information floor on the anchored replicates, replicate floor, boundary rule,
 // scale identification, model agreement), the confirmatory contrasts with Holm, the nested-bootstrap D, the verdict,
@@ -50,8 +50,9 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 	res.Deviations = Preregistered(co, opts)
 	res.Used = summarise(co, opts)
 
-	// 1. Judge QC before θ (decisions §9, §9.1, §13 item 5) on the QC set: every triplet but pilot and qt30 (re-review
-	// N3), fixed regardless of opts so that a sensitivity fit's exclusions cannot move the gate, the tie share or α.
+	// 1. Judge QC before θ (decisions §9, §9.1, §13 item 5) on the QC set: every triplet without a default-excluded
+	// flag (re-review N3), fixed regardless of opts so that a sensitivity fit's exclusions cannot move the gate, the
+	// tie share or α.
 	qcT, qcJ := qcSet(trips, js)
 	res.QC = JudgeQCStats(qcT, qcJ, co.JudgeNames, QCOptions{GateDelta: co.GateDelta, RMax: co.RMax, Conf: co.GateConf})
 	names := co.JudgeNames
@@ -256,9 +257,13 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 	return res, nil
 }
 
-// QCGateExclude are the flags kept out of the judge QC set (decisions §13, §15.9; re-review N3): the pilot and the
-// QT30 transfer triplets. Nothing else is excluded, whatever the fit's own filters are.
-var QCGateExclude = []string{"pilot", "qt30"}
+// QCGateExclude are the flags kept out of the judge QC set: the default exclusion list of the fit (decisions §9,
+// §9.1 "Gate set"; re-review N3), whatever the fit's own filters are. The tie share and α are then measured on
+// the triplets the primary fit uses: X-spk and the diagnostic CA relabels are judged on something the cost table
+// does not price (pilots 1–2: 0–4% "same" there against 7–11% elsewhere), so they would move a judge's tie share
+// for a reason unrelated to the costs. No T1 triplet carries x_spk, diag_ca_type or del_add_cooccur, so the gate
+// set is the same as with pilot and qt30 alone.
+var QCGateExclude = slices.Clone(DefaultExclude)
 
 // qcSet is the judge QC set: every triplet but QCGateExclude, with all judgments.
 func qcSet(trips []Triplet, js []Judgment) ([]Triplet, []Judgment) {
@@ -564,7 +569,7 @@ type ConfirmResult struct {
 	// HolmFamily is the size of the Holm family (the constant HolmFamily; C4 is kept with p = 1 when its baseline is missing, C4Missing).
 	HolmFamily int
 	C4Missing  bool
-	// Judge QC (on the QC set: every triplet but pilot and qt30, before θ) and the judges dropped by it.
+	// Judge QC (on the QC set: every triplet without a default-excluded flag, before θ) and the judges dropped by it.
 	QC             JudgeQCResult
 	ExcludedJudges []string
 	JudgeNames     []string

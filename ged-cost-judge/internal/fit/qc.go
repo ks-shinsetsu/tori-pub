@@ -57,7 +57,7 @@ func t1Stratum(d float64) string {
 }
 
 // JudgeQCStats computes the mechanical judge QC on the triplets it is given (Confirmatory passes the QC set: every
-// triplet but pilot and qt30, QCGateExclude), before any θ is fitted: the T1 reversal
+// triplet without a default-excluded flag, QCGateExclude), before any θ is fitted: the T1 reversal
 // gate of §9.1 (gate set = T1 triplets with Δ(θ₀) ≥ GateDelta, "same" in the denominator only, n_eff = gate
 // triplets), the tie share (≤ 40%) and Krippendorff's α with each other judge (≥ 0.4) as mechanical criteria, and
 // order consistency and Krippendorff's α as descriptive statistics. A judge is Excluded when it fails the gate or

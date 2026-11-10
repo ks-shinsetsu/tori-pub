@@ -196,8 +196,8 @@ func TestValidIterate(t *testing.T) {
 	}
 }
 
-// TestQCSetIsFixed (re-review N3): the judge QC runs on every triplet but pilot and qt30, whatever the fit's own
-// exclusions are, so a sensitivity fit cannot move the gate.
+// TestQCSetIsFixed (re-review N3; decisions §9.1 "Gate set"): the judge QC runs on every triplet without a
+// default-excluded flag, whatever the fit's own exclusions are, so a sensitivity fit cannot move the gate.
 func TestQCSetIsFixed(t *testing.T) {
 	trips, js := Synthetic(13, SyntheticOptions{Sources: 60, Sigma: 1})
 	gate := 0
@@ -212,13 +212,15 @@ func TestQCSetIsFixed(t *testing.T) {
 			trips[i].Flags = append(trips[i].Flags, "qt30")
 		case 2:
 			trips[i].Flags = append(trips[i].Flags, "sens") // a flag a sensitivity fit might exclude
+		case 3:
+			trips[i].Flags = append(trips[i].Flags, "x_spk") // a default-excluded flag other than pilot / qt30
 		}
 		gate++
 	}
 	if gate < 4 {
 		t.Fatalf("only %d gate triplets", gate)
 	}
-	want := JudgeQCStats(trips, js, []string{"a", "b", "c"}, QCOptions{}).NT - (gate+3)/4 - (gate+2)/4
+	want := JudgeQCStats(trips, js, []string{"a", "b", "c"}, QCOptions{}).NT - (gate+3)/4 - (gate+2)/4 - gate/4
 	co := ConfirmOptions{B: 4, SkipMixed: true, SkipD: true, SkipLOJO: true, RandomStarts: -1, MinInformative: map[int]int{}, MinGateTriplets: -1}
 	opts := Options{Judges: 3, Theta0: ged.Current()}
 	for _, excl := range [][]string{nil, append(slices.Clone(DefaultExclude), "sens"), {}} {
