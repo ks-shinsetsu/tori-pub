@@ -2560,7 +2560,9 @@ func runAuditEnv(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	return nil
 }
 
-// qcExemplars: the G1 verifier must recover ≥ 90% of every exemplar's relations and read no extra one.
+// qcExemplars: the G1 verifier must recover ≥ 90% of every exemplar's relations and read no extra one
+// (dataset-spec §7). This checks the verifier on hand-made graphs, so it keeps the strict rule that source
+// acceptance (synth.SourceRecallMin) no longer uses.
 func (r *v2run) qcExemplars(ctx context.Context, b *bytes.Buffer) {
 	fmt.Fprintln(b, "\n## 例示の再注釈（G1 の検証者の固定の検査）")
 	fmt.Fprintln(b, "\n| 例示 | 検証者 | 一致 / 金 | 種別違い | 向き違い | 余分 | 合格 |")
@@ -2583,7 +2585,7 @@ func (r *v2run) qcExemplars(ctx context.Context, b *bytes.Buffer) {
 				fmt.Fprintf(b, "| %s | %s | エラー: %v | | | | |\n", ex.ID, m, err)
 				continue
 			}
-			fmt.Fprintf(b, "| %s | %s | %d / %d | %d | %d | %d | %v |\n", ex.ID, meta.Model, a.Matched, a.Gold, a.TypeWrong, a.DirWrong, a.Extra, a.Pass)
+			fmt.Fprintf(b, "| %s | %s | %d / %d | %d | %d | %d | %v |\n", ex.ID, meta.Model, a.Matched, a.Gold, a.TypeWrong, a.DirWrong, a.Extra, a.Recall >= 0.9 && a.Extra == 0)
 		}
 	}
 }

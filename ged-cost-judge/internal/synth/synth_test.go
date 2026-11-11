@@ -360,6 +360,11 @@ func TestAgreement(t *testing.T) {
 	if a := Agreement(gold, ann); a.Pass || a.DirWrong != 1 || a.Extra != 1 || a.Negated != 1 || a.Recall != 0.5 {
 		t.Fatalf("%+v", a)
 	}
+	// An extra relation does not reject a source whose own relations are all recovered.
+	_ = json.Unmarshal([]byte(`{"propositions":[],"relations":[{"kind":"RA","from":"P2","to":"P1"},{"kind":"CA","from":"P4","to":"P3"},{"kind":"RA","from":"P1","to":"P3"}]}`), &ann)
+	if a := Agreement(gold, ann); !a.Pass || a.Extra != 1 || a.Recall != 1 {
+		t.Fatalf("%+v", a)
+	}
 }
 
 // Allocation for 750 sources: generator × exemplar pair balanced within ±1, generators balanced
