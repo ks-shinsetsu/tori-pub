@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -1435,5 +1436,26 @@ func TestVariantTextsDiffer(t *testing.T) {
 	}
 	if cells[perturb.T4SurfSurf] == 0 || cells[perturb.T4SurfSpk]+cells[perturb.T4SpkSpk] == 0 {
 		t.Errorf("the run kept no X-surf vs X-surf or no X-spk triplet (cells %v); the test does not cover them", cells)
+	}
+}
+
+// TestCodeProvenance: the report names the code the binary was built from (Go's VCS stamp), not the checkout at
+// report time; without a stamp (go run, tests) it says that the working tree was read instead.
+func TestCodeProvenance(t *testing.T) {
+	rev := "876496d0123456789abcdef0123456789abcdef0"
+	bi := &debug.BuildInfo{Settings: []debug.BuildSetting{
+		{Key: "vcs.revision", Value: rev}, {Key: "vcs.time", Value: "2026-11-10T06:23:00Z"}, {Key: "vcs.modified", Value: "true"}}}
+	got := codeProvenance(bi, true)
+	for _, want := range []string{"876496d01234（未コミットの変更を含む）", "-dirty", "2026-11-10T06:23:00Z", "ビルド時の値"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stamped build: %q lacks %q", got, want)
+		}
+	}
+	bi.Settings[2].Value = "false"
+	if got := codeProvenance(bi, true); strings.Contains(got, "未コミット") || strings.Contains(got, "-dirty") {
+		t.Errorf("clean build marked modified: %q", got)
+	}
+	if got := codeProvenance(nil, false); !strings.Contains(got, "VCS の刻印が無い") {
+		t.Errorf("unstamped build: %q", got)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -955,10 +956,13 @@ type v2run struct {
 	judges    []synth.Judge
 	exemplars []synth.Exemplar
 	prompts   map[string]synth.Prompt
+	// code is the provenance of the running code, fixed when the run starts (codeProvenance).
+	code string
 }
 
 func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
-	r := &v2run{o: o, env: env, mt: newMeter(o.budget), gens: map[string]*synth.Generator{}, prompts: map[string]synth.Prompt{}}
+	r := &v2run{o: o, env: env, mt: newMeter(o.budget), gens: map[string]*synth.Generator{}, prompts: map[string]synth.Prompt{},
+		code: codeProvenance(debug.ReadBuildInfo())}
 	for m, c := range env.clients {
 		if co, ok := c.(*llm.Coalescer); ok {
 			co.BeforeFlush = r.admitBatch(m)
@@ -1788,7 +1792,7 @@ func writeJudgeFailures(b *bytes.Buffer, kept []*pilotTriplet, judges []string) 
 func (r *v2run) writeProvenance(b *bytes.Buffer) {
 	o := r.o
 	fmt.Fprintln(b, "\n## 来歴")
-	fmt.Fprintf(b, "\n- git: %s（tag: %s）\n", gitOut("rev-parse", "--short", "HEAD"), gitOut("describe", "--tags", "--always", "--dirty"))
+	fmt.Fprintf(b, "\n- git: %s\n", r.code)
 	fmt.Fprintf(b, "- seed: %d、元の議論 %d 件、P2: %v、QT30 を含む: %v、予算 $%.2f\n", o.seed, o.sources, o.p2, o.withQT30, o.budget)
 	fmt.Fprintf(b, "- λ = %.2f、m = %.2f、B = %d（正規化の集合 U は統計側の設定）\n", o.lambda, o.m, o.boot)
 	var ps []string
@@ -1818,6 +1822,40 @@ func (r *v2run) writeProvenance(b *bytes.Buffer) {
 	if len(bs) > 0 {
 		fmt.Fprintf(b, "- Message Batches にまとめた生成・書き下し・検証: %s。同時に扱う枠: すべて\n", strings.Join(bs, "、"))
 	}
+}
+
+// codeProvenance describes the code the run executes (decisions-stats §16 #13). A binary from go build carries Go's
+// VCS stamp (commit, uncommitted changes, commit time), which is what ran however the checkout changes afterwards;
+// the tag is looked up for that commit. Without a stamp (go run, -buildvcs=false) the checkout is read now, at the
+// start of the run, and the text says so. Reading git when the report is written recorded the wrong code: the P0
+// smoke run's report said e9924ef-dirty for a binary built from 876496d plus uncommitted changes, because commits
+// were made while it ran.
+func codeProvenance(bi *debug.BuildInfo, ok bool) string {
+	var rev, at string
+	modified := false
+	if ok {
+		for _, s := range bi.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.time":
+				at = s.Value
+			case "vcs.modified":
+				modified = s.Value == "true"
+			}
+		}
+	}
+	if rev == "" {
+		return fmt.Sprintf("%s（tag: %s）。実行ファイルに VCS の刻印が無い（go run など）ので、実行開始時の作業ツリーを読んだ",
+			gitOut("rev-parse", "--short=12", "HEAD"), gitOut("describe", "--tags", "--always", "--dirty"))
+	}
+	tag := gitOut("describe", "--tags", "--always", rev)
+	short := rev[:min(12, len(rev))]
+	if modified {
+		short += "（未コミットの変更を含む）"
+		tag += "-dirty"
+	}
+	return fmt.Sprintf("%s（tag: %s、コミット時刻 %s）。実行ファイルに埋め込まれたビルド時の値", short, tag, at)
 }
 
 func gitOut(args ...string) string {
