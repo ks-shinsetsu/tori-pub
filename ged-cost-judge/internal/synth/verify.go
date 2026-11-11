@@ -352,7 +352,7 @@ type GraphAgreement struct {
 	ContentIssues int     `json:"content_issues"`
 	Negated       int     `json:"negated"`
 	Recall        float64 `json:"recall"`
-	// Pass: ≥ 80% of the relations recovered with type and direction (dataset-spec §4.3 as amended 2026-11-11).
+	// Pass: ≥ 65% of the relations recovered with type and direction (dataset-spec §4.3 as amended 2026-11-11).
 	// Extra relations are counted but do not reject.
 	Pass bool `json:"pass"`
 }
@@ -360,8 +360,10 @@ type GraphAgreement struct {
 // SourceRecallMin is the G1 acceptance threshold on relation recall. It was 0.9 together with "no extra relation";
 // the first runs with real models accepted 1 source in 8 under that rule (recall 0.71 over 142 relations, 1.6 extra
 // relations per source, mostly attacks the writer had not put in the graph), so the user set 0.8 and dropped the
-// extra-relation condition (2026-11-11).
-const SourceRecallMin = 0.8
+// extra-relation condition (2026-11-11). The P2 pilot (25 sources) still accepted 9 of 25 at 0.8 after 49
+// generations, with a median recall of 0.64 (Sonnet 5.5) and 0.65 (luna) over the re-annotations, so the user set
+// 0.65 the same day.
+const SourceRecallMin = 0.65
 
 // sourceLabels maps proposition ids to P1, P2, … in graph order.
 func sourceLabels(g ged.Graph) (map[string]string, map[string]string) {
