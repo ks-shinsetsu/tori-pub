@@ -14,6 +14,8 @@ type QCOptions struct {
 	Conf      float64 // 0 → 0.90
 	// MaxTieShare and MinAlpha are the other mechanical criteria (0 → 0.40 and 0.40).
 	MaxTieShare, MinAlpha float64
+	// MinGate is the n_T below which the gate is not evaluable (decisions §9.1 data requirement; 0 → 100, < 0 → no floor).
+	MinGate int
 }
 
 // JudgeQCResult is the per-judge QC table.
@@ -21,9 +23,12 @@ type JudgeQCResult struct {
 	Names []string
 	// NT is the number of gate triplets (T1 with Δ(θ₀) ≥ GateDelta); GateExcluded those with Δ(θ₀) ≤ 0.
 	NT, GateExcluded int
-	Gates            []stats.GateResult
-	Judgments        []int
-	TieShare         []float64
+	// MinGate is the n_T floor used; with NT below it the gate is not evaluable and excludes no judge (GateEvaluable).
+	MinGate       int
+	GateEvaluable bool
+	Gates         []stats.GateResult
+	Judgments     []int
+	TieShare      []float64
 	// OrderConsistency is descriptive (decisions §9 as revised): the share of triplets answered the same in both orders,
 	// over all triplets and over the gate stratum.
 	OrderConsistency, OrderN         []float64
@@ -61,7 +66,7 @@ func t1Stratum(d float64) string {
 // gate of §9.1 (gate set = T1 triplets with Δ(θ₀) ≥ GateDelta, "same" in the denominator only, n_eff = gate
 // triplets), the tie share (≤ 40%) and Krippendorff's α with each other judge (≥ 0.4) as mechanical criteria, and
 // order consistency and Krippendorff's α as descriptive statistics. A judge is Excluded when it fails the gate or
-// the tie share.
+// the tie share; with fewer than MinGate gate triplets the gate is not evaluable and only the tie share excludes.
 func JudgeQCStats(trips []Triplet, js []Judgment, names []string, o QCOptions) JudgeQCResult {
 	if o.GateDelta <= 0 {
 		o.GateDelta = 2
@@ -72,8 +77,11 @@ func JudgeQCStats(trips []Triplet, js []Judgment, names []string, o QCOptions) J
 	if o.MinAlpha <= 0 {
 		o.MinAlpha = 0.40
 	}
+	if o.MinGate == 0 {
+		o.MinGate = 100
+	}
 	J := len(names)
-	r := JudgeQCResult{Names: names, MaxTieShare: o.MaxTieShare, MinAlpha: o.MinAlpha,
+	r := JudgeQCResult{Names: names, MaxTieShare: o.MaxTieShare, MinAlpha: o.MinAlpha, MinGate: o.MinGate,
 		Judgments: make([]int, J), TieShare: make([]float64, J), OrderConsistency: make([]float64, J), OrderN: make([]float64, J),
 		GateOrderConsistency: make([]float64, J), GateOrderN: make([]float64, J), ByStratum: make([]map[string]StratumRate, J),
 		Excluded: make([]bool, J), Reasons: make([]string, J)}
@@ -155,6 +163,9 @@ func JudgeQCStats(trips []Triplet, js []Judgment, names []string, o QCOptions) J
 			r.Alpha[a][b] = pairAlpha(js, len(trips), a, b)
 		}
 	}
+	// Below the n_T floor the gate is not evaluable (decisions §9.1): with few gate triplets the Clopper–Pearson
+	// bound exceeds r_max even without a single reversal (n_T ≤ 10), so a failure there says nothing about the judge.
+	r.GateEvaluable = r.NT >= o.MinGate
 	for j := range J {
 		r.Judgments[j] = tie[j].n
 		if tie[j].n > 0 {
@@ -178,7 +189,7 @@ func JudgeQCStats(trips []Triplet, js []Judgment, names []string, o QCOptions) J
 		g := stats.ReversalGate(gate[j].rev, gate[j].tie, gate[j].n, r.NT, o.RMax, o.Conf)
 		r.Gates = append(r.Gates, g)
 		var reasons []string
-		if gate[j].n > 0 && g.Fail {
+		if r.GateEvaluable && gate[j].n > 0 && g.Fail {
 			reasons = append(reasons, "T1 reversal gate")
 		}
 		if !math.IsNaN(r.TieShare[j]) && r.TieShare[j] > o.MaxTieShare {

@@ -236,6 +236,28 @@ func TestQCSetIsFixed(t *testing.T) {
 	}
 }
 
+// TestGateNeedsEnoughTriplets: below the n_T floor the T1 gate is not evaluable and excludes no judge
+// (decisions §9.1), even one that reverses every gate triplet; without the floor the same judge is excluded.
+func TestGateNeedsEnoughTriplets(t *testing.T) {
+	var trips []Triplet
+	var js []Judgment
+	for i := range 8 {
+		trips = append(trips, Triplet{Source: i, Type: "T1", T1Delta0: 3})
+		for _, o := range []float64{1, -1} {
+			js = append(js, Judgment{Triplet: i, Judge: 0, Order: o, Answer: AnswerB})
+		}
+	}
+	qc := JudgeQCStats(trips, js, []string{"a"}, QCOptions{})
+	if qc.GateEvaluable || qc.Excluded[0] || !qc.Gates[0].Fail {
+		t.Errorf("n_T = %d: evaluable %v, excluded %v, gate fail %v; want a failing gate that is not evaluable and excludes nobody",
+			qc.NT, qc.GateEvaluable, qc.Excluded[0], qc.Gates[0].Fail)
+	}
+	qc = JudgeQCStats(trips, js, []string{"a"}, QCOptions{MinGate: -1})
+	if !qc.GateEvaluable || !qc.Excluded[0] {
+		t.Errorf("no floor: evaluable %v, excluded %v; want both", qc.GateEvaluable, qc.Excluded[0])
+	}
+}
+
 // TestMixedSigmaZero (deliverable d): FitMixed with σ fixed near 0 agrees with the independence fit.
 func TestMixedSigmaZero(t *testing.T) {
 	w := newWorld(5, altTheta(), 0)

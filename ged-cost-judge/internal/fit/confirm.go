@@ -54,7 +54,7 @@ func Confirmatory(trips []Triplet, js []Judgment, opts Options, co ConfirmOption
 	// flag (re-review N3), fixed regardless of opts so that a sensitivity fit's exclusions cannot move the gate, the
 	// tie share or α.
 	qcT, qcJ := qcSet(trips, js)
-	res.QC = JudgeQCStats(qcT, qcJ, co.JudgeNames, QCOptions{GateDelta: co.GateDelta, RMax: co.RMax, Conf: co.GateConf})
+	res.QC = JudgeQCStats(qcT, qcJ, co.JudgeNames, QCOptions{GateDelta: co.GateDelta, RMax: co.RMax, Conf: co.GateConf, MinGate: co.MinGateTriplets})
 	names := co.JudgeNames
 	if co.ApplyExclusions {
 		for j := opts.Judges - 1; j >= 0; j-- {

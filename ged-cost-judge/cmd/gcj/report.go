@@ -394,9 +394,14 @@ func writeJudgeQC(w io.Writer, q fit.JudgeQCResult, co fit.ConfirmOptions) {
 		verdict := "いいえ"
 		if q.Excluded[j] {
 			verdict = "**はい**（" + q.Reasons[j] + "）"
+		} else if !q.GateEvaluable && g.Fail {
+			verdict = "いいえ（ゲートは評価不能。上限は r_max を超える）"
 		}
 		fmt.Fprintf(w, "| %s | %d | %.1f%% | %s | %s | %d | %d | %s | %s | %s |\n", name, q.Judgments[j], 100*q.TieShare[j],
 			ratioF(q.OrderConsistency[j], int(q.OrderN[j])), ratioF(q.GateOrderConsistency[j], int(q.GateOrderN[j])), g.Judgments, g.Reversals, num(g.R), num(g.Upper), verdict)
+	}
+	if !q.GateEvaluable {
+		fmt.Fprintf(w, "\n**T1 ゲートは評価不能**: n_T = %d < %d（§9.1 のデータ要件）。ゲートでは判定者を除外しない。\n", q.NT, q.MinGate)
 	}
 	if len(q.Strata) > 0 {
 		fmt.Fprintln(w, "\n反転率の Δ(θ₀) 層別（記述）:")

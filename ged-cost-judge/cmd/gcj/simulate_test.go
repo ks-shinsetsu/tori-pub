@@ -88,8 +88,9 @@ func TestSimJSONLRecord(t *testing.T) {
 	if rec.MinInformative["I 欠落"] != 14 || rec.MinInformative["種別 RA↔MA"] != 10 || rec.MinInformative["θ_neg（極性反転）"] != 7 {
 		t.Fatalf("scaled floors %v", rec.MinInformative)
 	}
-	// Without -apply-qc the QC is recorded but no judge is dropped (at 16 sources every judge fails the T1 gate).
-	if len(rec.ExcludedJudges) != 0 || len(rec.QCFail) == 0 {
+	// At 16 sources the T1 gate has fewer than 100 triplets: it is not evaluable and fails no judge (decisions §9.1),
+	// although every judge's bound is above r_max there.
+	if len(rec.ExcludedJudges) != 0 || len(rec.QCFail) != 0 {
 		t.Fatalf("excluded %v, QC failures %v", rec.ExcludedJudges, rec.QCFail)
 	}
 	if len(rec.Hypotheses) == 0 || rec.Hypotheses[0].ID == "" {
