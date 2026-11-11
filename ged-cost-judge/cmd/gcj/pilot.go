@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"slices"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -131,6 +133,9 @@ type meter struct {
 	// reserved is the projected cost of submitted batches not yet metered; check and remaining count it as spent,
 	// so concurrent request-by-request calls cannot spend it (review-synth-impl M5).
 	reserved float64
+	// stop is the error that ended the run (halt): the budget, or a call that returned no model output. Once set,
+	// check fails, so no further call is made and the records are incomplete.
+	stop error
 }
 
 func newMeter(limit float64) *meter {
@@ -139,6 +144,41 @@ func newMeter(limit float64) *meter {
 }
 
 var errBudget = errors.New("pilot: API の費用が上限に達した")
+
+// errNoOutput marks a call that ended without a model response (transport or API error after the client's
+// retries, cache error, canceled context). The model did not fail, so such a call is not an attempt.
+var errNoOutput = errors.New("pilot: API の呼び出しが応答を返さなかった")
+
+// halt ends the run with err; the first error is kept.
+func (m *meter) halt(err error) {
+	m.mu.Lock()
+	if m.stop == nil {
+		m.stop = err
+	}
+	m.mu.Unlock()
+}
+
+// stopped is the error that ended the run, nil while it is complete.
+func (m *meter) stopped() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stop
+}
+
+// lost reports whether a call failed without a model response, and ends the run if so. Why: counting such a
+// failure as the model's would spend a retry on a request the model never saw, put the error text into the next
+// prompt, and make a rerun (where the call succeeds from the start) take a different path than the records show.
+func (m *meter) lost(tag string, resp *llm.Response, err error) bool {
+	if err == nil || resp != nil {
+		return false
+	}
+	if errors.Is(err, errBudget) {
+		m.halt(err)
+	} else {
+		m.halt(fmt.Errorf("%w（%s）: %v", errNoOutput, tag, err))
+	}
+	return true
+}
 
 func (m *meter) add(tag string, r *llm.Response) {
 	if r == nil {
@@ -195,9 +235,14 @@ func (m *meter) release(x float64) {
 	m.mu.Unlock()
 }
 
-// check fails once the metered cost plus the reserved batch projections reach the limit (-budget 0: no calls).
+// check is asked before every call. It fails once the run was ended (halt), or once the metered cost plus the
+// reserved batch projections reach the limit (-budget 0: no calls); a call refused for the limit ends the run too.
 func (m *meter) check() error {
+	if err := m.stopped(); err != nil {
+		return err
+	}
 	if m.total()+m.pending() >= m.limit {
+		m.halt(errBudget)
 		return errBudget
 	}
 	return nil
@@ -384,7 +429,21 @@ func runPilot(o pilotOptions) error {
 	if err != nil {
 		return err
 	}
-	return runPilotV2(context.Background(), o, env)
+	ctx, cancel := runContext()
+	defer cancel()
+	return runPilotV2(ctx, o, env)
+}
+
+// runContext is canceled by the first interrupt (Ctrl-C) or SIGTERM, so that calls in flight return, a batch
+// submission in flight is reconciled (llm money-safety rule 4) and the records and the report are written before
+// the process exits. Signal handling is then back to the default: a second interrupt ends the process at once.
+func runContext() (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return ctx, stop
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -940,7 +999,9 @@ func (r *v2run) admitBatch(model string) func([]llm.Request) (func(), error) {
 			proj += r.env.pricing.ChatCostBatch(model, llm.Usage{InputTokens: int64(float64(chars) / 4 * 1.2), OutputTokens: int64(out)})
 		}
 		if rem := r.mt.remaining(); proj > rem {
-			return nil, fmt.Errorf("%w: %s のバッチ %d 件（見込み $%.2f）が残りの予算 $%.2f を超えるので投げなかった", errBudget, model, len(reqs), proj, rem)
+			err := fmt.Errorf("%w: %s のバッチ %d 件（見込み $%.2f）が残りの予算 $%.2f を超えるので投げなかった", errBudget, model, len(reqs), proj, rem)
+			r.mt.halt(err)
+			return nil, err
 		}
 		r.mt.reserve(proj)
 		return func() { r.mt.release(proj) }, nil
@@ -1095,8 +1156,14 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	}
 
 	// ---- J judgments: every judge × both orders; Anthropic judges in Message Batches ----
-	js, judgeErr := r.judgeAll(ctx, kept, accepted)
-	fmt.Fprintf(os.Stderr, "judged, cost $%.3f\n", mt.total())
+	// A run ended during generation has an incomplete triplet set and is not judged: with the budget spent nothing
+	// more may be sent, and the rerun judges the full set.
+	var js []fit.Judgment
+	var judgeErr error
+	if mt.stopped() == nil {
+		js, judgeErr = r.judgeAll(ctx, kept, accepted)
+		fmt.Fprintf(os.Stderr, "judged, cost $%.3f\n", mt.total())
+	}
 
 	// ---- records ----
 	if err := writeJSONL(filepath.Join(o.out, "pilot_sources.jsonl"), all); err != nil {
@@ -1126,17 +1193,19 @@ func runPilotV2(ctx context.Context, o pilotOptions, env *pilotEnv) error {
 	if judgeErr != nil {
 		fmt.Fprintf(&b, "\n**判定の一部が失敗した**: %v\n", judgeErr)
 	}
-	if err := r.writeFitReport(&b, kept, ft, js, d0, pp.stats); err != nil {
+	// A run that was ended (budget, calls without a response, missing judgments) has incomplete records: it is not
+	// fitted and exits non-zero. A rerun with the same settings reads what was paid for from the cache and continues.
+	stop := mt.stopped()
+	if stop != nil {
+		fmt.Fprintf(&b, "\n## 実行は途中で止まった\n\n- 理由: %v\n- 記録は不完全なので、当てはめは行わない。\n- 同じ設定で再実行すると、応答を得た呼び出しはキャッシュから読まれ（費用 0）、止まった所から続く。\n", stop)
+	} else if err := r.writeFitReport(&b, kept, ft, js, d0, pp.stats); err != nil {
 		fmt.Fprintf(&b, "\n（当てはめを行わなかった: %v）\n", err)
 	}
 	if err := os.WriteFile(filepath.Join(o.out, "pilot.md"), b.Bytes(), 0o644); err != nil {
 		return err
 	}
 	fmt.Print(b.String())
-	if errors.Is(judgeErr, errBudget) || mt.check() != nil {
-		return errBudget
-	}
-	return nil
+	return stop
 }
 
 // sourceJob is one G1 generation: a spec of the allocation (index = its position, source id s%04d) or the
@@ -1177,6 +1246,10 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			if err != nil {
 				att.Error = err.Error()
 				rec.Attempts = append(rec.Attempts, att)
+				if r.mt.lost("synth_source", resp, err) {
+					rec.Reason = r.mt.stopped().Error()
+					return err
+				}
 				rec.Reason = "generation error"
 				continue
 			}
@@ -1189,10 +1262,15 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			}
 			cp, err := synth.CopyCheck(ctx, d, r.exemplars, r.env.emb)
 			att.Copy = &cp
-			if err != nil || cp.Reject {
-				if err != nil {
-					att.Error = err.Error()
-				}
+			if err != nil {
+				// The embedding call failed: the source was not checked, which is not a rejection.
+				att.Error = err.Error()
+				rec.Attempts = append(rec.Attempts, att)
+				r.mt.lost("embed", nil, err)
+				rec.Reason = r.mt.stopped().Error()
+				return err
+			}
+			if cp.Reject {
 				rec.Attempts = append(rec.Attempts, att)
 				rec.Reason = "exemplar copy"
 				continue
@@ -1203,6 +1281,10 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			if err != nil {
 				att.Error = "verify_source: " + err.Error()
 				rec.Attempts = append(rec.Attempts, att)
+				if r.mt.lost("verify_source", vresp, err) {
+					rec.Reason = r.mt.stopped().Error()
+					return err
+				}
 				rec.Reason = "G1 verification error"
 				continue
 			}
@@ -1411,6 +1493,7 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 			if rem := r.mt.remaining(); proj > rem {
 				jr.skip = fmt.Errorf("%w: %s の判定 %d 件（未キャッシュ分の見込み $%.2f）が残りの予算 $%.2f を超えるので投げなかった",
 					errBudget, judge.Model, len(jr.reqs), proj, rem)
+				r.mt.halt(jr.skip)
 				continue
 			}
 			r.mt.reserve(proj)
@@ -1430,13 +1513,15 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 				// On a whole-call error the slice still holds every response obtained before the failure (llm
 				// contract): they are paid for, so they are metered and recorded like the others (review M1).
 				res, err := judge.Client.(llm.BatchClient).CompleteBatch(ctx, jr.reqs)
+				// Released before the costs are metered: holding both would count the batch twice for a moment, and
+				// a request-by-request judge asking check then would end the run.
+				r.mt.release(jr.reserved)
 				for i, x := range res {
 					r.mt.add("judge", x.Response)
 					if i < len(jr.results) {
 						jr.results[i] = x
 					}
 				}
-				r.mt.release(jr.reserved)
 				if err != nil {
 					jr.err = fmt.Errorf("judge %s: batch: %w", judge.Model, err)
 				}
@@ -1467,7 +1552,7 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 		if jr.err != nil {
 			errs = append(errs, jr.err)
 		}
-		failed := 0
+		failed, lost := 0, 0
 		for i, res := range jr.results {
 			it := jr.items[i]
 			t := kept[it.t]
@@ -1482,6 +1567,9 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 			err := res.Err
 			if err == nil && res.Response == nil {
 				err = errors.New("no result (the batch call failed before this item)")
+			}
+			if res.Response == nil {
+				lost++
 			}
 			if err == nil {
 				ans, err = synth.ParseJudgeAnswer(res.Response)
@@ -1504,6 +1592,11 @@ func (r *v2run) judgeAll(ctx context.Context, kept []*pilotTriplet, sources []*s
 		}
 		if failed > 0 {
 			errs = append(errs, fmt.Errorf("judge %s: %d/%d judgments failed", judge.Model, failed, len(jr.results)))
+		}
+		if lost > 0 {
+			// Judgments without a response are missing data, not answers the judge declined to give (a refusal or
+			// a truncation is a response): the fit must not run on them.
+			r.mt.halt(fmt.Errorf("%w（judge）: %s の判定 %d/%d 件に応答が無い", errNoOutput, judge.Model, lost, len(jr.results)))
 		}
 	}
 	return js, errors.Join(errs...)
@@ -2323,7 +2416,9 @@ func runTopics(o pilotOptions) error {
 	if err != nil {
 		return err
 	}
-	return runTopicsEnv(context.Background(), o, env)
+	ctx, cancel := runContext()
+	defer cancel()
+	return runTopicsEnv(ctx, o, env)
 }
 
 func runTopicsEnv(ctx context.Context, o pilotOptions, env *pilotEnv) error {
@@ -2434,7 +2529,9 @@ func runAudit(o pilotOptions) error {
 	if err != nil {
 		return err
 	}
-	return runAuditEnv(context.Background(), o, env)
+	ctx, cancel := runContext()
+	defer cancel()
+	return runAuditEnv(ctx, o, env)
 }
 
 func runAuditEnv(ctx context.Context, o pilotOptions, env *pilotEnv) error {

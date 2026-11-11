@@ -781,7 +781,7 @@ const (
 	outcomeOK realizeOutcome = iota
 	outcomeInfeasible
 	outcomeFailed
-	outcomeBudget
+	outcomeBudget // the run was ended: the budget, or a call without a model response (meter.halt)
 )
 
 // realizeVerifiedV2 realizes edits on base and verifies blind, retrying once with the verifier's reasons.
@@ -810,6 +810,10 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 		if err != nil {
 			att.Error = err.Error()
 			rec.Attempts = append(rec.Attempts, att)
+			// key == "": no call was made (the edits cannot be turned into a request); that is the plan's failure.
+			if key != "" && pp.mt.lost("realize", resp, err) {
+				return synth.Discussion{}, rec, outcomeBudget
+			}
 			in.Feedback = "the output could not be used: " + err.Error()
 			continue
 		}
@@ -846,6 +850,9 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 		if err != nil {
 			att.Error = "verify: " + err.Error()
 			rec.Attempts = append(rec.Attempts, att)
+			if pp.mt.lost("verify", resp, err) {
+				return synth.Discussion{}, rec, outcomeBudget
+			}
 			continue
 		}
 		att.Verification = &ver
@@ -1169,7 +1176,7 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 		}
 		dp.A = recA
 		if oa == outcomeBudget {
-			t.Err = errBudget.Error()
+			t.Err = pp.stopReason()
 			return t
 		}
 		if oa != outcomeOK {
@@ -1193,7 +1200,7 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 		pp.stats.record(extraRecs, recB, outcomeInfeasibleEdit(ob, recB), sr.QT30, pair)
 		dp.B = recB
 		if ob == outcomeBudget {
-			t.Err = errBudget.Error()
+			t.Err = pp.stopReason()
 			return t
 		}
 		if ob != outcomeOK {
@@ -1222,6 +1229,7 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 		t.StatA, t.StatB = lastStats(recA), lastStats(recB)
 		if err := pp.measure(t, src); err != nil {
 			t.Err = "embed: " + err.Error()
+			pp.mt.lost("embed", nil, err)
 			return t
 		}
 		if s.typ == perturb.T1Monotone {
@@ -1259,6 +1267,14 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 	}
 	t.Err = "discarded: 3 回の編集計画とも使えなかった（最後の理由: " + lastReason + "）"
 	return t
+}
+
+// stopReason is the Err of a slot given up because the run was ended (outcomeBudget).
+func (pp *pipelineV2) stopReason() string {
+	if err := pp.mt.stopped(); err != nil {
+		return err.Error()
+	}
+	return errBudget.Error()
 }
 
 // outcomeInfeasibleEdit is the infeasible edit's index for the stats (-1 unless o is an infeasible return).

@@ -183,7 +183,13 @@ type fakeLLM struct {
 	// see the same content, so a 12-source run has only ≈ 96 distinct contents: n must be small enough that at
 	// least one is refused in every run ((1 − 1/n)^96).
 	refuseEvery int
+	// dropRealize: the n-th realize call (1-based) ends without a response, as a transport error would.
+	dropRealize int
+	// leaked: a later prompt contained the text of that error.
+	leaked bool
 }
+
+const fakeTransportError = "fake: connection reset by peer"
 
 func newFakeLLM() *fakeLLM {
 	return &fakeLLM{sources: map[string][][3]string{}, variants: map[string]*fakeVariant{}, calls: map[string]int{}, caSeen: map[string]bool{}}
@@ -219,10 +225,15 @@ func (f *fakeLLM) next() int {
 }
 
 func (f *fakeLLM) complete(_ context.Context, req llm.Request) (*llm.Response, error) {
+	user := req.Messages[len(req.Messages)-1].Content
 	f.mu.Lock()
 	f.calls[req.Tag]++
+	drop := req.Tag == "realize" && f.calls[req.Tag] == f.dropRealize
+	f.leaked = f.leaked || strings.Contains(user, fakeTransportError)
 	f.mu.Unlock()
-	user := req.Messages[len(req.Messages)-1].Content
+	if drop {
+		return nil, errors.New(fakeTransportError)
+	}
 	var out any
 	switch req.Tag {
 	case "synth_source":
@@ -901,6 +912,89 @@ func TestPilotV2Coalesced(t *testing.T) {
 	}
 }
 
+// runQuiet runs the v2 pilot with stdout discarded and returns its error and the report.
+func runQuiet(t *testing.T, o pilotOptions, env *pilotEnv) (error, string) {
+	t.Helper()
+	null, _ := os.Open(os.DevNull)
+	stdout := os.Stdout
+	os.Stdout = null
+	err := runPilotV2(context.Background(), o, env)
+	os.Stdout = stdout
+	b, rerr := os.ReadFile(filepath.Join(o.out, "pilot.md"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	return err, string(b)
+}
+
+// TestLostCallEndsRun: a call that returns no response is not the model's failure. It is not retried as an
+// attempt, its error text reaches no prompt, the run ends with an error, and nothing is judged or fitted.
+func TestLostCallEndsRun(t *testing.T) {
+	f := newFakeLLM()
+	f.dropRealize = 5
+	o := testOptions(t)
+	err, report := runQuiet(t, o, testEnv(f, o.allModels()))
+	if !errors.Is(err, errNoOutput) {
+		t.Fatalf("err = %v, want errNoOutput", err)
+	}
+	if f.leaked {
+		t.Error("the transport error text was sent to the model as feedback")
+	}
+	if f.calls["judge"] != 0 {
+		t.Errorf("%d judge calls in a run that was ended during generation", f.calls["judge"])
+	}
+	if !strings.Contains(report, "実行は途中で止まった") || strings.Contains(report, "規則ごとの一致率") {
+		t.Error("the report must say the run was ended and must not contain a fit")
+	}
+	trips, err := readJSONL[pilotTriplet](filepath.Join(o.out, "pilot_triplets.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := 0
+	for _, tr := range trips {
+		if strings.Contains(tr.Err, errNoOutput.Error()) {
+			stopped++
+		}
+		if strings.HasPrefix(tr.Err, "discarded") {
+			t.Errorf("%s: a slot of an ended run was counted as discarded: %s", tr.ID, tr.Err)
+		}
+		for _, dp := range tr.Discarded {
+			if dp.Reason == "verification" && strings.Contains(strings.Join(dp.Details, " "), fakeTransportError) {
+				t.Errorf("%s: the lost call was recorded as a failed verification", tr.ID)
+			}
+		}
+	}
+	if stopped == 0 {
+		t.Error("no slot records the lost call")
+	}
+}
+
+// TestBudgetRefusalEndsRun: a generation batch refused for the budget ends the run with errBudget instead of
+// being counted as failed realizations (which were replaced and redrawn until the slots ran out).
+func TestBudgetRefusalEndsRun(t *testing.T) {
+	f := newFakeLLM()
+	o := testOptions(t)
+	o.budget = 1e-6
+	env := testEnv(f, o.allModels())
+	for m := range env.clients {
+		if synth.FamilyOf(m) == "anthropic" {
+			co := llm.NewCoalescer(&fakeBatchClient{f})
+			co.Quiet, co.MaxWait = 20*time.Millisecond, time.Second
+			env.clients[m] = co
+		}
+	}
+	err, report := runQuiet(t, o, env)
+	if !errors.Is(err, errBudget) {
+		t.Fatalf("err = %v, want errBudget", err)
+	}
+	if f.batches != 0 || f.calls["judge"] != 0 {
+		t.Errorf("%d batches and %d judge calls after the refusal", f.batches, f.calls["judge"])
+	}
+	if !strings.Contains(report, "実行は途中で止まった") {
+		t.Error("the report does not say the run was ended")
+	}
+}
+
 // TestCoalescedBudgetGuard: a flush whose projected batch cost exceeds the remaining budget is not sent.
 func TestCoalescedBudgetGuard(t *testing.T) {
 	f := newFakeLLM()
@@ -1338,12 +1432,21 @@ func TestJudgePartialBatchAndReservation(t *testing.T) {
 		t.Fatalf("remaining %v", m.remaining())
 	}
 	m.reserve(0.5)
-	if m.check() == nil {
+	if m.remaining() >= 0 {
 		t.Fatal("reserved projections do not count against the budget")
 	}
 	m.release(1.1)
 	if m.check() != nil || m.pending() != 0 {
 		t.Fatal("release")
+	}
+	// A call refused for the budget ends the run: later calls stay refused even if a reservation is released.
+	m.reserve(1)
+	if !errors.Is(m.check(), errBudget) {
+		t.Fatal("no refusal at the limit")
+	}
+	m.release(1)
+	if !errors.Is(m.check(), errBudget) || !errors.Is(m.stopped(), errBudget) {
+		t.Fatal("a refused call did not end the run")
 	}
 }
 
