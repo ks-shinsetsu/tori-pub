@@ -29,6 +29,9 @@ import (
 //  4. Submissions are never retried by the SDK (no idempotency key). After a failure whose outcome
 //     is unknown, the batches created since the upload started are listed and recorded as
 //     "ambiguous", so the next attempt resumes them instead of submitting again.
+//  5. A submission leaves an intent file from before the upload until its batch is recorded. A
+//     process killed in between (no chance to list anything) leaves the file behind, and the next
+//     run does the listing of rule 4 from the intent's start time before it submits anything.
 
 const (
 	// anthropicBatchRequestLimit is the Message Batches limit on requests per batch
@@ -136,7 +139,11 @@ func (c *AnthropicClient) CompleteBatchStore(ctx context.Context, reqs []Request
 		}
 	}
 
-	// 1. Resume recorded batches that cover any of these requests.
+	// 1. Resume recorded batches that cover any of these requests, after recording the batches an
+	// interrupted submission of an earlier run may have created.
+	if err := c.recoverIntents(ctx); err != nil {
+		return c.finishBatch(out, keys, results, polled, err)
+	}
 	pending, err := c.pendingStates()
 	if err != nil {
 		return c.finishBatch(out, keys, results, polled, err)
@@ -490,19 +497,25 @@ func (c *AnthropicClient) chunkBatch(reqs []anthropic.MessageBatchNewParamsReque
 // returned, so the next attempt resumes them instead of uploading again.
 func (c *AnthropicClient) submitBatch(ctx context.Context, reqs []anthropic.MessageBatchNewParamsRequest, items map[string]*batchItem) (*batchState, error) {
 	start := time.Now()
+	intent, err := c.beginSubmit(start)
+	if err != nil {
+		return nil, fmt.Errorf("llm: anthropic batch not submitted: %w", err)
+	}
 	b, err := c.api.Messages.Batches.New(ctx, anthropic.MessageBatchNewParams{Requests: reqs},
 		option.WithMaxRetries(0), option.WithRequestTimeout(c.cfg.BatchSubmitTimeout))
 	if err != nil {
 		werr := wrapAnthropicError(err)
 		var apiErr *APIError
 		if errors.As(werr, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			endSubmit(intent)
 			return nil, fmt.Errorf("llm: anthropic batch submit rejected: %w", werr)
 		}
 		n, rerr := c.reconcileSubmit(ctx, start)
 		if rerr != nil {
-			// Not retryable: retrying blindly could create a second batch.
+			// Not retryable: retrying blindly could create a second batch. The intent stays, so the next run lists again.
 			return nil, fmt.Errorf("llm: anthropic batch submit failed with an unknown outcome (%v) and the batch list could not be read (%v); check the Console for an untracked batch before rerunning", werr, rerr)
 		}
+		endSubmit(intent)
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("llm: anthropic batch submit interrupted; %d batch(es) created since the upload started are recorded and resume on the next call: %w", n, ctx.Err())
 		}
@@ -516,10 +529,89 @@ func (c *AnthropicClient) submitBatch(ctx context.Context, reqs []anthropic.Mess
 		st.Items[i] = batchItemRef{CustomID: r.CustomID, Tags: slices.Clone(items[r.CustomID].tags)}
 	}
 	if err := c.saveState(st); err != nil {
-		// The batch runs (and is billed) regardless; it is in memory for this process.
+		// The batch runs (and is billed) regardless; it is in memory for this process, and the intent stays so
+		// that a later run records it.
 		return nil, fmt.Errorf("llm: anthropic batch %s submitted but its state file could not be written (resume with ResumeBatch): %w", b.ID, err)
 	}
+	endSubmit(intent)
 	return st, nil
+}
+
+// submitIntent is the content of an intent file (money-safety rule 5).
+type submitIntent struct {
+	PID     int       `json:"pid"`
+	Started time.Time `json:"started"`
+}
+
+// intentSuffix keeps intent files apart from the batch state files (*.json) of the same directory.
+const intentSuffix = ".submitting"
+
+// processStart tells this process's intents from those of a dead process that had the same pid.
+var processStart = time.Now()
+
+// beginSubmit writes the intent file of a submission that starts now and returns its path
+// ("" without a state dir). An intent that cannot be written is an error: nothing is submitted.
+func (c *AnthropicClient) beginSubmit(start time.Time) (string, error) {
+	if c.cfg.BatchStateDir == "" {
+		return "", nil
+	}
+	if err := os.MkdirAll(c.cfg.BatchStateDir, 0o755); err != nil {
+		return "", fmt.Errorf("llm: create batch state dir: %w", err)
+	}
+	b, err := json.Marshal(submitIntent{PID: os.Getpid(), Started: start.UTC()})
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(c.cfg.BatchStateDir, fmt.Sprintf("%d-%d%s", os.Getpid(), start.UnixNano(), intentSuffix))
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return "", fmt.Errorf("llm: write batch submit intent: %w", err)
+	}
+	return path, nil
+}
+
+// endSubmit removes an intent whose outcome is recorded (or known to be "nothing created").
+func endSubmit(path string) {
+	if path != "" {
+		os.Remove(path)
+	}
+}
+
+// recoverIntents handles the intents an earlier process left behind (rule 5): the batches created
+// since each intent started are recorded as ambiguous, then the intent is removed. Intents of this
+// process belong to submissions still in flight (other clients share the directory) and are left.
+func (c *AnthropicClient) recoverIntents(ctx context.Context) error {
+	if c.cfg.BatchStateDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(c.cfg.BatchStateDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("llm: read batch state dir: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), intentSuffix) {
+			continue
+		}
+		path := filepath.Join(c.cfg.BatchStateDir, e.Name())
+		b, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue // removed by the submission it belonged to
+		}
+		var in submitIntent
+		if err == nil {
+			err = json.Unmarshal(b, &in)
+		}
+		if err != nil {
+			return fmt.Errorf("llm: read batch submit intent %s: %w", e.Name(), err)
+		}
+		if in.PID == os.Getpid() && !in.Started.Before(processStart) {
+			continue
+		}
+		if _, err := c.reconcileSubmit(ctx, in.Started); err != nil {
+			return fmt.Errorf("llm: an earlier run was interrupted while submitting a batch and the batch list could not be read; nothing is submitted: %w", transient(err))
+		}
+		os.Remove(path)
+	}
+	return nil
 }
 
 // reconcileSubmit records the batches created since start (minus clock-skew slack) that are not

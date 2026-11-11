@@ -198,6 +198,46 @@ func TestBatchLostSubmitResponseIsReconciled(t *testing.T) {
 	}
 }
 
+// A process killed during the upload records nothing; its intent file makes the next run list the
+// batches created since then and resume them instead of submitting the same requests again.
+func TestBatchKilledDuringSubmitIsReconciled(t *testing.T) {
+	f, srv := newFakeAnthropic(t)
+	stateDir := t.TempDir()
+	mod := func(cfg *AnthropicConfig) { cfg.BatchStateDir = stateDir }
+	reqs := []Request{judgeReq("claude-haiku-5-5", "killed")}
+
+	// The dead run: the API accepted the batch, but the process left only its intent.
+	dead := newTestAnthropic(t, srv, mod)
+	plantBatch(t, f, dead, stateDir, "msgbatch_dead", reqs)
+	if err := os.Remove(filepath.Join(stateDir, "msgbatch_dead.json")); err != nil {
+		t.Fatal(err)
+	}
+	intent, _ := json.Marshal(submitIntent{PID: os.Getpid() + 1, Started: time.Now().Add(-time.Minute).UTC()})
+	intentPath := filepath.Join(stateDir, "dead"+intentSuffix)
+	if err := os.WriteFile(intentPath, intent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCachingClient(newTestAnthropic(t, srv, mod), NewFileCache(t.TempDir()))
+	c.BatchRetry = fastRetry(3)
+	res, err := c.CompleteBatch(context.Background(), reqs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.batchCreates != 0 {
+		t.Errorf("batches created = %d, want 0 (the dead run's batch is resumed)", f.batchCreates)
+	}
+	if res[0].Err != nil || res[0].Response.Text != `{"echo":"killed"}` {
+		t.Errorf("result: %+v", res[0])
+	}
+	if _, err := os.Stat(intentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("intent file still there: %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(stateDir, "*"+intentSuffix)); len(left) != 0 {
+		t.Errorf("intent files left: %v", left)
+	}
+}
+
 // R1: a lost-response batch is first read by a call for unrelated requests (after the process
 // that submitted it died). Its results have no recorded tag yet, so it must stay pending until the
 // original requests come back; then they are stored and nothing is submitted twice.
