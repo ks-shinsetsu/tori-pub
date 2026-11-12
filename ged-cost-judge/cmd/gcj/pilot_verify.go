@@ -28,8 +28,8 @@ import (
 //
 // v2 (dataset-spec §2–§4): plans come from the catalogue (perturb.DrawTriplet with the source's prop→utterance
 // map, the embedding cos between source propositions, θ₀ and the strength-predicted cos); the writer realizes
-// with realize_v3 (touched-proposition texts, infeasible flag), the other-family verifier re-annotates the touched
-// elements blind (verify_v2), an infeasible return or a failed plan is redrawn (≤ 3 plans per slot) and kept as a
+// with realize_v4 (touched-proposition texts, infeasible flag), the other-family verifier re-annotates the touched
+// elements blind (verify_v3), an infeasible return or a failed plan is redrawn (≤ 3 plans per slot) and kept as a
 // discarded plan; a t3_diag relabel returned infeasible is redrawn inside the slot (≤ 3, then an ordinary T3 slot);
 // T1's B is realized incrementally from A's realized text and must reach realized Δ(θ₀) ≥ 0.5.
 

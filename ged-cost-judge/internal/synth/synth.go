@@ -7,8 +7,14 @@
 //
 //   - "v1" is the pilot-2 pipeline (synth_source_v1, realize_v1/v2, verify_v1, judge_v1; one model).
 //     Its requests are kept byte-identical so that a pilot-2 run replays from the response cache.
-//   - "v2" is the revised pipeline of dataset-spec §9 (synth_source_v2 with exemplars, realize_v3,
-//     verify_v2, verify_source_v1, synth_topics_v1; two generator families, cross-family verifier).
+//   - "v2" is the revised pipeline of dataset-spec §9 (synth_source_v3 with exemplars, realize_v4,
+//     verify_v3, verify_source_v2, synth_topics_v1; two generator families, cross-family verifier).
+//     Until the first P2 pilot (2026-11-12) the prompts were synth_source_v2, realize_v3, verify_v2 and
+//     verify_source_v1. They defined RA / CA / MA in one line each by signalling words, and the verifier read MA
+//     as RA 101 times against 16 the other way. The new versions share one block of definitions after Inference
+//     Anchoring Theory (a relation is anchored in a speaker's move: arguing, disagreeing, restating; an explicit
+//     framing decides, the contents decide where the framing is ambiguous), given to the writers and to the
+//     verifier alike. The output schemas are unchanged.
 package synth
 
 import (

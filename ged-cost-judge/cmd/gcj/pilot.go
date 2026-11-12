@@ -1030,7 +1030,7 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 		}
 	}
 	dir := cmp(o.promptDir, "prompts")
-	for _, name := range []string{"synth_source_v2", "realize_v3", "verify_v2", "verify_source_v1", "judge_v1", "synth_topics_v1"} {
+	for _, name := range []string{"synth_source_v3", "realize_v4", "verify_v3", "verify_source_v2", "judge_v1", "synth_topics_v1"} {
 		p, err := synth.LoadPrompt(dir, name)
 		if err != nil {
 			return nil, err
@@ -1051,8 +1051,8 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 			return nil, fmt.Errorf("pilot: no client for %s", m)
 		}
 		g := &synth.Generator{Client: c, Model: m, Effort: o.genEffort[m], Thinking: o.genThinking[m], Version: synth.V2,
-			SourcePrompt: r.prompts["synth_source_v2"], RealizePrompt: r.prompts["realize_v3"], VerifyPrompt: r.prompts["verify_v2"],
-			VerifySourcePrompt: r.prompts["verify_source_v1"], JudgePrompt: r.prompts["judge_v1"], TopicPrompt: r.prompts["synth_topics_v1"],
+			SourcePrompt: r.prompts["synth_source_v3"], RealizePrompt: r.prompts["realize_v4"], VerifyPrompt: r.prompts["verify_v3"],
+			VerifySourcePrompt: r.prompts["verify_source_v2"], JudgePrompt: r.prompts["judge_v1"], TopicPrompt: r.prompts["synth_topics_v1"],
 			Exemplars: exs}
 		// One verifier for every generator (defaultVerifier); it may share the writer's family.
 		a, err := r.agent(o.verifierModel())
@@ -2574,7 +2574,7 @@ func (r *v2run) qcExemplars(ctx context.Context, b *bytes.Buffer) {
 			return
 		}
 		g := &synth.Generator{Client: ag.Client, Model: m, Effort: ag.Effort, Thinking: ag.Thinking,
-			VerifySourcePrompt: r.prompts["verify_source_v1"]}
+			VerifySourcePrompt: r.prompts["verify_source_v2"]}
 		for _, ex := range r.exemplars {
 			if r.mt.check() != nil {
 				return
@@ -2650,7 +2650,7 @@ func (r *v2run) qcLabels(ctx context.Context, b *bytes.Buffer, trips []pilotTrip
 		if ag.Client == nil {
 			continue
 		}
-		g := &synth.Generator{Client: ag.Client, Model: ag.Model, Effort: ag.Effort, Thinking: ag.Thinking, VerifySourcePrompt: r.prompts["verify_source_v1"]}
+		g := &synth.Generator{Client: ag.Client, Model: ag.Model, Effort: ag.Effort, Thinking: ag.Thinking, VerifySourcePrompt: r.prompts["verify_source_v2"]}
 		ann, _, _, resp, err := g.VerifySource(ctx, d)
 		r.mt.add("qc", resp)
 		if err != nil {

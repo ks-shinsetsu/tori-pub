@@ -28,7 +28,7 @@ const (
 	DirNone          = "none"
 )
 
-// Verification is the G4 verifier's blind local re-annotation (prompts/verify_v2.md, dataset-spec §4.3).
+// Verification is the G4 verifier's blind local re-annotation (prompts/verify_v3.md, dataset-spec §4.3).
 // Labels refer to the VerifyQuery the request was built from.
 type Verification struct {
 	Propositions []struct {
@@ -297,7 +297,7 @@ func metaOf(a Agent, resp *llm.Response) VerifierMeta {
 	return m
 }
 
-// Verify checks a realization blind (prompts/verify_v2.md): the verifier (the other family) sees only the
+// Verify checks a realization blind (prompts/verify_v3.md): the verifier (the other family) sees only the
 // edited text d and the touched elements of q. It returns the verifier's family and model id.
 func (g *Generator) Verify(ctx context.Context, d Discussion, q VerifyQuery) (Verification, VerifierMeta, *llm.Response, error) {
 	a := g.verifier()
@@ -309,7 +309,7 @@ func (g *Generator) Verify(ctx context.Context, d Discussion, q VerifyQuery) (Ve
 	return v, metaOf(a, resp), resp, err
 }
 
-// verifyRequest builds the verify_v2 request with its schema (exactly what is sent and cached).
+// verifyRequest builds the verify_v3 request with its schema (exactly what is sent and cached).
 func (g *Generator) verifyRequest(d Discussion, q VerifyQuery) (llm.Request, error) {
 	req := g.verifier().request(g.VerifyPrompt.Body, q.userMessage(d), "verify")
 	schema, err := llm.SchemaFor[Verification]("verification_v2", "Per-proposition content, per-pair relation, fluency and coherence")
@@ -326,7 +326,7 @@ func (g *Generator) VerifyKey(d Discussion, q VerifyQuery) string {
 	return RequestKey(g.verifier().Client, req)
 }
 
-// SourceAnnotation is the verifier's full blind re-annotation of a source (prompts/verify_source_v1.md).
+// SourceAnnotation is the verifier's full blind re-annotation of a source (prompts/verify_source_v2.md).
 type SourceAnnotation struct {
 	Propositions []struct {
 		Label   string `json:"label" jsonschema_description:"P1, P2, ... as given"`
