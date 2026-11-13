@@ -86,12 +86,21 @@ type VerifyQuery struct {
 // touched pair with its intended relation in the variant graph, and up to nSample untouched variant edges
 // (collateral check).
 //
+// What the experiment needs from a variant is that each edit shows in the text and that nothing else changed
+// between the source and the variant (user decision 2026-11-13): the judges compare A and B with S, so a relation
+// that the source text itself does not carry is missing from all three texts alike and cancels. The collateral
+// sample is therefore drawn only among readable, the edges the verifier recovered from the source text (G1), when
+// readable is not nil: an untouched edge is then expected to read as it read in the source, not as the writer's
+// graph says. In the two P2 pilots about half of the "untouched relation changed" rejections (95 of 209, then 93
+// of 168) were on edges the verifier had not read in the source either; edges it had read were read again in the
+// variant 88% and 90% of the time. The touched pairs and every proposition are checked as before.
+//
 // The reference text of a proposition is the realizer's text only when an edit must change its content
 // (P-para, P-shift, P-neg, P-add); every other proposition (the endpoints of relation edits, deleted ones and the
 // endpoints of sampled edges) is referenced by its base text, whose wording must stay (dataset-spec §2.1, §4.3).
 // So a realizer that negates an endpoint to make a relation fit, and reports the negated text, is read as
 // "negated" against the base text and rejected (the §5.1 polarity-leak control).
-func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []perturb.Edit, rng *rand.Rand, nSample int) VerifyQuery {
+func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []perturb.Edit, readable []ged.Edge, rng *rand.Rand, nSample int) VerifyQuery {
 	var q VerifyQuery
 	inTarget := map[string]bool{}
 	for _, p := range target.Graph.Props {
@@ -144,11 +153,11 @@ func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []pert
 			addPair(e.Edge.From, e.Edge.To, false)
 		}
 	}
-	// collateral sample among untouched edges
+	// collateral sample among the untouched edges that read in the source as they stand in the variant graph
 	var cands []ged.Edge
 	for _, e := range target.Graph.Edges {
 		k := [2]string{min(e.From, e.To), max(e.From, e.To)}
-		if !pairSeen[k] {
+		if !pairSeen[k] && (readable == nil || slices.Contains(readable, e)) {
 			cands = append(cands, e)
 		}
 	}

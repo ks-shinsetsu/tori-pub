@@ -49,9 +49,13 @@ type RealizeInput struct {
 	// Incremental requires every base utterance outside the edited utterances and their direct
 	// neighbours to stay byte-equal (T1's B).
 	Incremental bool
-	Prefix      string
-	Attempt     int
-	Feedback    string
+	// Readable are the edges of the source that the verifier itself recovered when it re-annotated the source
+	// (G1), with kind and direction. The collateral check of the realization samples only among them
+	// (BuildVerifyQuery). nil: every edge may be sampled (a source without a G1 re-annotation).
+	Readable []ged.Edge
+	Prefix   string
+	Attempt  int
+	Feedback string
 }
 
 // RealizeResult is the outcome of Realize.

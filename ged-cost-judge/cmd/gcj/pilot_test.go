@@ -1562,3 +1562,32 @@ func TestCodeProvenance(t *testing.T) {
 		t.Errorf("unstamped build: %q", got)
 	}
 }
+
+// readableEdges: the edges of a source that its G1 re-annotation recovered with kind and direction.
+func TestReadableEdges(t *testing.T) {
+	g := ged.Graph{
+		Props: []ged.Prop{{ID: "s0.p1"}, {ID: "s0.p2"}, {ID: "s0.p3"}},
+		Edges: []ged.Edge{{From: "s0.p2", To: "s0.p1", Kind: ged.RA}, {From: "s0.p3", To: "s0.p1", Kind: ged.CA}},
+	}
+	ann := func(js string) *synth.SourceAnnotation {
+		var a synth.SourceAnnotation
+		if err := json.Unmarshal([]byte(js), &a); err != nil {
+			t.Fatal(err)
+		}
+		return &a
+	}
+	sr := &sourceRecord{Discussion: synth.Discussion{Graph: g}}
+	if got := sr.readableEdges(); got != nil {
+		t.Fatalf("no re-annotation: want nil (every edge may be sampled), got %v", got)
+	}
+	// the first edge is read as it stands; the second is read with the wrong kind
+	sr.Attempts = []sourceAttempt{{Annotation: ann(`{"relations":[{"kind":"RA","from":"P2","to":"P1"},{"kind":"RA","from":"P3","to":"P1"}]}`)}}
+	if got := sr.readableEdges(); !slices.Equal(got, g.Edges[:1]) {
+		t.Fatalf("readable edges %v", got)
+	}
+	// a reversed reading does not count, and an empty result is not nil (nothing may be sampled)
+	sr.Attempts = []sourceAttempt{{Annotation: ann(`{"relations":[{"kind":"RA","from":"P1","to":"P2"}]}`)}}
+	if got := sr.readableEdges(); got == nil || len(got) != 0 {
+		t.Fatalf("want an empty, non-nil list, got %v", got)
+	}
+}

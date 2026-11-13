@@ -207,7 +207,7 @@ func TestVerificationProblems(t *testing.T) {
 	target := perturb.Variant{Graph: base.Graph.Clone()}
 	target.Graph.Edges[0].Kind = ged.MA
 	edits := []perturb.Edit{{Kind: perturb.RType, Edge: &e, NewKind: ged.MA}}
-	q := BuildVerifyQuery(base, base, target, edits, rand.New(rand.NewPCG(1, 1)), 2)
+	q := BuildVerifyQuery(base, base, target, edits, nil, rand.New(rand.NewPCG(1, 1)), 2)
 	if len(q.Pairs) != 2 || q.Pairs[0].Kind != ged.MA || q.Pairs[0].From != "s0.p2" || !q.Pairs[1].Sampled {
 		t.Fatalf("query pairs %+v", q.Pairs)
 	}
@@ -260,7 +260,7 @@ func TestVerifyReferenceIsBaseForRelationEndpoints(t *testing.T) {
 			out.Graph.Props[i].Text = para
 		}
 	}
-	q := BuildVerifyQuery(base, out, target, edits, nil, 0)
+	q := BuildVerifyQuery(base, out, target, edits, nil, nil, 0)
 	ref := map[string]PropExpect{}
 	for _, pe := range q.Props {
 		ref[pe.ID] = pe
@@ -327,7 +327,7 @@ func TestRequestKeys(t *testing.T) {
 	g := &Generator{Client: c, Model: "m", Version: V2, Verifier: &Agent{Client: c, Model: "v", Family: "openai"}}
 	in := RealizeInput{Base: base, Target: v, Edits: edits, Prefix: "s0."}
 	_, _, _ = g.Realize(context.Background(), in)
-	q := BuildVerifyQuery(base, base, v, edits, nil, 1)
+	q := BuildVerifyQuery(base, base, v, edits, nil, nil, 1)
 	_, _, _, _ = g.Verify(context.Background(), base, q)
 	if len(sent) != 2 || g.RealizeKey(in) != llm.CacheKey(sent[0]) || g.VerifyKey(base, q) != llm.CacheKey(sent[1]) || sent[0].Schema == nil {
 		t.Fatalf("keys do not match the sent requests (%d sent)", len(sent))
@@ -344,6 +344,46 @@ func TestParseJudgeAnswerRefusal(t *testing.T) {
 	}
 	if _, err := ParseJudgeAnswer(&llm.Response{FinishReason: "max_tokens", Text: `{"answ`}); !errors.Is(err, llm.ErrTruncated) {
 		t.Fatalf("truncation: %v", err)
+	}
+}
+
+// The collateral sample of a realization is drawn only among the edges the verifier read in the source (G1).
+func TestVerifyQueryReadable(t *testing.T) {
+	base := baseDiscussion()
+	e := base.Graph.Edges[0] // p2 RA p1; the other edge is p4 CA p3
+	target := perturb.Variant{Graph: base.Graph.Clone()}
+	target.Graph.Edges[0].Kind = ged.MA
+	edits := []perturb.Edit{{Kind: perturb.RType, Edge: &e, NewKind: ged.MA}}
+	sampled := func(readable []ged.Edge) int {
+		q := BuildVerifyQuery(base, base, target, edits, readable, rand.New(rand.NewPCG(1, 1)), 2)
+		if len(q.Pairs) == 0 || q.Pairs[0].Sampled || q.Pairs[0].Kind != ged.MA {
+			t.Fatalf("the touched pair must stay first and unsampled: %+v", q.Pairs)
+		}
+		n := 0
+		for _, p := range q.Pairs {
+			if p.Sampled {
+				n++
+			}
+		}
+		return n
+	}
+	if n := sampled(nil); n != 1 {
+		t.Fatalf("no re-annotation: every untouched edge may be sampled, got %d", n)
+	}
+	if n := sampled([]ged.Edge{}); n != 0 {
+		t.Fatalf("the verifier read no source edge: nothing may be sampled, got %d", n)
+	}
+	if n := sampled(base.Graph.Edges[1:2]); n != 1 {
+		t.Fatalf("the untouched edge was read in the source: it is sampled, got %d", n)
+	}
+	rev := base.Graph.Edges[1]
+	rev.From, rev.To = rev.To, rev.From
+	if n := sampled([]ged.Edge{rev}); n != 0 {
+		t.Fatalf("an edge read with another direction is not the variant's edge, got %d", n)
+	}
+	// the touched edge is never a collateral sample, even when it was read in the source
+	if n := sampled(base.Graph.Edges[0:1]); n != 0 {
+		t.Fatalf("the touched edge was sampled, got %d", n)
 	}
 }
 

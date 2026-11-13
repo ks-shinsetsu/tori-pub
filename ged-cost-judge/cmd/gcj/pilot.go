@@ -387,6 +387,29 @@ type sourceRecord struct {
 	ReplacedBy    string `json:"replaced_by,omitempty"`
 }
 
+// readableEdges are the edges of the source that the verifier recovered in the G1 re-annotation of the accepted
+// attempt, with kind and direction (synth.RealizeInput.Readable). nil when the source carries no re-annotation
+// (a QT30 source), so that every edge may be sampled.
+func (s *sourceRecord) readableEdges() []ged.Edge {
+	var ann *synth.SourceAnnotation
+	for i := range s.Attempts {
+		if s.Attempts[i].Annotation != nil {
+			ann = s.Attempts[i].Annotation
+		}
+	}
+	if ann == nil {
+		return nil
+	}
+	read := ann.Relabel(s.Discussion.Graph)
+	out := []ged.Edge{}
+	for _, e := range s.Discussion.Graph.Edges {
+		if slices.Contains(read, e) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func (s *sourceRecord) prefix() string {
 	if s.QT30 {
 		return "q" + s.NodesetID + "."

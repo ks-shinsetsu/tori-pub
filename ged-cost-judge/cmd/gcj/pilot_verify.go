@@ -834,7 +834,7 @@ func (pp *pipelineV2) realizeVerifiedV2(g *synth.Generator, in synth.RealizeInpu
 			in.Feedback = "the text was left unchanged; every edit must be visible in the text"
 			continue
 		}
-		q := synth.BuildVerifyQuery(in.Base, res.Discussion, in.Target, in.Edits, rng, 2)
+		q := synth.BuildVerifyQuery(in.Base, res.Discussion, in.Target, in.Edits, in.Readable, rng, 2)
 		att.Query = &q
 		att.VerifyKey = g.VerifyKey(res.Discussion, q)
 		ver, meta, resp, err := g.Verify(pp.ctx, res.Discussion, q)
@@ -1118,6 +1118,7 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 	g := pp.gens[sr.Generator]
 	t := newTripletRecord(sr, s)
 	prefix := sr.prefix()
+	readable := sr.readableEdges()
 	pair := g.Writer().Family + "→" + g.Writer().Family
 	if g.Verifier != nil {
 		pair = g.Writer().Family + "→" + g.Verifier.Family
@@ -1171,7 +1172,7 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 		if keptA != nil {
 			da, recA = keptA.d, keptA.rec
 		} else {
-			da, recA, oa = pp.realizeVerifiedV2(g, synth.RealizeInput{Base: src, Target: tp.A, Edits: tp.A.Edits, Prefix: prefix}, rng)
+			da, recA, oa = pp.realizeVerifiedV2(g, synth.RealizeInput{Base: src, Target: tp.A, Edits: tp.A.Edits, Prefix: prefix, Readable: readable}, rng)
 			pp.stats.record(t.PlanA, recA, outcomeInfeasibleEdit(oa, recA), sr.QT30, pair)
 		}
 		dp.A = recA
@@ -1188,12 +1189,12 @@ func (pp *pipelineV2) slot(s slotSpec) *pilotTriplet {
 			plans++
 			continue
 		}
-		inB := synth.RealizeInput{Base: src, Target: tp.B, Edits: tp.B.Edits, Prefix: prefix}
+		inB := synth.RealizeInput{Base: src, Target: tp.B, Edits: tp.B.Edits, Prefix: prefix, Readable: readable}
 		sideB, extraRecs, dpRecsB := tp.B.Edits, t.PlanB, dp.EditsB
 		if s.typ == perturb.T1Monotone {
 			// B = A plus the extra edits, realized from A's realized text (dataset-spec §3.1 item 1).
 			n := len(tp.A.Edits)
-			inB = synth.RealizeInput{Base: da, Target: tp.B, Edits: tp.B.Edits[n:], Incremental: true, Prefix: prefix}
+			inB = synth.RealizeInput{Base: da, Target: tp.B, Edits: tp.B.Edits[n:], Incremental: true, Prefix: prefix, Readable: readable}
 			sideB, extraRecs, dpRecsB = tp.B.Edits[n:], t.PlanB[n:], dp.EditsB[n:]
 		}
 		db, recB, ob := pp.realizeVerifiedV2(g, inB, rng)
@@ -1516,6 +1517,7 @@ func writeVerifyReportV2(b *bytes.Buffer, s *v2Stats, kept []*pilotTriplet, d0 [
 	fmt.Fprintf(b, "\n- 三つ組の枠 %d（うち破棄した枠の補充 %d、最大 %d 巡）、採用 %d、破棄 %d（%.1f%%）。編集計画の引き直し 計 %d 回（infeasible を含む）。T1 の実現後 Δ(θ₀) < 0.5 による引き直し %d 回\n",
 		s.slots, s.replaced, maxReplaceRounds, s.accepted, s.discarded, pct(s.discarded, s.slots), s.replans, s.t1Dropped)
 	fmt.Fprintln(b, "- 合格の基準（dataset-spec §4.3）: 触れた命題がすべて same / paraphrase（削除したものは absent）、触れた組と抜き取りの 2 組の関係が意図どおり、流暢さ 3 以上。整合性は記録のみ")
+	fmt.Fprintln(b, "- 抜き取りの 2 組は、元の議論の再注釈（G1）で検証者が種別と向きまで読めた関係から選ぶ（元の文章で読めない関係は S・A・B に共通なので、変種の合否に使わない。2026-11-13 の決定）")
 	fmt.Fprintln(b, "- 1 回目の合格率は infeasible を分母から外して数える（§7）。R-add の距離 5–8 は別の行（d5-8）")
 	fmt.Fprintln(b, "\n| 編集 × 方向 × 編集数 | 書き下し | 1 回目で合格 | 作り直しで合格 | 不合格 | infeasible |")
 	fmt.Fprintln(b, "| --- | --: | --: | --: | --: | --: |")
