@@ -2614,6 +2614,11 @@ func (r *v2run) qcExemplars(ctx context.Context, b *bytes.Buffer) {
 }
 
 // qcLabels is the label-correctness audit: 100 variants, ≥ 5 per kind × direction where available.
+//
+// The criterion printed with it is 80% of the checked edits read as intended (user decision 2026-11-13; it was
+// 90%). The audit is the verifier's full blind re-annotation, and the same verifier recovers 93% of the relations
+// of the hand-made exemplars (55 of 59), so 90% asked for more than the instrument can show; the three P2 pilots
+// read 87.9%, 84.7% and 84.4%. No human has checked a sample yet, so how much of the gap is the verifier's is open.
 func (r *v2run) qcLabels(ctx context.Context, b *bytes.Buffer, trips []pilotTriplet) {
 	type cand struct {
 		t    *pilotTriplet
@@ -2707,7 +2712,7 @@ func (r *v2run) qcLabels(ctx context.Context, b *bytes.Buffer, trips []pilotTrip
 		}
 	}
 	fmt.Fprintln(b, "\n## ラベルの正しさの監査（採用した変種の盲検の全再注釈）")
-	fmt.Fprintf(b, "\n- 変種 %d、確かめた編集 %d、意図どおりに読めた編集 %s（基準 ≥ 90%%）、指示していない極性の反転 %d（基準 0）\n",
+	fmt.Fprintf(b, "\n- 変種 %d、確かめた編集 %d、意図どおりに読めた編集 %s（基準 ≥ 80%%）、指示していない極性の反転 %d（基準 0）\n",
 		len(sample), edits, ratio(recovered, edits), flips)
 	fmt.Fprintln(b, "\n| 先頭の編集 × 方向 | 読めた / 確かめた |")
 	fmt.Fprintln(b, "| --- | --: |")
