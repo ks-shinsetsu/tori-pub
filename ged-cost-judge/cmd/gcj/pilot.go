@@ -62,8 +62,8 @@ type pilotOptions struct {
 	// withQT30 adds <out>/qt30_sources.json (from -import-qt30) as transfer-set sources.
 	withQT30 bool
 	aifdb    string
-	// diagShare overrides the share of T3 slots in the t3_diag sub-stratum (0 → the dataset-spec §2.2 default
-	// 0.10); not a flag, set by the offline tests so that the sub-stratum is exercised.
+	// diagShare is the share of T3 slots in the t3_diag sub-stratum (0 → none: the sub-stratum was taken out of the
+	// pilot's catalogue, see catalogueOptions); not a flag, set by the offline tests so that the sub-stratum is exercised.
 	diagShare float64
 	// dReps overrides the nested-D replicates of the confirmatory analysis (0 → fit's pre-registered 200); not a
 	// flag, set by the offline tests.

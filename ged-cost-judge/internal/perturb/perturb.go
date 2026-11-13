@@ -101,6 +101,10 @@ type BuildOptions struct {
 	Theta0 *ged.Theta
 	// CosPred is the strength-predicted cos of a changed proposition (nil → PredictedCos).
 	CosPred func(Edit) float64
+	// TypeDirections are the directions of the estimation relabel R-type (nil → both, RA→MA and MA→RA).
+	TypeDirections [][2]string
+	// AddKinds are the relation-type shares of R-add (nil → AddKindWeights); a type with share 0 is never added.
+	AddKinds map[string]float64
 }
 
 // DrawSub draws the sub-stratum of a T3 slot: t3_ident with probability IdentShare (default 0.10), t3_diag with
@@ -147,6 +151,12 @@ func (o BuildOptions) norm() BuildOptions {
 	}
 	if o.CosPred == nil {
 		o.CosPred = PredictedCos
+	}
+	if o.TypeDirections == nil {
+		o.TypeDirections = TypeDirections
+	}
+	if o.AddKinds == nil {
+		o.AddKinds = AddKindWeights
 	}
 	return o
 }
@@ -399,7 +409,7 @@ func (s *state) draw(rng *rand.Rand, kind Kind, w want) (Edit, bool, string) {
 	case RAdd:
 		return s.drawAdd(rng, w)
 	case RType, RTypeCA:
-		groups := [][][2]string{TypeDirections}
+		groups := [][][2]string{s.opts.TypeDirections}
 		if kind == RTypeCA {
 			groups = slices.Clone(TypeCAPairs)
 			if rng.IntN(2) == 1 {
@@ -510,7 +520,7 @@ func (s *state) drawAdd(rng *rand.Rand, w want) (Edit, bool, string) {
 	kinds := []string{ged.RA, ged.MA, ged.CA}
 	kw := make([]float64, len(kinds))
 	for i, x := range kinds {
-		kw[i] = AddKindWeights[x]
+		kw[i] = s.opts.AddKinds[x]
 	}
 	kind := kinds[pickWeighted(rng, kw)]
 	from, to := ab[0], ab[1]

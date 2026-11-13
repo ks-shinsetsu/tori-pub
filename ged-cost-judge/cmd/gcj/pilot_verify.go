@@ -544,10 +544,26 @@ const (
 )
 
 // catalogueOptions are the catalogue options of a v2 run: the dataset-spec §2–§3 defaults with θ₀ = ged.Current()
-// and the strength-predicted cos for the Δ(θ₀) targeting; diagShare overrides the t3_diag share when non-zero.
+// and the strength-predicted cos for the Δ(θ₀) targeting, less three kinds of edit that the writers could not put
+// into text (user decision 2026-11-13, after the second P2 pilot):
+//
+//   - R-type RA→MA: under the definitions a reason cannot be turned into a restatement without changing what it
+//     claims. 84 planned, 53 returned infeasible, 10 of the 25 that reached the verifier read as intended.
+//   - R-add MA: the same, for two unrelated claims. 39 planned, 30 returned infeasible, 2 of 6 read as intended.
+//   - The t3_diag sub-stratum (R-type-CA, the four CA-involving relabels): 59 planned, 51 returned infeasible.
+//
+// Together they were 134 of the 141 infeasible returns of that pilot. The type cost stays estimable from R-type
+// MA→RA and the extra-edge cost from R-add RA / CA; the diagnostic fit of the CA-involving type costs has no data
+// without t3_diag. diagShare, when non-zero, brings the sub-stratum back (the offline tests exercise it). The
+// simulator (-simulate) keeps the full catalogue of dataset-spec §2.
 func catalogueOptions(diagShare float64) perturb.BuildOptions {
 	th0 := ged.Current()
-	return perturb.BuildOptions{Theta0: &th0, CosPred: perturb.PredictedCos, DiagShare: diagShare}
+	if diagShare == 0 {
+		diagShare = -1
+	}
+	return perturb.BuildOptions{Theta0: &th0, CosPred: perturb.PredictedCos, DiagShare: diagShare,
+		TypeDirections: [][2]string{{ged.MA, ged.RA}},
+		AddKinds:       map[string]float64{ged.RA: perturb.AddKindWeights[ged.RA], ged.CA: perturb.AddKindWeights[ged.CA]}}
 }
 
 // statKeys are the kind × direction × edit-count cells of the first-pass gate (dataset-spec §7).
@@ -1517,6 +1533,7 @@ func writeVerifyReportV2(b *bytes.Buffer, s *v2Stats, kept []*pilotTriplet, d0 [
 	fmt.Fprintf(b, "\n- 三つ組の枠 %d（うち破棄した枠の補充 %d、最大 %d 巡）、採用 %d、破棄 %d（%.1f%%）。編集計画の引き直し 計 %d 回（infeasible を含む）。T1 の実現後 Δ(θ₀) < 0.5 による引き直し %d 回\n",
 		s.slots, s.replaced, maxReplaceRounds, s.accepted, s.discarded, pct(s.discarded, s.slots), s.replans, s.t1Dropped)
 	fmt.Fprintln(b, "- 合格の基準（dataset-spec §4.3）: 触れた命題がすべて same / paraphrase（削除したものは absent）、触れた組と抜き取りの 2 組の関係が意図どおり、流暢さ 3 以上。整合性は記録のみ")
+	fmt.Fprintln(b, "- 編集のカタログ: R-type は MA→RA のみ、R-add は RA と CA のみ、診断層 t3_diag は既定で使わない（2026-11-13 の決定。第 2 回のパイロットで infeasible 141 回のうち 134 回がこの 3 種類だった）")
 	fmt.Fprintln(b, "- 抜き取りの 2 組は、元の議論の再注釈（G1）で検証者が種別と向きまで読めた関係から選ぶ（元の文章で読めない関係は S・A・B に共通なので、変種の合否に使わない。2026-11-13 の決定）")
 	fmt.Fprintln(b, "- 1 回目の合格率は infeasible を分母から外して数える（§7）。R-add の距離 5–8 は別の行（d5-8）")
 	fmt.Fprintln(b, "\n| 編集 × 方向 × 編集数 | 書き下し | 1 回目で合格 | 作り直しで合格 | 不合格 | infeasible |")

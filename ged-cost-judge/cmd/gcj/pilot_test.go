@@ -1591,3 +1591,48 @@ func TestReadableEdges(t *testing.T) {
 		t.Fatalf("want an empty, non-nil list, got %v", got)
 	}
 }
+
+// The pilot's catalogue leaves out R-type RA→MA, R-add MA and the t3_diag sub-stratum (catalogueOptions); the
+// kinds it keeps are still drawn, and diagShare brings the sub-stratum back.
+func TestPilotCatalogue(t *testing.T) {
+	src := parityGraph()
+	count := func(opts perturb.BuildOptions) map[string]int {
+		rng := rand.New(rand.NewPCG(11, 12))
+		seen := map[string]int{}
+		for range 4000 {
+			typ := perturb.DrawType(rng)
+			o := opts
+			if typ == perturb.T3Contrast {
+				sub := o.DrawSub(rng)
+				o.Sub = &sub
+			}
+			tp := perturb.DrawTriplet(rng, src, typ, o)
+			if tp.T3Diag {
+				seen["t3_diag"]++
+			}
+			for _, e := range append(slices.Clone(tp.A.Edits), tp.B.Edits...) {
+				switch e.Kind {
+				case perturb.RType, perturb.RTypeCA:
+					seen[string(e.Kind)+" "+e.Direction]++
+				case perturb.RAdd:
+					seen["R-add "+e.Edge.Kind]++
+				}
+			}
+		}
+		return seen
+	}
+	got := count(catalogueOptions(0))
+	for _, k := range []string{"R-type RA→MA", "R-add MA", "t3_diag", "R-type-CA RA→CA", "R-type-CA CA→RA", "R-type-CA CA→MA", "R-type-CA MA→CA"} {
+		if got[k] != 0 {
+			t.Errorf("%s drawn %d times, want none (%v)", k, got[k], got)
+		}
+	}
+	for _, k := range []string{"R-type MA→RA", "R-add RA", "R-add CA"} {
+		if got[k] == 0 {
+			t.Errorf("%s never drawn (%v)", k, got)
+		}
+	}
+	if with := count(catalogueOptions(0.5)); with["t3_diag"] == 0 {
+		t.Errorf("diagShare 0.5 draws no t3_diag plan (%v)", with)
+	}
+}
