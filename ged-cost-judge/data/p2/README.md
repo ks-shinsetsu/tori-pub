@@ -12,6 +12,7 @@ the reports were computed from.
 | `round2/` | Second pilot, code `ea8dea4`: prompts `synth_source_v3`, `realize_v4`, `verify_v3`, `verify_source_v2` (the shared IAT definitions) |
 | `round3/` | Third pilot, code `fe85aed`: the prompts of round 2; the collateral check samples only relations the verifier read in the source; R-type RA→MA, R-add MA and t3_diag are out of the catalogue. Its sources are the discussions of round 2, replayed from the response cache |
 | `scale100/` | The same pipeline at `-sources 100` (code `b63b913`: as round 3, with the label audit's criterion printed as 80%). A trial of scale before the main run; all text was generated anew |
+| `sources100/` | Source generation only at `-sources 100` (code `640d23a`: prompt `synth_source_v4`, and a retried source is told why the last attempt was rejected). The run was stopped on purpose when the sources were done, so there are no variants or judgments: `pilot_sources.jsonl` (109 records, 100 accepted) and the report of the stopped run |
 
 In each round:
 
@@ -62,6 +63,7 @@ P2 パイロット 3 回分（元の議論 25 件ずつ、`-seed 2`）と、100 
 | `round2/` | 第 2 回。コード `ea8dea4`、プロンプト `synth_source_v3`・`realize_v4`・`verify_v3`・`verify_source_v2`（IAT の定義を共通化） |
 | `round3/` | 第 3 回。コード `fe85aed`、プロンプトは第 2 回と同じ。触れていない関係の抜き取りを、元の議論で検証者が読めた関係に限った。R-type RA→MA、R-add MA、t3_diag をカタログから外した。元の議論は第 2 回のものを応答のキャッシュから再生した |
 | `scale100/` | 同じパイプラインを `-sources 100` で実行したもの（コード `b63b913`。第 3 回と同じで、ラベルの監査の基準の表示だけ 80%）。本番の前の規模の試行。文章はすべて新しく生成した |
+| `sources100/` | 元の議論の生成だけを `-sources 100` で実行したもの（コード `640d23a`。プロンプト `synth_source_v4`、やり直しに前回の不採用の理由を伝える）。元の議論がそろった時点で意図して止めたので、変種と判定は無い。`pilot_sources.jsonl`（109 件、受理 100 件）と、止めた実行の報告 |
 
 各回のファイル:
 
