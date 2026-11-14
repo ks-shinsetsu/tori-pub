@@ -1053,7 +1053,7 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 		}
 	}
 	dir := cmp(o.promptDir, "prompts")
-	for _, name := range []string{"synth_source_v3", "realize_v4", "verify_v3", "verify_source_v2", "judge_v1", "synth_topics_v1"} {
+	for _, name := range []string{"synth_source_v4", "realize_v4", "verify_v3", "verify_source_v2", "judge_v1", "synth_topics_v1"} {
 		p, err := synth.LoadPrompt(dir, name)
 		if err != nil {
 			return nil, err
@@ -1074,7 +1074,7 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 			return nil, fmt.Errorf("pilot: no client for %s", m)
 		}
 		g := &synth.Generator{Client: c, Model: m, Effort: o.genEffort[m], Thinking: o.genThinking[m], Version: synth.V2,
-			SourcePrompt: r.prompts["synth_source_v3"], RealizePrompt: r.prompts["realize_v4"], VerifyPrompt: r.prompts["verify_v3"],
+			SourcePrompt: r.prompts["synth_source_v4"], RealizePrompt: r.prompts["realize_v4"], VerifyPrompt: r.prompts["verify_v3"],
 			VerifySourcePrompt: r.prompts["verify_source_v2"], JudgePrompt: r.prompts["judge_v1"], TopicPrompt: r.prompts["synth_topics_v1"],
 			Exemplars: exs}
 		// One verifier for every generator (defaultVerifier); it may share the writer's family.
@@ -1255,13 +1255,16 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			ReplacementOf: jobs[j].replacementOf}
 		out[j] = rec
 		prefix := fmt.Sprintf("s%d.", i)
+		// feedback is what the checks found in the previous attempt of this source; the next attempt is told
+		// (synth.GenerateSourceRetry). The first attempt of a source or of its replacement has none.
+		feedback := ""
 		for attempt := jobs[j].firstAttempt; attempt < jobs[j].firstAttempt+3; attempt++ {
 			if err := r.mt.check(); err != nil {
 				rec.Reason = err.Error()
 				return err
 			}
 			att := sourceAttempt{Attempt: attempt}
-			d, resp, err := g.GenerateSource(ctx, sp, prefix, attempt)
+			d, resp, err := g.GenerateSourceRetry(ctx, sp, prefix, attempt, feedback)
 			r.mt.add("synth_source", resp)
 			if resp != nil {
 				att.Model, att.Usage = resp.Model, resp.Usage
@@ -1274,6 +1277,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 					return err
 				}
 				rec.Reason = "generation error"
+				feedback = "the output could not be used (" + err.Error() + ")"
 				continue
 			}
 			att.Discussion = &d
@@ -1281,6 +1285,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			if len(att.Targets) > 0 {
 				rec.Attempts = append(rec.Attempts, att)
 				rec.Reason = "numeric targets"
+				feedback = strings.Join(att.Targets, "; ")
 				continue
 			}
 			cp, err := synth.CopyCheck(ctx, d, r.exemplars, r.env.emb)
@@ -1296,6 +1301,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			if cp.Reject {
 				rec.Attempts = append(rec.Attempts, att)
 				rec.Reason = "exemplar copy"
+				feedback = copyFeedback(cp)
 				continue
 			}
 			ann, agr, meta, vresp, err := g.VerifySource(ctx, d)
@@ -1314,6 +1320,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			rec.Attempts = append(rec.Attempts, att)
 			if !agr.Pass {
 				rec.Reason = "G1 re-annotation"
+				feedback = unreadFeedback(d, ann, agr, prefix)
 				continue
 			}
 			rec.Discussion, rec.Stats, rec.Accepted, rec.Reason = d, synth.Stats(d), true, ""
@@ -1325,6 +1332,47 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 		return nil
 	})
 	return out
+}
+
+// copyFeedback tells a retry what the exemplar-copy check found, without naming the exemplar: the wording shared
+// with an example, the names taken from one, or that the text as a whole is too close to one.
+func copyFeedback(cp synth.CopyResult) string {
+	var parts []string
+	shared := cp.Shared6 // a shared 6-gram contains its 5-grams; name the longer wording only
+	if len(shared) == 0 {
+		shared = cp.Shared5
+	}
+	if len(shared) > 0 {
+		quoted := make([]string, len(shared))
+		for i, s := range shared {
+			quoted[i] = strconv.Quote(s)
+		}
+		parts = append(parts, "it repeats wording of an example ("+strings.Join(quoted, ", ")+"); use other words")
+	}
+	if len(cp.Names) > 0 {
+		parts = append(parts, "it uses names from an example ("+strings.Join(cp.Names, ", ")+")")
+	}
+	if cp.CosComputed && cp.MaxCos > synth.CopyMaxCos {
+		parts = append(parts, "its content is too close to an example")
+	}
+	if len(parts) == 0 {
+		return "it is too close to an example"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// unreadFeedback tells a retry which relations of the rejected attempt a reader of the text alone did not recover
+// (the G1 re-annotation), with the writer's own proposition ids.
+func unreadFeedback(d synth.Discussion, ann synth.SourceAnnotation, agr synth.GraphAgreement, prefix string) string {
+	read := ann.Relabel(d.Graph)
+	var missed []string
+	for _, e := range d.Graph.Edges {
+		if !slices.Contains(read, e) {
+			missed = append(missed, fmt.Sprintf("%s → %s (%s)", strings.TrimPrefix(e.From, prefix), strings.TrimPrefix(e.To, prefix), e.Kind))
+		}
+	}
+	return fmt.Sprintf("a reader who saw only the text recovered %d of the %d relations; anchor every relation in the text so that it can be read. Not recovered in the last attempt: %s",
+		agr.Matched, agr.Gold, strings.Join(missed, ", "))
 }
 
 // Source dedup thresholds (dataset-spec §1.3): rendered-text cos > 0.9 with an accepted source, or

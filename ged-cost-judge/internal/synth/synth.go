@@ -7,14 +7,15 @@
 //
 //   - "v1" is the pilot-2 pipeline (synth_source_v1, realize_v1/v2, verify_v1, judge_v1; one model).
 //     Its requests are kept byte-identical so that a pilot-2 run replays from the response cache.
-//   - "v2" is the revised pipeline of dataset-spec §9 (synth_source_v3 with exemplars, realize_v4,
+//   - "v2" is the revised pipeline of dataset-spec §9 (synth_source_v4 with exemplars, realize_v4,
 //     verify_v3, verify_source_v2, synth_topics_v1; two generator families, cross-family verifier).
 //     Until the first P2 pilot (2026-11-12) the prompts were synth_source_v2, realize_v3, verify_v2 and
 //     verify_source_v1. They defined RA / CA / MA in one line each by signalling words, and the verifier read MA
 //     as RA 101 times against 16 the other way. The new versions share one block of definitions after Inference
 //     Anchoring Theory (a relation is anchored in a speaker's move: arguing, disagreeing, restating; an explicit
 //     framing decides, the contents decide where the framing is ambiguous), given to the writers and to the
-//     verifier alike. The output schemas are unchanged.
+//     verifier alike. The output schemas are unchanged. synth_source_v4 (2026-11-14) adds to v3 that a conclusion
+//     and two premises do not go into one utterance, and that a retry is told why the last attempt was rejected.
 package synth
 
 import (
@@ -291,22 +292,41 @@ func (g *Generator) SourceSystemPrompt(spec Spec, withExemplars bool) (string, e
 // v2 renders the exemplar pair of spec into the system prompt; the pair is part of the prompt text and
 // therefore of the LLM cache key.
 func (g *Generator) GenerateSource(ctx context.Context, spec Spec, prefix string, attempt int) (Discussion, *llm.Response, error) {
-	return g.generateSource(ctx, spec, prefix, attempt, true)
+	return g.generateSource(ctx, spec, prefix, attempt, "", true)
+}
+
+// GenerateSourceRetry is GenerateSource for an attempt after a rejected one: feedback names what the checks
+// found in the previous attempt (numeric targets, exemplar copy, the relations the verifier did not recover) and
+// is appended to the user message. Without it a retry repeated the request with only the attempt number changed,
+// and the writer repeated the fault: in the 100-source trial Sonnet 5.5 put a conclusion and two premises into
+// one utterance in 64 of 145 generations (the limit is two propositions), on all three attempts of many sources.
+// An empty feedback gives the request of GenerateSource.
+func (g *Generator) GenerateSourceRetry(ctx context.Context, spec Spec, prefix string, attempt int, feedback string) (Discussion, *llm.Response, error) {
+	return g.generateSource(ctx, spec, prefix, attempt, feedback, true)
+}
+
+// sourceUserMessage is SourceUserMessage with the feedback on the previous attempt, if any.
+func (g *Generator) sourceUserMessage(spec Spec, attempt int, feedback string) string {
+	user := g.SourceUserMessage(spec, attempt)
+	if feedback != "" {
+		user += "The previous attempt was rejected: " + feedback + "\n"
+	}
+	return user
 }
 
 // GenerateSourceNoExemplars is GenerateSource with the v2 prompt but no examples (homogeneity monitor only).
 func (g *Generator) GenerateSourceNoExemplars(ctx context.Context, spec Spec, prefix string) (Discussion, *llm.Response, error) {
-	return g.generateSource(ctx, spec, prefix, 0, false)
+	return g.generateSource(ctx, spec, prefix, 0, "", false)
 }
 
-func (g *Generator) generateSource(ctx context.Context, spec Spec, prefix string, attempt int, withEx bool) (Discussion, *llm.Response, error) {
+func (g *Generator) generateSource(ctx context.Context, spec Spec, prefix string, attempt int, feedback string, withEx bool) (Discussion, *llm.Response, error) {
 	sys, err := g.SourceSystemPrompt(spec, withEx)
 	if err != nil {
 		return Discussion{}, nil, err
 	}
 	req := llm.Request{
 		Model:    g.Model,
-		Messages: []llm.Message{llm.System(sys), llm.User(g.SourceUserMessage(spec, attempt))},
+		Messages: []llm.Message{llm.System(sys), llm.User(g.sourceUserMessage(spec, attempt, feedback))},
 		Tag:      "synth_source",
 	}
 	if g.Version == V2 {

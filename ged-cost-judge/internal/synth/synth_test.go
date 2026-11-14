@@ -565,3 +565,17 @@ func TestSurfaceTargets(t *testing.T) {
 		t.Errorf("default swap: %v, want %v", got, want)
 	}
 }
+
+// A retry is told why the previous attempt was rejected; without feedback the request is the one of a first call.
+func TestSourceRetryFeedback(t *testing.T) {
+	g := &Generator{Version: V2}
+	spec := Spec{Format: "meeting", Topic: "t", Names: []string{"A", "B"}, Props: 10, RA: 4, CA: 1, MA: 2, Isolated: 2}
+	if got, want := g.sourceUserMessage(spec, 0, ""), g.SourceUserMessage(spec, 0); got != want {
+		t.Fatalf("no feedback: %q, want %q", got, want)
+	}
+	got := g.sourceUserMessage(spec, 1, "an utterance states 3 propositions (≤ 2)")
+	if !strings.HasPrefix(got, g.SourceUserMessage(spec, 1)) ||
+		!strings.HasSuffix(got, "The previous attempt was rejected: an utterance states 3 propositions (≤ 2)\n") {
+		t.Fatalf("retry message %q", got)
+	}
+}

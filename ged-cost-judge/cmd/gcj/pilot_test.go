@@ -1636,3 +1636,29 @@ func TestPilotCatalogue(t *testing.T) {
 		t.Errorf("diagShare 0.5 draws no t3_diag plan (%v)", with)
 	}
 }
+
+// The feedback a rejected source attempt gives to the next one: shared wording without the exemplar's id, and the
+// relations a reader did not recover with the writer's own ids.
+func TestSourceFeedback(t *testing.T) {
+	cp := synth.CopyResult{Reject: true, Shared6: []string{"so what you are saying is"},
+		Shared5: []string{"so what you are saying", "what you are saying is"}, Reasons: []string{`shares 1 6-gram(s) with ex04-one-on-one`}}
+	if got := copyFeedback(cp); strings.Contains(got, "ex04") || got != `it repeats wording of an example ("so what you are saying is"); use other words` {
+		t.Fatalf("copy feedback %q", got)
+	}
+	if got := copyFeedback(synth.CopyResult{Reject: true, Names: []string{"Ruth"}}); !strings.Contains(got, "Ruth") {
+		t.Fatalf("name feedback %q", got)
+	}
+	d := synth.Discussion{Graph: ged.Graph{
+		Props: []ged.Prop{{ID: "s3.p1"}, {ID: "s3.p2"}, {ID: "s3.p3"}},
+		Edges: []ged.Edge{{From: "s3.p2", To: "s3.p1", Kind: ged.RA}, {From: "s3.p3", To: "s3.p1", Kind: ged.CA}},
+	}}
+	var ann synth.SourceAnnotation
+	if err := json.Unmarshal([]byte(`{"relations":[{"kind":"RA","from":"P2","to":"P1"}]}`), &ann); err != nil {
+		t.Fatal(err)
+	}
+	agr := synth.Agreement(d.Graph, ann)
+	got := unreadFeedback(d, ann, agr, "s3.")
+	if !strings.Contains(got, "recovered 1 of the 2 relations") || !strings.Contains(got, "p3 → p1 (CA)") || strings.Contains(got, "p2 → p1") || strings.Contains(got, "s3.") {
+		t.Fatalf("unread feedback %q", got)
+	}
+}
