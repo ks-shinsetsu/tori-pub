@@ -1,6 +1,6 @@
 # P2 pilot records: synthetic discussions, variants and judgments
 
-The records of the three P2 pilot runs (25 sources each, `-seed 2`) and of one run at 100 sources. Everything here was written by language
+The records of the three P2 pilot runs (25 sources each, `-seed 2`) and of the runs at 100 sources. Everything here was written by language
 models from the prompts in `../../prompts/`; no corpus text is included (the runs did not use `-with-qt30`).
 The discussions are kept because they can serve as a dataset later, and because they are what the numbers in
 the reports were computed from.
@@ -13,6 +13,7 @@ the reports were computed from.
 | `round3/` | Third pilot, code `fe85aed`: the prompts of round 2; the collateral check samples only relations the verifier read in the source; R-type RA→MA, R-add MA and t3_diag are out of the catalogue. Its sources are the discussions of round 2, replayed from the response cache |
 | `scale100/` | The same pipeline at `-sources 100` (code `b63b913`: as round 3, with the label audit's criterion printed as 80%). A trial of scale before the main run; all text was generated anew |
 | `sources100/` | Source generation only at `-sources 100` (code `640d23a`: prompt `synth_source_v4`, and a retried source is told why the last attempt was rejected). The run was stopped on purpose when the sources were done, so there are no variants or judgments: `pilot_sources.jsonl` (109 records, 100 accepted) and the report of the stopped run |
+| `scale100-v4/` | The whole pipeline at `-sources 100` with the code of `sources100/` (`838a672`, seed 2: prompts `synth_source_v4`, `realize_v4`, `verify_v3`, `verify_source_v2`), run on another machine (linux/amd64, built with Go 1.26.8) with an empty response cache, so its sources are not those of `sources100/` |
 
 In each round:
 
@@ -24,11 +25,11 @@ In each round:
 | `audit.md` | The report of `gcj -audit` on that run's records |
 | `round2/audit_round1_texts.md` | `gcj -audit` of the round-1 records with the round-2 verifier prompt (same texts, new definitions) |
 
-| | Round 1 | Round 2 | Round 3 | Scale 100 |
-| --- | --: | --: | --: | --: |
-| Source records / accepted | 35 / 25 | 33 / 25 | 33 / 25 | 138 / 95 |
-| Triplet slots / kept | 173 / 92 | 158 / 99 | 119 / 99 | 470 / 375 |
-| Judgments | 552 | 594 | 594 | 2,250 |
+| | Round 1 | Round 2 | Round 3 | Scale 100 | Scale 100 (v4) |
+| --- | --: | --: | --: | --: | --: |
+| Source records / accepted | 35 / 25 | 33 / 25 | 33 / 25 | 138 / 95 | 110 / 100 |
+| Triplet slots / kept | 173 / 92 | 158 / 99 | 119 / 99 | 470 / 375 | 474 / 398 |
+| Judgments | 552 | 594 | 594 | 2,250 | 2,388 |
 
 Models: sources and variants by `gpt-5.6-luna` and `claude-sonnet-5-5`; verifier `claude-haiku-5-5`; judges
 `gpt-5.6-luna`, `claude-sonnet-5-5`, `claude-haiku-5-5`. Settings and prompt hashes are in each `pilot.md`.
@@ -38,8 +39,8 @@ Models: sources and variants by `gpt-5.6-luna` and `claude-sonnet-5-5`; verifier
 - These are pilot runs. All of them failed gates of the P2 plan (first-pass realization rate, discard rate, label
   audit, source acceptance); see each `pilot.md` and `audit.md`. Use the records with that in mind.
 - The labels (which edit a variant carries) are the writer's plan, accepted when one model (`claude-haiku-5-5`)
-  read the edit back. No human checked them. The audit read 87.9% (round 1), 84.7% (round 2), 84.4% (round 3) and 85.7%
-  (scale 100) of the checked edits as intended, and the same verifier recovered 73% and 93% of the relations of the hand-made exemplars.
+  read the edit back. No human checked them. The audit read 87.9% (round 1), 84.7% (round 2), 84.4% (round 3), 85.7%
+  (scale 100) and 86.6% (scale 100, v4) of the checked edits as intended, and the same verifier recovered 73% and 93% of the relations of the hand-made exemplars.
 - A source was accepted when the verifier recovered at least 65% of its relations, so a source graph contains
   relations that the verifier did not read in the text. `g1_annotation` says which.
 - Discarded slots and rejected sources are included, with the reason. Filter on `accepted` (sources) and on
@@ -52,7 +53,7 @@ Models: sources and variants by `gpt-5.6-luna` and `claude-sonnet-5-5`; verifier
 
 # P2 パイロットの記録: 合成の議論、変種、判定
 
-P2 パイロット 3 回分（元の議論 25 件ずつ、`-seed 2`）と、100 件での実行 1 回分の記録。すべて `../../prompts/` のプロンプトから言語モデルが
+P2 パイロット 3 回分（元の議論 25 件ずつ、`-seed 2`）と、100 件での実行の記録。すべて `../../prompts/` のプロンプトから言語モデルが
 書いたもので、コーパスの本文は含まない（`-with-qt30` は使っていない）。後でデータセットとして使えること、
 各回の報告の数値の出どころであることから、ここに置く。
 
@@ -64,6 +65,7 @@ P2 パイロット 3 回分（元の議論 25 件ずつ、`-seed 2`）と、100 
 | `round3/` | 第 3 回。コード `fe85aed`、プロンプトは第 2 回と同じ。触れていない関係の抜き取りを、元の議論で検証者が読めた関係に限った。R-type RA→MA、R-add MA、t3_diag をカタログから外した。元の議論は第 2 回のものを応答のキャッシュから再生した |
 | `scale100/` | 同じパイプラインを `-sources 100` で実行したもの（コード `b63b913`。第 3 回と同じで、ラベルの監査の基準の表示だけ 80%）。本番の前の規模の試行。文章はすべて新しく生成した |
 | `sources100/` | 元の議論の生成だけを `-sources 100` で実行したもの（コード `640d23a`。プロンプト `synth_source_v4`、やり直しに前回の不採用の理由を伝える）。元の議論がそろった時点で意図して止めたので、変種と判定は無い。`pilot_sources.jsonl`（109 件、受理 100 件）と、止めた実行の報告 |
+| `scale100-v4/` | `sources100/` のコード（`838a672`、seed 2。プロンプト `synth_source_v4`・`realize_v4`・`verify_v3`・`verify_source_v2`）でパイプラインを最後まで `-sources 100` で実行したもの。別のマシン（linux/amd64、Go 1.26.8 でビルド）で、応答のキャッシュが空の状態から実行したので、元の議論は `sources100/` のものではない |
 
 各回のファイル:
 
@@ -75,11 +77,11 @@ P2 パイロット 3 回分（元の議論 25 件ずつ、`-seed 2`）と、100 
 | `audit.md` | その回の記録に対する `gcj -audit` の報告 |
 | `round2/audit_round1_texts.md` | 第 1 回の記録を第 2 回の検証者プロンプトで監査した報告（同じ文章、新しい定義） |
 
-| | 第 1 回 | 第 2 回 | 第 3 回 | 100 件 |
-| --- | --: | --: | --: | --: |
-| 元の議論の記録 / 受理 | 35 / 25 | 33 / 25 | 33 / 25 | 138 / 95 |
-| 三つ組の枠 / 採用 | 173 / 92 | 158 / 99 | 119 / 99 | 470 / 375 |
-| 判定 | 552 | 594 | 594 | 2,250 |
+| | 第 1 回 | 第 2 回 | 第 3 回 | 100 件 | 100 件（v4） |
+| --- | --: | --: | --: | --: | --: |
+| 元の議論の記録 / 受理 | 35 / 25 | 33 / 25 | 33 / 25 | 138 / 95 | 110 / 100 |
+| 三つ組の枠 / 採用 | 173 / 92 | 158 / 99 | 119 / 99 | 470 / 375 | 474 / 398 |
+| 判定 | 552 | 594 | 594 | 2,250 | 2,388 |
 
 モデル: 元の議論と変種は `gpt-5.6-luna` と `claude-sonnet-5-5`、検証者は `claude-haiku-5-5`、判定者は
 `gpt-5.6-luna`・`claude-sonnet-5-5`・`claude-haiku-5-5`。設定とプロンプトのハッシュは各回の `pilot.md` にある。
@@ -89,7 +91,7 @@ P2 パイロット 3 回分（元の議論 25 件ずつ、`-seed 2`）と、100 
 - パイロットの記録である。どの回も P2 の関門（書き下しの 1 回目の合格率、破棄率、ラベルの監査、元の議論の
   受理率）を通っていない。各回の `pilot.md` と `audit.md` を見たうえで使うこと。
 - ラベル（変種がどの編集を持つか）は書き手の計画で、1 つのモデル（`claude-haiku-5-5`）がその編集を読み取れた
-  ときに採用している。人手の確認はしていない。監査で意図どおり読めた編集は 87.9%（第 1 回）、84.7%（第 2 回）、84.4%（第 3 回）、85.7%（100 件）、
+  ときに採用している。人手の確認はしていない。監査で意図どおり読めた編集は 87.9%（第 1 回）、84.7%（第 2 回）、84.4%（第 3 回）、85.7%（100 件）、86.6%（100 件、v4）、
   同じ検証者が手作りの例示の関係を再現できた割合は 73% と 93% だった。
 - 元の議論は、検証者が関係の 65% 以上を再現できれば受理している。このため元の議論のグラフには、検証者が
   文章から読めなかった関係が残っている。どの関係かは `g1_annotation` で分かる。
