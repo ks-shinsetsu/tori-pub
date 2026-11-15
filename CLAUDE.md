@@ -55,7 +55,7 @@
   - クレデンシャルらしい文字列。[gitleaks](https://github.com/gitleaks/gitleaks) があればそれを使う。無ければ組み込みのパターンで代わりに検査する。
   - 手動で全履歴を検査するには `.githooks/secrets-scan.sh all` を実行する。
 - **CI（`.github/workflows/secrets-scan.yml`）も push のたびに全履歴を検査する。** ただし検出は push の後になるので、本来の防壁は手元の hook である。
-- **hook を飛ばさない。** `--no-verify` は使わない。誤検出は、その行に `gitleaks:allow` を書いて抑える。
+- **hook を飛ばさない。** `--no-verify` は使わない。誤検出は、その行に `gitleaks:allow` を書いて抑える。行に書けない記録（JSONL のキャッシュキーなど）は、`.gitleaks.toml` にフィールド名・値の形・パスを揃えた許可を足す。
 - **キーを一度でも push してしまったら、まずキーを無効化して再発行する。** 履歴の書き換えはその後で行う。
 
 ## 6. 書き方

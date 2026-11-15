@@ -1,0 +1,20 @@
+# gitleaks configuration for .githooks/secrets-scan.sh (local hooks and CI).
+# gitleaks reads this file from the checked-out tree, while CI scans the history of every branch,
+# so the file has to be on every branch that is pushed.
+
+[extend]
+useDefault = true
+
+# The pilot records (ged-cost-judge/data/<stage>/*.jsonl) carry the cache keys of their LLM requests:
+# realize_key, verify_key and cache_key. Each is llm.CacheKey, the SHA-256 of the request (model,
+# messages, sampling settings, schema); no credential goes into it. The field name ends in "_key" and
+# the value is 64 hex characters, which is what generic-api-key looks for.
+# The entry needs the field name, the value shape and the path together, so any other string in these
+# files is still reported.
+[[allowlists]]
+description = "LLM cache keys in pilot records: SHA-256 of the request, not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "match"
+regexes = ['''(realize|verify|cache)_key":"[0-9a-f]{64}"''']
+paths = ['''^ged-cost-judge/data/.*\.jsonl$''']
