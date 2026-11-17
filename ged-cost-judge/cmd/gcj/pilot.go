@@ -1742,8 +1742,8 @@ func pilotExclude() []string {
 func (r *v2run) pilotFitOptions() fit.Options {
 	th0 := ged.Current()
 	starts, names := fit.DefaultStarts(th0)
-	return fit.Options{Judges: len(r.judges), Theta0: th0, Lambda: r.o.lambda, FitNeg: true, MaxOuter: 20,
-		Tie: fit.TypeTie(), Exclude: pilotExclude(), Starts: starts, StartNames: names}
+	return withOuter(fit.Options{Judges: len(r.judges), Theta0: th0, Lambda: r.o.lambda, FitNeg: true, MaxOuter: 20,
+		Tie: fit.TypeTie(), Exclude: pilotExclude(), Starts: starts, StartNames: names})
 }
 
 // writeFitSet reports which triplets enter the fit.

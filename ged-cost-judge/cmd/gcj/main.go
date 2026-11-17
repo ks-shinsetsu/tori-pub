@@ -15,8 +15,19 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/fit"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/synth"
 )
+
+// outerMode is the outer loop (-outer) of the θ fits of the simulator and of the v2 pilot; the v1 pilot (kept for
+// cache replay) keeps the alternation.
+var outerMode fit.OuterMode
+
+// withOuter applies -outer to the options of a θ fit.
+func withOuter(o fit.Options) fit.Options {
+	o.Outer = outerMode
+	return o
+}
 
 // Default reasoning settings (plan §5.1: fixed per judge in P2 and not changed afterwards).
 //   - gpt-5.6-luna: reasoning_effort low (pilot 2 ran luna without an effort setting, ≈ 95 output tokens).
@@ -61,8 +72,17 @@ func main() {
 		p2        = flag.Bool("p2", false, "v2: P2 パイロットとして実行する（記録に pilot=true、θ を出さず補助パラメータ・QC・破棄率・例示の組と領域の ICC を報告）")
 		withQT30  = flag.Bool("with-qt30", false, "v2: <out>/qt30_sources.json（-import-qt30）を転移セットとして加える")
 		aifdb     = flag.String("aifdb", "../aif-with-llm/data/aifdb", "-import-qt30: aif-with-llm が取得した nodeset のディレクトリ")
+		outer     = flag.String("outer", "alternate", "推定の外側のループ: alternate（事前登録の交互最適化）| descent（交互最適化で探索し、通った中で真の目的関数が最小の点から、目的関数が下がる歩みだけで仕上げる。事前登録からの逸脱として記録される）")
 	)
 	flag.Parse()
+	switch *outer {
+	case "alternate":
+		outerMode = fit.OuterAlternate
+	case "descent":
+		outerMode = fit.OuterDescent
+	default:
+		log.Fatalf("-outer %q: alternate か descent を指定する", *outer)
+	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatal(err)
 	}
