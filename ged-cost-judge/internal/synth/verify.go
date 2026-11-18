@@ -28,7 +28,7 @@ const (
 	DirNone          = "none"
 )
 
-// Verification is the G4 verifier's blind local re-annotation (prompts/verify_v2.md, dataset-spec §4.3).
+// Verification is the G4 verifier's blind local re-annotation (prompts/verify_v3.md, dataset-spec §4.3).
 // Labels refer to the VerifyQuery the request was built from.
 type Verification struct {
 	Propositions []struct {
@@ -86,12 +86,21 @@ type VerifyQuery struct {
 // touched pair with its intended relation in the variant graph, and up to nSample untouched variant edges
 // (collateral check).
 //
+// What the experiment needs from a variant is that each edit shows in the text and that nothing else changed
+// between the source and the variant (user decision 2026-11-13): the judges compare A and B with S, so a relation
+// that the source text itself does not carry is missing from all three texts alike and cancels. The collateral
+// sample is therefore drawn only among readable, the edges the verifier recovered from the source text (G1), when
+// readable is not nil: an untouched edge is then expected to read as it read in the source, not as the writer's
+// graph says. In the two P2 pilots about half of the "untouched relation changed" rejections (95 of 209, then 93
+// of 168) were on edges the verifier had not read in the source either; edges it had read were read again in the
+// variant 88% and 90% of the time. The touched pairs and every proposition are checked as before.
+//
 // The reference text of a proposition is the realizer's text only when an edit must change its content
 // (P-para, P-shift, P-neg, P-add); every other proposition (the endpoints of relation edits, deleted ones and the
 // endpoints of sampled edges) is referenced by its base text, whose wording must stay (dataset-spec §2.1, §4.3).
 // So a realizer that negates an endpoint to make a relation fit, and reports the negated text, is read as
 // "negated" against the base text and rejected (the §5.1 polarity-leak control).
-func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []perturb.Edit, rng *rand.Rand, nSample int) VerifyQuery {
+func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []perturb.Edit, readable []ged.Edge, rng *rand.Rand, nSample int) VerifyQuery {
 	var q VerifyQuery
 	inTarget := map[string]bool{}
 	for _, p := range target.Graph.Props {
@@ -144,11 +153,11 @@ func BuildVerifyQuery(base, out Discussion, target perturb.Variant, edits []pert
 			addPair(e.Edge.From, e.Edge.To, false)
 		}
 	}
-	// collateral sample among untouched edges
+	// collateral sample among the untouched edges that read in the source as they stand in the variant graph
 	var cands []ged.Edge
 	for _, e := range target.Graph.Edges {
 		k := [2]string{min(e.From, e.To), max(e.From, e.To)}
-		if !pairSeen[k] {
+		if !pairSeen[k] && (readable == nil || slices.Contains(readable, e)) {
 			cands = append(cands, e)
 		}
 	}
@@ -297,7 +306,7 @@ func metaOf(a Agent, resp *llm.Response) VerifierMeta {
 	return m
 }
 
-// Verify checks a realization blind (prompts/verify_v2.md): the verifier (the other family) sees only the
+// Verify checks a realization blind (prompts/verify_v3.md): the verifier (the other family) sees only the
 // edited text d and the touched elements of q. It returns the verifier's family and model id.
 func (g *Generator) Verify(ctx context.Context, d Discussion, q VerifyQuery) (Verification, VerifierMeta, *llm.Response, error) {
 	a := g.verifier()
@@ -309,7 +318,7 @@ func (g *Generator) Verify(ctx context.Context, d Discussion, q VerifyQuery) (Ve
 	return v, metaOf(a, resp), resp, err
 }
 
-// verifyRequest builds the verify_v2 request with its schema (exactly what is sent and cached).
+// verifyRequest builds the verify_v3 request with its schema (exactly what is sent and cached).
 func (g *Generator) verifyRequest(d Discussion, q VerifyQuery) (llm.Request, error) {
 	req := g.verifier().request(g.VerifyPrompt.Body, q.userMessage(d), "verify")
 	schema, err := llm.SchemaFor[Verification]("verification_v2", "Per-proposition content, per-pair relation, fluency and coherence")
@@ -326,7 +335,7 @@ func (g *Generator) VerifyKey(d Discussion, q VerifyQuery) string {
 	return RequestKey(g.verifier().Client, req)
 }
 
-// SourceAnnotation is the verifier's full blind re-annotation of a source (prompts/verify_source_v1.md).
+// SourceAnnotation is the verifier's full blind re-annotation of a source (prompts/verify_source_v2.md).
 type SourceAnnotation struct {
 	Propositions []struct {
 		Label   string `json:"label" jsonschema_description:"P1, P2, ... as given"`
@@ -352,7 +361,7 @@ type GraphAgreement struct {
 	ContentIssues int     `json:"content_issues"`
 	Negated       int     `json:"negated"`
 	Recall        float64 `json:"recall"`
-	// Pass: ≥ 80% of the relations recovered with type and direction (dataset-spec §4.3 as amended 2026-11-11).
+	// Pass: ≥ 65% of the relations recovered with type and direction (dataset-spec §4.3 as amended 2026-11-11).
 	// Extra relations are counted but do not reject.
 	Pass bool `json:"pass"`
 }
@@ -360,8 +369,10 @@ type GraphAgreement struct {
 // SourceRecallMin is the G1 acceptance threshold on relation recall. It was 0.9 together with "no extra relation";
 // the first runs with real models accepted 1 source in 8 under that rule (recall 0.71 over 142 relations, 1.6 extra
 // relations per source, mostly attacks the writer had not put in the graph), so the user set 0.8 and dropped the
-// extra-relation condition (2026-11-11).
-const SourceRecallMin = 0.8
+// extra-relation condition (2026-11-11). The P2 pilot (25 sources) still accepted 9 of 25 at 0.8 after 49
+// generations, with a median recall of 0.64 (Sonnet 5.5) and 0.65 (luna) over the re-annotations, so the user set
+// 0.65 the same day.
+const SourceRecallMin = 0.65
 
 // sourceLabels maps proposition ids to P1, P2, … in graph order.
 func sourceLabels(g ged.Graph) (map[string]string, map[string]string) {

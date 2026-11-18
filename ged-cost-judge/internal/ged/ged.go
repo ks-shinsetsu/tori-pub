@@ -153,10 +153,16 @@ type Features struct {
 }
 
 // Cost is the GED at θ.
+//
+// The sum is written with math.FMA so that it has the same bits on every architecture. The compiler fuses
+// c += φ·θ into a multiply-add on arm64 and not on amd64, and the two differed in the last bit: a Δ(θ₀) that is
+// exactly on a stratum boundary (0.5, 1, 2) fell on either side of it, and the plans drawn from one seed differed
+// between the two (perturb.drawT1; TestT1Incremental passed on arm64 and failed on amd64). math.FMA is exact
+// everywhere and gives the values arm64 had.
 func (f Features) Cost(t Theta) float64 {
 	c := f.EdgeExtra * EdgeExtraCost
 	for i := range NumParams {
-		c += f.Phi[i] * t[i]
+		c = math.FMA(f.Phi[i], t[i], c)
 	}
 	return c
 }

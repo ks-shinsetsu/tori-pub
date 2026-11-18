@@ -188,6 +188,8 @@ type Options struct {
 	// If FixTheta is true, θ is fixed at Theta0 and only the auxiliary parameters are fitted
 	// (to give fixed rules a chance at calibration too and compare log loss; plan §7.3).
 	FixTheta bool
+	// MaxOuter caps the outer rounds (0 → 20); under OuterDescent it caps each exploration, and each descent may
+	// make descentRoundFactor times as many rounds.
 	MaxOuter int
 	// AuxRidge is the L2 coefficient on log β, log τ and π (0 means 1e-4).
 	// With a single judge and few judgments, perfect separation makes β diverge, so at small scale it acts as a weak prior.
@@ -232,7 +234,26 @@ type Options struct {
 	Trace func(RoundTrace)
 	// NoLapse fixes every ℓ_j at 0 (the pre-2026-10-29 model; a recorded deviation in Confirmatory).
 	NoLapse bool
+	// Outer selects the outer loop (OuterMode). The zero value is the pre-registered alternation.
+	Outer OuterMode
 }
+
+// OuterMode selects how the matching and the parameters are optimised together.
+type OuterMode int
+
+const (
+	// OuterAlternate is the pre-registered alternating optimisation (decisions §11): solve the parameters at the
+	// current matching, re-solve the matching, repeat until the matching repeats. It is not a descent method on the
+	// true objective (the objective under real GED): a round can raise it, and the loop returns the matching's fixed
+	// point when it reaches one, whatever the true objective of the earlier rounds was. On the main run (750 sources,
+	// 2026-11) the random-intercept fit ended, from all five starts, at a fixed point 460 nats above a round it had
+	// visited, with the node costs at 0; kept so that the registered results can be reproduced.
+	OuterAlternate OuterMode = iota
+	// OuterDescent explores by the same alternation but keeps the best point under the true objective (the start
+	// included), then descends from it, accepting a step only if the true objective decreases (fitDescent). The
+	// returned point is never worse than a visited one. A recorded deviation in Confirmatory.
+	OuterDescent
+)
 
 // TypeTie is the pre-registered tie of the three type-mismatch costs to the RA↔MA cost (decisions §12b).
 func TypeTie() map[int]int {
@@ -292,6 +313,15 @@ type RoundTrace struct {
 	Theta      ged.Theta
 	InnerIters int
 	InnerConv  bool
+	// OuterDescent only: Descent marks a round of the descent phase (the others are exploration rounds). In a descent
+	// round Inner is the objective of the full proposal (the inner solve from the current point), True the objective of
+	// the accepted point, and Step the accepted step as a fraction of the length of the full proposal: 1 when the
+	// proposal itself was accepted, below 1 for a trust-region, gradient or line step, 0 when no step gave a decrease
+	// (True then repeats the current objective). Step is 1 in exploration. Trials is the number of
+	// true-objective evaluations of the round.
+	Descent bool
+	Step    float64
+	Trials  int
 }
 
 // StartResult records one start of a multi-start fit.
@@ -320,10 +350,26 @@ type Result struct {
 	// would keep producing (the cycle) together with the returned round, so it bounds the distance between the
 	// returned estimate and every other candidate; 0 unless Cycled. Reported, not a validity criterion (§11.2).
 	CycleSpread float64
-	// Capped indicates the outer loop hit MaxOuter without converging or cycling.
+	// Capped indicates the outer loop hit MaxOuter without converging or cycling (OuterDescent: the last descent used
+	// all its rounds; an exploration that uses its MaxOuter rounds is not capped, it only hands over its best).
 	Capped bool
+	// Stalled (OuterDescent only) indicates the descent stopped for lack of progress rather than at a fixed point:
+	// none of the steps of a complete round decreased the true objective, or several consecutive rounds of restricted
+	// steps decreased it by less than the stopping tolerance. The fixed-matching model still promises a decrease there, so the point
+	// may be improvable at a rate below the tolerance; it is the best point visited. Set together with Converged and
+	// counted as a valid iterate, as a cycle of the alternation is.
+	Stalled bool
+	// Backtracked (OuterDescent only) counts the descent rounds whose accepted step was a restricted (trust-region,
+	// gradient or line) step rather than the full proposal.
+	Backtracked int
+	// Explored (OuterDescent only) is the number of exploration rounds over all passes; Outer counts them and the
+	// descent rounds. Passes is the number of exploration-and-descent passes whose descent ran (the last exploration,
+	// which found nothing lower and so ended the loop, is counted in Explored only).
+	Explored int
+	Passes   int
 	// InnerConverged is false if the bound-constrained inner solver of the returned round stopped on a line-search
-	// failure or an iteration/evaluation cap rather than on its tolerances.
+	// failure or an iteration/evaluation cap rather than on its tolerances (OuterDescent: the inner solve behind the
+	// last step of the last descent, or its full proposal when that descent ended without a step).
 	InnerConverged bool
 	// Boundary[p] is true if the free cost p ended below BoundaryEps; Divergent[p] if it ended at ThetaMax (clipped).
 	Boundary  [ged.NumParams]bool
@@ -343,7 +389,11 @@ type Result struct {
 // Valid is the one statement of the validity rule of decisions §11.2 (RepMeta.Valid and the §6 replicate floor
 // delegate to it): the inner solver stopped on its tolerances and the outer loop did not hit the round cap. A cycle
 // of any width is valid: it returns the round with the smallest objective, a tie on a kink of the piecewise-linear
-// GED, not a failure (§11 item 2); its width is recorded in CycleSpread and reported.
+// GED, not a failure (§11 item 2); its width is recorded in CycleSpread and reported. A stall of OuterDescent (a
+// loop that cannot cycle and stops when its progress falls below the tolerance instead) sets Converged and is valid
+// on the same footing: both return the best point of a search that did not settle, and both are reported. Neither is
+// a certificate of a minimum; under OuterDescent a further pass of exploration has at least confirmed that restarting
+// the procedure from the point does not improve it (unless Passes reached descentPasses).
 func (r Result) Valid() bool {
 	return r.InnerConverged && !r.Capped && (r.Converged || r.Cycled)
 }
@@ -1181,26 +1231,18 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 	if ridge <= 0 {
 		ridge = 1e-4
 	}
+	finish := func(r Result) Result { return finishResult(r, opts, mixed, len(trips), len(js)) }
+	if opts.Outer == OuterDescent {
+		r, err := fitDescent(trips, js, opts, p, l, lo, hi, ds, ridge, mixed)
+		if err != nil {
+			return r, err
+		}
+		return finish(r), nil
+	}
 	seen := map[string]int{sigOf(ds): 0} // matching signature → the round that produced it
 	rounds := [][]float64{ThetaVec(p)}   // (θ, θ_neg) per round (index 0: the start)
 	best, bestF, bestRound := Result{}, math.Inf(1), 0
 	prevTrue := math.Inf(1)
-	finish := func(r Result) Result {
-		r.Free = FreeTheta(opts)
-		r.Mixed = mixed
-		r.Triplets, r.Judgments = len(trips), len(js)
-		for q := range ged.NumParams {
-			if !r.Free[q] {
-				continue
-			}
-			r.Boundary[q] = r.Params.Theta[q] < BoundaryEps
-			r.Divergent[q] = r.Params.Theta[q] >= ThetaMax-1e-9
-		}
-		if !mixed {
-			r.Params.Sigma = 0
-		}
-		return r
-	}
 	for outer := 1; outer <= opts.MaxOuter; outer++ {
 		obj := newObjective(l, ds, trips, js, opts, ridge, mixed, p)
 		br := projLBFGS(obj.eval, l.pack(p, mixed), lo, hi, boxOptions{})
@@ -1272,6 +1314,435 @@ func fitOnce(trips []Triplet, js []Judgment, opts Options, init *Params, mixed b
 	best.Outer = opts.MaxOuter
 	best.Capped = true
 	return finish(best), nil
+}
+
+// finishResult fills the fields of a result that do not depend on the outer loop.
+func finishResult(r Result, opts Options, mixed bool, nTrips, nJs int) Result {
+	r.Free = FreeTheta(opts)
+	r.Mixed = mixed
+	r.Triplets, r.Judgments = nTrips, nJs
+	for q := range ged.NumParams {
+		if !r.Free[q] {
+			continue
+		}
+		r.Boundary[q] = r.Params.Theta[q] < BoundaryEps
+		r.Divergent[q] = r.Params.Theta[q] >= ThetaMax-1e-9
+	}
+	if !mixed {
+		r.Params.Sigma = 0
+	}
+	return r
+}
+
+// Tolerances of the descent phase of fitDescent. descentDecrease is the relative decrease a step must achieve to be
+// accepted: above the noise of the objective (re-evaluating a random-intercept fit on a re-centred grid moves it by
+// about 1e-9 relative), below anything of interest. descentMinStep is the smallest step that is tried, as a fraction
+// of the length of the full proposal; boxMinRadius the smallest trust-region radius (twice the inner solver's
+// tolerance on the projected gradient, under which it returns its start unchanged).
+const (
+	descentDecrease = 1e-8
+	descentMinStep  = 1.0 / (1 << 20)
+	boxMinRadius    = 2e-6
+)
+
+// descentStop is the relative decrease of a round under which the round counts as making no progress (a tenth of the
+// 1e-6 of the alternation's objective-based stop, at which a kink case of TestDescentAgainstTighterRun stopped 0.14
+// nats above the run with a tighter tolerance while still descending slowly), descentPatience
+// the number of consecutive such rounds of restricted steps that ends the phase as a stall, and descentRoundFactor
+// the number of descent rounds allowed per MaxOuter in one pass (a round on a kink moves by a small fraction of the
+// alternation's step, so the phase needs more rounds than the exploration), and descentPasses the largest number of
+// exploration-and-descent passes. Variables so that the tests can compare against a run with tighter settings.
+var (
+	descentStop        = 1e-7
+	descentPatience    = 3
+	descentRoundFactor = 10
+	descentPasses      = 5
+)
+
+// outerState is a point of the outer loop: the packed parameters, the matching solved at them, and the true
+// objective there (the penalized negative log-likelihood under that matching, on the grid centred at p).
+type outerState struct {
+	x   []float64
+	p   Params
+	ds  []diff
+	f   float64
+	nll float64
+}
+
+// stateAt re-solves the matching at the parameters packed in x (a point of the box) and evaluates the true
+// objective there. x is kept as given and p is its unpacking: pack is not the inverse of unpack at the lower bounds
+// of log β and log τ (it floors them at log 1e-3, above the bounds), so re-packing would evaluate another point than
+// the one returned.
+func stateAt(x []float64, l layout, trips []Triplet, js []Judgment, opts Options, ridge float64, mixed bool) (outerState, error) {
+	p := l.unpack(x, opts, mixed)
+	ds, err := features(trips, p.Theta)
+	if err != nil {
+		return outerState{}, err
+	}
+	obj := newObjective(l, ds, trips, js, opts, ridge, mixed, p)
+	f := obj.eval(x, nil)
+	return outerState{x: x, p: p, ds: ds, f: f, nll: obj.nllRaw}, nil
+}
+
+// fitDescent is the outer loop of OuterDescent, from the start p with the matching ds (features at p.Theta).
+//
+// The model's distance is the minimum over matchings, so the true objective F(x) (the penalized negative
+// log-likelihood with the matching re-solved at x) is continuous and piecewise smooth. Its minimizers lie on kinks
+// (points where the optimal matching of some triplets is tied), where the objective at one fixed matching is a poor
+// local model of F. The loop therefore alternates two phases, in passes.
+//
+// Exploration is the alternation of OuterAlternate with its stopping rules (the matching repeats, the true
+// objective stops moving, or MaxOuter rounds): it moves far and is not monotone. Every round, and the start, is
+// evaluated under the true objective and the best is kept.
+//
+// Descent starts from that best point and is a trust-region method on the fixed-matching model, which agrees with
+// F at the current point x in value and, where the optimal matching at x is unique, in gradient. Each round solves
+// the fixed-matching problem from x (the inner solve of the alternation) and tries, in this order, until one
+// decreases the true objective:
+//   - its solution, the full proposal (if the carried radius allows it);
+//   - the solution of the fixed-matching problem inside the box of half-width r around x (max-norm over the packed
+//     coordinates), for r from the carried radius, or half the length of the proposal, down by halves to
+//     descentMinStep of that length. Shrinking the box does not only shorten the step: it turns it from the
+//     direction of the distant minimizer towards the steepest descent at x, the direction in which the model is right;
+//   - two directions, each shortened by halves: the projected negative gradient of the fixed-matching objective at x
+//     (from a move of 1 in the largest coordinate) and the line towards the proposal. A box step moves every
+//     coordinate by r, which on a kink can cross the matchings of many triplets at once; these move mainly the
+//     coordinates that matter.
+//
+// When the step found is a box step with a decrease below descentStop, the two directions are tried as well and the
+// better point is taken, so that a round without progress has always looked at every kind of step. After a
+// restricted step the radius is doubled for the next round; after a full step it is unlimited again. A round that
+// finds nothing at or below a carried radius is made again from the full proposal before the phase gives up.
+//
+// The descent stops when
+//   - the inner solve no longer improves the fixed-matching objective at the current matching: a fixed point of the
+//     alternation (Result.Converged);
+//   - a round whose step was the full proposal decreases the true objective by less than descentStop
+//     (Result.Converged);
+//   - a round started from the full proposal finds no decreasing step at all, or descentPatience consecutive rounds
+//     of restricted steps, the last of them started from the full proposal, decrease the true objective by less than
+//     descentStop each (Result.Converged and Result.Stalled). The fixed-matching model still promises a decrease
+//     there, so a stall is a statement about the steps this search tried and their rate of progress, not a proof
+//     that no descent exists. It is the counterpart of a cycle of the alternation, which also returns the best point
+//     of a loop that cannot settle on the piecewise-linear GED;
+//   - descentRoundFactor·MaxOuter descent rounds were made (Result.Capped).
+//
+// A descent that stops is followed by another pass: an exploration from its end point, whose non-monotone rounds can
+// reach a point the descent cannot, and, if that finds a lower point, a descent from it. The loop ends when a pass's
+// exploration does not improve on the previous pass (the end point is then one that a restart of the whole procedure
+// would return unchanged) or after descentPasses passes (Result.Passes).
+//
+// The returned point is therefore never worse, under the true objective, than the start or any round of any
+// exploration, and the true objectives of the descent rounds are strictly decreasing. These are the only guarantees:
+// the point is not certified as a local or global minimum of F (only the fixed-point exit says that the
+// fixed-matching model offers no further decrease), and the multi-start of decisions §11.3 still applies. In the
+// random-intercept fit every true objective is evaluated on the grid centred at its own parameters.
+func fitDescent(trips []Triplet, js []Judgment, opts Options, p Params, l layout, lo, hi []float64, ds []diff, ridge float64, mixed bool) (Result, error) {
+	// The start is projected into the box (as the inner solver does with its own start) and p is its unpacking, so
+	// that every state of the loop is one consistent (x, p) pair. θ is already inside the box (fitOnce clamps it), so
+	// the matching ds still belongs to it.
+	x0 := l.pack(p, mixed)
+	for i := range x0 {
+		x0[i] = clampTo(x0[i], lo[i], hi[i])
+	}
+	p = l.unpack(x0, opts, mixed)
+	obj0 := newObjective(l, ds, trips, js, opts, ridge, mixed, p)
+	f0 := obj0.eval(x0, nil)
+	if math.IsNaN(f0) || math.IsInf(f0, 0) {
+		return Result{}, errors.New("fit: objective is not finite at the start")
+	}
+	n := len(x0)
+	below := func(a, b float64) bool { return !math.IsNaN(a) && a < b-descentDecrease*math.Max(1, math.Abs(b)) }
+	trace := func(tr RoundTrace) {
+		if opts.Trace != nil {
+			opts.Trace(tr)
+		}
+	}
+	changes := func(tr *RoundTrace, from, to outerState) {
+		for i := range to.ds {
+			if to.ds[i].sig != from.ds[i].sig {
+				tr.Changed++
+				tr.Flipped = append(tr.Flipped, i)
+				sh := math.Abs(to.ds[i].value(to.p.Theta) - from.ds[i].value(to.p.Theta))
+				tr.MaxDeltaShift = math.Max(tr.MaxDeltaShift, sh)
+				tr.SumDeltaShift += sh
+			}
+		}
+	}
+	outer := 0 // rounds so far, exploration and descent, over all passes
+
+	// explore runs the alternation from cur and returns the best point under the true objective, cur included.
+	explore := func(cur outerState) (outerState, int, error) {
+		best := cur
+		rounds := 0
+		seen := map[string]bool{sigOf(cur.ds): true}
+		prevTrue := math.Inf(1)
+		for range opts.MaxOuter {
+			obj := newObjective(l, cur.ds, trips, js, opts, ridge, mixed, cur.p)
+			br := projLBFGS(obj.eval, cur.x, lo, hi, boxOptions{})
+			if math.IsNaN(br.F) || math.IsInf(br.F, 0) {
+				return best, rounds, errors.New("fit: objective is not finite")
+			}
+			next, err := stateAt(br.X, l, trips, js, opts, ridge, mixed)
+			if err != nil {
+				return best, rounds, err
+			}
+			rounds++
+			outer++
+			if !math.IsNaN(next.f) && next.f < best.f {
+				best = next
+			}
+			tr := RoundTrace{Outer: outer, Inner: br.F, True: next.f, Theta: next.p.Theta, InnerIters: br.Iter, InnerConv: br.Converged, Step: 1, Trials: 1}
+			changes(&tr, cur, next)
+			trace(tr)
+			sig := sigOf(next.ds)
+			same := sig == sigOf(cur.ds)
+			centersStable := !mixed || math.Abs(next.f-br.F) < 1e-6*math.Max(1, math.Abs(next.f))
+			stable := math.Abs(next.f-prevTrue) < 1e-6*math.Max(1, math.Abs(next.f)) && centersStable
+			repeated := !same && seen[sig]
+			seen[sig] = true
+			prevTrue = next.f
+			cur = next
+			if (same && centersStable) || stable || repeated || math.IsNaN(next.f) {
+				break
+			}
+		}
+		return best, rounds, nil
+	}
+
+	// descend runs the trust-region descent from cur and returns its end point with the status of the stop.
+	type status struct {
+		converged, stalled, capped, innerConv bool
+		backtracked                           int
+	}
+	descend := func(cur outerState) (outerState, status, error) {
+		st := status{innerConv: true}
+		obj := newObjective(l, cur.ds, trips, js, opts, ridge, mixed, cur.p)
+		trials := 0
+		// try evaluates the true objective at xt and returns the state if it is below that of cur. A candidate equal
+		// to cur in every free coordinate is not evaluated.
+		try := func(xt []float64) (*outerState, error) {
+			moved := false
+			for i := range xt {
+				moved = moved || (lo[i] < hi[i] && xt[i] != cur.x[i])
+			}
+			if !moved {
+				return nil, nil
+			}
+			c, err := stateAt(xt, l, trips, js, opts, ridge, mixed)
+			if err != nil {
+				return nil, err
+			}
+			trials++
+			if below(c.f, cur.f) {
+				return &c, nil
+			}
+			return nil, nil
+		}
+		radius := math.Inf(1) // trust-region radius (max-norm over the packed coordinates); +Inf: the full proposal
+		slow := 0             // consecutive rounds without progress
+		for range descentRoundFactor * opts.MaxOuter {
+			outer++
+			trials = 0
+			x := cur.x
+			fx := obj.eval(x, nil)
+			full := projLBFGS(obj.eval, x, lo, hi, boxOptions{})
+			if math.IsNaN(full.F) || math.IsInf(full.F, 0) {
+				return cur, st, errors.New("fit: objective is not finite")
+			}
+			tr := RoundTrace{Outer: outer, Inner: full.F, True: cur.f, Theta: cur.p.Theta, InnerIters: full.Iter, InnerConv: full.Converged, Descent: true}
+			if fx-full.F < descentStop*math.Max(1, math.Abs(fx)) {
+				// The inner solve cannot improve the fixed-matching objective at the current matching: x is a
+				// fixed point of the alternation.
+				st.converged, st.innerConv = true, full.Converged
+				trace(tr)
+				return cur, st, nil
+			}
+			length := 0.0 // max-norm length of the full proposal over the free coordinates
+			for i := range x {
+				if lo[i] < hi[i] {
+					length = math.Max(length, math.Abs(full.X[i]-x[i]))
+				}
+			}
+			// boxes tries the full proposal (if r0 allows it) and then the fixed-matching problem restricted to
+			// the box of half-width r around x, for r from r0 (or half the proposal's length) down by halves. Below
+			// boxMinRadius the inner solver takes x itself for a solution, so smaller boxes say nothing.
+			boxes := func(r0 float64) (acc *outerState, step float64, innerConv bool, err error) {
+				r := r0
+				if r >= length {
+					if acc, err = try(full.X); acc != nil || err != nil {
+						return acc, 1, full.Converged, err
+					}
+					r = length / 2
+				}
+				for ; r >= length*descentMinStep && r >= boxMinRadius; r /= 2 {
+					tlo, thi := make([]float64, n), make([]float64, n)
+					for i := range x {
+						tlo[i], thi[i] = math.Max(lo[i], x[i]-r), math.Min(hi[i], x[i]+r)
+					}
+					br := projLBFGS(obj.eval, x, tlo, thi, boxOptions{})
+					if math.IsNaN(br.F) || math.IsInf(br.F, 0) {
+						return nil, 0, false, errors.New("fit: objective is not finite")
+					}
+					if acc, err = try(br.X); acc != nil || err != nil {
+						radius = r
+						return acc, r / length, br.Converged, err
+					}
+				}
+				return nil, 0, full.Converged, nil
+			}
+			// directions tries the projected negative gradient of the fixed-matching objective at x, from a move
+			// of 1 in its largest coordinate, and the line towards the proposal, each shortened by halves, and
+			// returns the better of the two first successes.
+			directions := func() (acc *outerState, step float64, err error) {
+				g := make([]float64, n)
+				obj.eval(x, g)
+				scale := 0.0
+				for i := range g {
+					if lo[i] >= hi[i] || (x[i] <= lo[i] && g[i] > 0) || (x[i] >= hi[i] && g[i] < 0) {
+						g[i] = 0 // fixed, or at a bound with the gradient pointing out of the box
+					}
+					scale = math.Max(scale, math.Abs(g[i]))
+				}
+				for k, dir := range []func(i int) float64{
+					func(i int) float64 { return -g[i] / scale },
+					func(i int) float64 { return full.X[i] - x[i] },
+				} {
+					if k == 0 && scale == 0 {
+						continue
+					}
+					unit := length // max-norm length of the direction: the step is reported against the proposal's
+					if k == 0 {
+						unit = 1
+					}
+					for alpha := 1.0; alpha >= descentMinStep; alpha /= 2 {
+						if k == 1 && alpha == 1 {
+							continue // the full proposal itself is tried by boxes
+						}
+						xt := make([]float64, n)
+						for i := range xt {
+							xt[i] = clampTo(x[i]+alpha*dir(i), lo[i], hi[i])
+						}
+						c, err := try(xt)
+						if err != nil {
+							return nil, 0, err
+						}
+						if c != nil {
+							if acc == nil || c.f < acc.f {
+								acc, step = c, math.Min(alpha*unit/length, 1-descentMinStep)
+							}
+							break
+						}
+					}
+				}
+				return acc, step, nil
+			}
+			small := func(c *outerState) bool { return cur.f-c.f < descentStop*math.Max(1, math.Abs(c.f)) }
+			complete := radius >= length // the round starts from the full proposal
+			acc, step, innerConv, err := boxes(radius)
+			if err != nil {
+				return cur, st, err
+			}
+			if acc == nil && !complete {
+				// Nothing at or below the carried radius: the boxes are made again from the full proposal, so that a
+				// radius that collapsed in earlier rounds does not hide a longer step that works now.
+				complete = true
+				if acc, step, innerConv, err = boxes(math.Inf(1)); err != nil {
+					return cur, st, err
+				}
+			}
+			if acc == nil || (step < 1 && small(acc)) {
+				// No box step, or one without progress: the directions are tried too and the better point taken.
+				d, dstep, err := directions()
+				if err != nil {
+					return cur, st, err
+				}
+				if d != nil && (acc == nil || d.f < acc.f) {
+					acc, step, innerConv = d, dstep, full.Converged
+					radius = dstep * length
+				}
+			}
+			tr.Trials = trials
+			if acc == nil {
+				// The full proposal, every box, the gradient and the line towards the proposal all fail.
+				st.converged, st.stalled, st.innerConv = true, true, innerConv
+				trace(tr)
+				return cur, st, nil
+			}
+			progress := !small(acc)
+			changes(&tr, cur, *acc)
+			cur = *acc
+			obj = newObjective(l, cur.ds, trips, js, opts, ridge, mixed, cur.p)
+			st.innerConv = innerConv
+			if step < 1 {
+				st.backtracked++
+				radius *= 2 // the restricted step succeeded: allow a longer one next round
+			} else {
+				radius = math.Inf(1)
+			}
+			tr.True, tr.Theta, tr.Step = cur.f, cur.p.Theta, step
+			trace(tr)
+			if progress {
+				slow = 0
+				continue
+			}
+			if step == 1 {
+				// The full proposal was accepted and the true objective has stopped moving.
+				st.converged = true
+				return cur, st, nil
+			}
+			// A restricted step without progress: the decrease is small because the step is. The phase ends as a
+			// stall only after descentPatience such rounds in a row, the last of which started from the full
+			// proposal; otherwise the next round does (a collapsed radius must not be what ends the phase).
+			slow++
+			if slow >= descentPatience {
+				if complete {
+					st.converged, st.stalled = true, true
+					return cur, st, nil
+				}
+				radius = math.Inf(1)
+			}
+		}
+		st.capped = true
+		return cur, st, nil
+	}
+
+	end := outerState{x: x0, p: p, ds: ds, f: f0, nll: obj0.nllRaw}
+	result := func(c outerState, st status, explored, passes int) Result {
+		return Result{Params: c.p, NegLogLik: c.nll, Objective: c.f, Outer: outer, Explored: explored, Passes: passes,
+			Converged: st.converged, Stalled: st.stalled, Capped: st.capped, InnerConverged: st.innerConv, Backtracked: st.backtracked}
+	}
+	var st status
+	explored, passes, backtracked := 0, 0, 0
+	for pass := 1; pass <= descentPasses; pass++ {
+		best, rounds, err := explore(end)
+		explored += rounds
+		if err != nil {
+			if pass == 1 {
+				return result(end, st, explored, passes), err
+			}
+			// The confirming exploration failed (a non-finite objective on its way): the previous pass's end point
+			// stands, as it does when the exploration finds nothing lower.
+			break
+		}
+		if pass > 1 && !below(best.f, end.f) {
+			// The exploration from the previous pass's end point finds nothing lower: a restart of the whole
+			// procedure from that point would return it unchanged.
+			break
+		}
+		passes = pass
+		var derr error
+		end, st, derr = descend(best)
+		backtracked += st.backtracked
+		st.backtracked = backtracked
+		if derr != nil {
+			return result(end, st, explored, passes), derr
+		}
+		if st.capped {
+			break
+		}
+	}
+	return result(end, st, explored, passes), nil
 }
 
 func sigOf(ds []diff) string {

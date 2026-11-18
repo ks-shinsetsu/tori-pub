@@ -37,6 +37,10 @@ func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
 	fmt.Fprintf(w, "- λ = %g、種別の結び %v、除外フラグ {%s}、重み付け %v、γ %d、系列の結合フィルタ %v、Δcoh = 0 のみ %v、無作為回答の混合 %v、切片の数値積分の分解能 %d（三つ組ごとの適応一様格子の Riemann 和、20 で刻み ≤ 0.6 logit）、判定者 %d\n",
 		r.Used.Lambda, r.Used.Tie, strings.Join(r.Used.Exclude, ", "), r.Used.Weighted, r.Used.Gamma, r.Used.ExcludeSameFamily, r.Used.CohZeroOnly, !r.Used.NoLapse, r.Used.Quadrature, r.Used.Judges)
 	fmt.Fprintf(w, "- 情報量の下限: %v; ゲート Δ(θ₀) ≥ %g、r_max %g、信頼 %g、n_T ≥ %d; 格子の確認: σ̂ > %g なら分解能 %d で再当てはめ\n", co.MinInformative, co.GateDelta, co.RMax, co.GateConf, co.MinGateTriplets, co.HighNodesSigma, co.HighNodes)
+	if r.Used.Outer == fit.OuterDescent {
+		fmt.Fprintf(w, "- 外側のループ: 探索と降下（交互最適化で通った点のうち真の目的関数が最小の点から、目的関数が下がる歩みだけで仕上げ、そこからの探索がそれ以上の点を見つけなくなるまで繰り返す。繰り返しの上限 5 回に達した当てはめは、最後の確認の探索をしていない）。返る点は通った中で最良の点であり、極小の保証ではない。作業独立は %d 巡（探索 %d 回 + 降下 %d 回、歩みを縮めた回 %d、停留 %v）、ランダム切片は %d 巡（探索 %d 回 + 降下 %d 回、歩みを縮めた回 %d、停留 %v）\n",
+			r.Indep.Passes, r.Indep.Explored, r.Indep.Outer-r.Indep.Explored, r.Indep.Backtracked, r.Indep.Stalled, r.Mixed.Passes, r.Mixed.Explored, r.Mixed.Outer-r.Mixed.Explored, r.Mixed.Backtracked, r.Mixed.Stalled)
+	}
 	if len(r.Deviations) > 0 {
 		fmt.Fprintln(w, "\n**事前登録からの逸脱（判定は「否定されず」までに制限）:**")
 		for _, d := range r.Deviations {
@@ -187,6 +191,11 @@ func WriteConfirmatory(w io.Writer, r fit.ConfirmResult, prov provenance) {
 	if r.Boot.MixedMeta != nil {
 		shm := fit.Summarise(r.Boot.MixedMeta)
 		fmt.Fprintf(w, " ランダム切片: 循環 %.1f%%、上限到達 %.1f%%、無効 %.1f%%、非収束（旧指標） %.1f%%。", 100*shm.Cycled, 100*shm.Capped, 100*shm.Invalid, 100*shm.NotConverged)
+		if r.Used.Outer == fit.OuterDescent {
+			fmt.Fprintf(w, " 降下の停留（折れ点で止まった反復。循環と同じく有効）: 作業独立 %.1f%%、ランダム切片 %.1f%%。", 100*sh.Stalled, 100*shm.Stalled)
+		}
+	} else if r.Used.Outer == fit.OuterDescent {
+		fmt.Fprintf(w, " 降下の停留（折れ点で止まった反復。循環と同じく有効）: %.1f%%。", 100*sh.Stalled)
 	}
 	fmt.Fprintln(w)
 	for _, p := range r.Params {

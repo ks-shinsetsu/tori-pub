@@ -199,12 +199,14 @@ type RepMeta struct {
 	Cycled         bool
 	CycleSpread    float64
 	Capped         bool
-	Cold           bool
-	Boundary       [ged.NumParams]bool
-	Divergent      [ged.NumParams]bool
-	NegLogLik      float64
-	Sigma          float64
-	Err            string
+	// Stalled is Result.Stalled (OuterDescent only).
+	Stalled   bool
+	Cold      bool
+	Boundary  [ged.NumParams]bool
+	Divergent [ged.NumParams]bool
+	NegLogLik float64
+	Sigma     float64
+	Err       string
 }
 
 // BootResult holds the replicates of the paired bootstrap.
@@ -231,10 +233,12 @@ func (m RepMeta) Valid() bool {
 // converged, or failed); NotConverged keeps the older metric (outer loop not converged or inner solver not
 // converged, incl. failed fits; a cycle counts here but is valid) so earlier summaries stay comparable.
 type Shares struct {
-	Boundary     [ged.NumParams]float64
-	Divergent    [ged.NumParams]float64
-	Cycled       float64
-	Capped       float64
+	Boundary  [ged.NumParams]float64
+	Divergent [ged.NumParams]float64
+	Cycled    float64
+	Capped    float64
+	// Stalled is the share of replicates whose descent stopped on a kink (OuterDescent only; valid, like a cycle).
+	Stalled      float64
 	Invalid      float64
 	NotConverged float64
 	Cold         int
@@ -262,6 +266,9 @@ func Summarise(meta []RepMeta) Shares {
 		if m.Capped {
 			s.Capped++
 		}
+		if m.Stalled {
+			s.Stalled++
+		}
 		if !m.Valid() {
 			s.Invalid++
 		}
@@ -278,13 +285,14 @@ func Summarise(meta []RepMeta) Shares {
 	}
 	s.Cycled /= n
 	s.Capped /= n
+	s.Stalled /= n
 	s.Invalid /= n
 	s.NotConverged /= n
 	return s
 }
 
 func metaOf(r Result, cold bool) RepMeta {
-	return RepMeta{Outer: r.Outer, Converged: r.Converged, InnerConverged: r.InnerConverged, Cycled: r.Cycled, CycleSpread: r.CycleSpread, Capped: r.Capped, Cold: cold,
+	return RepMeta{Outer: r.Outer, Converged: r.Converged, InnerConverged: r.InnerConverged, Cycled: r.Cycled, CycleSpread: r.CycleSpread, Capped: r.Capped, Stalled: r.Stalled, Cold: cold,
 		Boundary: r.Boundary, Divergent: r.Divergent, NegLogLik: r.NegLogLik, Sigma: r.Params.Sigma}
 }
 

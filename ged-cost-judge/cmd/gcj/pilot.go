@@ -62,8 +62,8 @@ type pilotOptions struct {
 	// withQT30 adds <out>/qt30_sources.json (from -import-qt30) as transfer-set sources.
 	withQT30 bool
 	aifdb    string
-	// diagShare overrides the share of T3 slots in the t3_diag sub-stratum (0 → the dataset-spec §2.2 default
-	// 0.10); not a flag, set by the offline tests so that the sub-stratum is exercised.
+	// diagShare is the share of T3 slots in the t3_diag sub-stratum (0 → none: the sub-stratum was taken out of the
+	// pilot's catalogue, see catalogueOptions); not a flag, set by the offline tests so that the sub-stratum is exercised.
 	diagShare float64
 	// dReps overrides the nested-D replicates of the confirmatory analysis (0 → fit's pre-registered 200); not a
 	// flag, set by the offline tests.
@@ -385,6 +385,29 @@ type sourceRecord struct {
 	// ReplacementOf / ReplacedBy link a rejected or duplicate source and its replacement (review M2).
 	ReplacementOf string `json:"replacement_of,omitempty"`
 	ReplacedBy    string `json:"replaced_by,omitempty"`
+}
+
+// readableEdges are the edges of the source that the verifier recovered in the G1 re-annotation of the accepted
+// attempt, with kind and direction (synth.RealizeInput.Readable). nil when the source carries no re-annotation
+// (a QT30 source), so that every edge may be sampled.
+func (s *sourceRecord) readableEdges() []ged.Edge {
+	var ann *synth.SourceAnnotation
+	for i := range s.Attempts {
+		if s.Attempts[i].Annotation != nil {
+			ann = s.Attempts[i].Annotation
+		}
+	}
+	if ann == nil {
+		return nil
+	}
+	read := ann.Relabel(s.Discussion.Graph)
+	out := []ged.Edge{}
+	for _, e := range s.Discussion.Graph.Edges {
+		if slices.Contains(read, e) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (s *sourceRecord) prefix() string {
@@ -1030,7 +1053,7 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 		}
 	}
 	dir := cmp(o.promptDir, "prompts")
-	for _, name := range []string{"synth_source_v2", "realize_v3", "verify_v2", "verify_source_v1", "judge_v1", "synth_topics_v1"} {
+	for _, name := range []string{"synth_source_v4", "realize_v4", "verify_v3", "verify_source_v2", "judge_v1", "synth_topics_v1"} {
 		p, err := synth.LoadPrompt(dir, name)
 		if err != nil {
 			return nil, err
@@ -1051,8 +1074,8 @@ func newV2Run(o pilotOptions, env *pilotEnv) (*v2run, error) {
 			return nil, fmt.Errorf("pilot: no client for %s", m)
 		}
 		g := &synth.Generator{Client: c, Model: m, Effort: o.genEffort[m], Thinking: o.genThinking[m], Version: synth.V2,
-			SourcePrompt: r.prompts["synth_source_v2"], RealizePrompt: r.prompts["realize_v3"], VerifyPrompt: r.prompts["verify_v2"],
-			VerifySourcePrompt: r.prompts["verify_source_v1"], JudgePrompt: r.prompts["judge_v1"], TopicPrompt: r.prompts["synth_topics_v1"],
+			SourcePrompt: r.prompts["synth_source_v4"], RealizePrompt: r.prompts["realize_v4"], VerifyPrompt: r.prompts["verify_v3"],
+			VerifySourcePrompt: r.prompts["verify_source_v2"], JudgePrompt: r.prompts["judge_v1"], TopicPrompt: r.prompts["synth_topics_v1"],
 			Exemplars: exs}
 		// One verifier for every generator (defaultVerifier); it may share the writer's family.
 		a, err := r.agent(o.verifierModel())
@@ -1232,13 +1255,16 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			ReplacementOf: jobs[j].replacementOf}
 		out[j] = rec
 		prefix := fmt.Sprintf("s%d.", i)
+		// feedback is what the checks found in the previous attempt of this source; the next attempt is told
+		// (synth.GenerateSourceRetry). The first attempt of a source or of its replacement has none.
+		feedback := ""
 		for attempt := jobs[j].firstAttempt; attempt < jobs[j].firstAttempt+3; attempt++ {
 			if err := r.mt.check(); err != nil {
 				rec.Reason = err.Error()
 				return err
 			}
 			att := sourceAttempt{Attempt: attempt}
-			d, resp, err := g.GenerateSource(ctx, sp, prefix, attempt)
+			d, resp, err := g.GenerateSourceRetry(ctx, sp, prefix, attempt, feedback)
 			r.mt.add("synth_source", resp)
 			if resp != nil {
 				att.Model, att.Usage = resp.Model, resp.Usage
@@ -1251,6 +1277,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 					return err
 				}
 				rec.Reason = "generation error"
+				feedback = "the output could not be used (" + err.Error() + ")"
 				continue
 			}
 			att.Discussion = &d
@@ -1258,6 +1285,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			if len(att.Targets) > 0 {
 				rec.Attempts = append(rec.Attempts, att)
 				rec.Reason = "numeric targets"
+				feedback = strings.Join(att.Targets, "; ")
 				continue
 			}
 			cp, err := synth.CopyCheck(ctx, d, r.exemplars, r.env.emb)
@@ -1273,6 +1301,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			if cp.Reject {
 				rec.Attempts = append(rec.Attempts, att)
 				rec.Reason = "exemplar copy"
+				feedback = copyFeedback(cp)
 				continue
 			}
 			ann, agr, meta, vresp, err := g.VerifySource(ctx, d)
@@ -1291,6 +1320,7 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 			rec.Attempts = append(rec.Attempts, att)
 			if !agr.Pass {
 				rec.Reason = "G1 re-annotation"
+				feedback = unreadFeedback(d, ann, agr, prefix)
 				continue
 			}
 			rec.Discussion, rec.Stats, rec.Accepted, rec.Reason = d, synth.Stats(d), true, ""
@@ -1302,6 +1332,47 @@ func (r *v2run) generateSources(ctx context.Context, jobs []sourceJob) []*source
 		return nil
 	})
 	return out
+}
+
+// copyFeedback tells a retry what the exemplar-copy check found, without naming the exemplar: the wording shared
+// with an example, the names taken from one, or that the text as a whole is too close to one.
+func copyFeedback(cp synth.CopyResult) string {
+	var parts []string
+	shared := cp.Shared6 // a shared 6-gram contains its 5-grams; name the longer wording only
+	if len(shared) == 0 {
+		shared = cp.Shared5
+	}
+	if len(shared) > 0 {
+		quoted := make([]string, len(shared))
+		for i, s := range shared {
+			quoted[i] = strconv.Quote(s)
+		}
+		parts = append(parts, "it repeats wording of an example ("+strings.Join(quoted, ", ")+"); use other words")
+	}
+	if len(cp.Names) > 0 {
+		parts = append(parts, "it uses names from an example ("+strings.Join(cp.Names, ", ")+")")
+	}
+	if cp.CosComputed && cp.MaxCos > synth.CopyMaxCos {
+		parts = append(parts, "its content is too close to an example")
+	}
+	if len(parts) == 0 {
+		return "it is too close to an example"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// unreadFeedback tells a retry which relations of the rejected attempt a reader of the text alone did not recover
+// (the G1 re-annotation), with the writer's own proposition ids.
+func unreadFeedback(d synth.Discussion, ann synth.SourceAnnotation, agr synth.GraphAgreement, prefix string) string {
+	read := ann.Relabel(d.Graph)
+	var missed []string
+	for _, e := range d.Graph.Edges {
+		if !slices.Contains(read, e) {
+			missed = append(missed, fmt.Sprintf("%s → %s (%s)", strings.TrimPrefix(e.From, prefix), strings.TrimPrefix(e.To, prefix), e.Kind))
+		}
+	}
+	return fmt.Sprintf("a reader who saw only the text recovered %d of the %d relations; anchor every relation in the text so that it can be read. Not recovered in the last attempt: %s",
+		agr.Matched, agr.Gold, strings.Join(missed, ", "))
 }
 
 // Source dedup thresholds (dataset-spec §1.3): rendered-text cos > 0.9 with an accepted source, or
@@ -1671,8 +1742,8 @@ func pilotExclude() []string {
 func (r *v2run) pilotFitOptions() fit.Options {
 	th0 := ged.Current()
 	starts, names := fit.DefaultStarts(th0)
-	return fit.Options{Judges: len(r.judges), Theta0: th0, Lambda: r.o.lambda, FitNeg: true, MaxOuter: 20,
-		Tie: fit.TypeTie(), Exclude: pilotExclude(), Starts: starts, StartNames: names}
+	return withOuter(fit.Options{Judges: len(r.judges), Theta0: th0, Lambda: r.o.lambda, FitNeg: true, MaxOuter: 20,
+		Tie: fit.TypeTie(), Exclude: pilotExclude(), Starts: starts, StartNames: names})
 }
 
 // writeFitSet reports which triplets enter the fit.
@@ -2574,7 +2645,7 @@ func (r *v2run) qcExemplars(ctx context.Context, b *bytes.Buffer) {
 			return
 		}
 		g := &synth.Generator{Client: ag.Client, Model: m, Effort: ag.Effort, Thinking: ag.Thinking,
-			VerifySourcePrompt: r.prompts["verify_source_v1"]}
+			VerifySourcePrompt: r.prompts["verify_source_v2"]}
 		for _, ex := range r.exemplars {
 			if r.mt.check() != nil {
 				return
@@ -2591,6 +2662,11 @@ func (r *v2run) qcExemplars(ctx context.Context, b *bytes.Buffer) {
 }
 
 // qcLabels is the label-correctness audit: 100 variants, ≥ 5 per kind × direction where available.
+//
+// The criterion printed with it is 80% of the checked edits read as intended (user decision 2026-11-13; it was
+// 90%). The audit is the verifier's full blind re-annotation, and the same verifier recovers 93% of the relations
+// of the hand-made exemplars (55 of 59), so 90% asked for more than the instrument can show; the three P2 pilots
+// read 87.9%, 84.7% and 84.4%. No human has checked a sample yet, so how much of the gap is the verifier's is open.
 func (r *v2run) qcLabels(ctx context.Context, b *bytes.Buffer, trips []pilotTriplet) {
 	type cand struct {
 		t    *pilotTriplet
@@ -2650,7 +2726,7 @@ func (r *v2run) qcLabels(ctx context.Context, b *bytes.Buffer, trips []pilotTrip
 		if ag.Client == nil {
 			continue
 		}
-		g := &synth.Generator{Client: ag.Client, Model: ag.Model, Effort: ag.Effort, Thinking: ag.Thinking, VerifySourcePrompt: r.prompts["verify_source_v1"]}
+		g := &synth.Generator{Client: ag.Client, Model: ag.Model, Effort: ag.Effort, Thinking: ag.Thinking, VerifySourcePrompt: r.prompts["verify_source_v2"]}
 		ann, _, _, resp, err := g.VerifySource(ctx, d)
 		r.mt.add("qc", resp)
 		if err != nil {
@@ -2684,7 +2760,7 @@ func (r *v2run) qcLabels(ctx context.Context, b *bytes.Buffer, trips []pilotTrip
 		}
 	}
 	fmt.Fprintln(b, "\n## ラベルの正しさの監査（採用した変種の盲検の全再注釈）")
-	fmt.Fprintf(b, "\n- 変種 %d、確かめた編集 %d、意図どおりに読めた編集 %s（基準 ≥ 90%%）、指示していない極性の反転 %d（基準 0）\n",
+	fmt.Fprintf(b, "\n- 変種 %d、確かめた編集 %d、意図どおりに読めた編集 %s（基準 ≥ 80%%）、指示していない極性の反転 %d（基準 0）\n",
 		len(sample), edits, ratio(recovered, edits), flips)
 	fmt.Fprintln(b, "\n| 先頭の編集 × 方向 | 読めた / 確かめた |")
 	fmt.Fprintln(b, "| --- | --: |")

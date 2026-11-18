@@ -394,6 +394,8 @@ type OptionsUsed struct {
 	// Quadrature is the grid resolution of the random-intercept integration (Options.Quadrature; 20 → spacing ≤ 0.6).
 	Quadrature int
 	Judges     int
+	// Outer is the outer loop of the fits (Options.Outer).
+	Outer OuterMode
 }
 
 func summarise(co ConfirmOptions, opts Options) OptionsUsed {
@@ -409,7 +411,7 @@ func summarise(co ConfirmOptions, opts Options) OptionsUsed {
 		q = 20
 	}
 	return OptionsUsed{Lambda: opts.Lambda, Tie: !co.Untied, Exclude: slices.Clone(excl), Weighted: opts.Weighted, Gamma: opts.Gamma,
-		ExcludeSameFamily: opts.ExcludeSameFamily, CohZeroOnly: opts.CohZeroOnly, NoLapse: opts.NoLapse, Quadrature: q, Judges: opts.Judges}
+		ExcludeSameFamily: opts.ExcludeSameFamily, CohZeroOnly: opts.CohZeroOnly, NoLapse: opts.NoLapse, Quadrature: q, Judges: opts.Judges, Outer: opts.Outer}
 }
 
 // Preregistered lists every departure of (co, opts) from the pre-registered primary settings of decisions-stats
@@ -466,6 +468,9 @@ func Preregistered(co ConfirmOptions, opts Options) []string {
 	}
 	if co.GateDelta != 2 || co.RMax != stats.GateRMax || co.GateConf != stats.GateConf || co.MinGateTriplets != 100 {
 		add("T1 gate settings differ from §9.1")
+	}
+	if opts.Outer != OuterAlternate {
+		add("outer loop: descent on the true objective (pre-registered: the alternation of §11)")
 	}
 	if opts.Lambda != 0 {
 		// Cannot fire from Confirmatory (it forces λ = 0 first); kept for callers that list their own options.
@@ -956,8 +961,8 @@ func verdict(res ConfirmResult, co ConfirmOptions) (uncapped, capped stats.Verdi
 		r    *Result
 	}{{"independence fit", &res.Indep}, {"random-intercept fit", mixedOrNil(res)}, {"high-resolution refit", res.MixedCheck}} {
 		if f.r != nil && !f.r.Valid() {
-			block(fmt.Sprintf("%s is not a valid iterate (§11.2): converged %v, cycled %v, capped %v, inner converged %v",
-				f.name, f.r.Converged, f.r.Cycled, f.r.Capped, f.r.InnerConverged))
+			block(fmt.Sprintf("%s is not a valid iterate (§11.2): converged %v, cycled %v, stalled %v, capped %v, inner converged %v",
+				f.name, f.r.Converged, f.r.Cycled, f.r.Stalled, f.r.Capped, f.r.InnerConverged))
 		}
 	}
 	if co.SkipMixed {

@@ -455,12 +455,19 @@ type fitFlags struct {
 	StartSpread jf       `json:"start_spread"`
 	StartNLL    []jf     `json:"start_nll"`
 	NLL         jf       `json:"nll"`
+	// Outer-loop mode and its descent record (fit.OuterDescent only; zero under the alternation).
+	Descent     bool `json:"descent,omitempty"`
+	Stalled     bool `json:"stalled,omitempty"`
+	Explored    int  `json:"explored,omitempty"`
+	Backtracked int  `json:"backtracked,omitempty"`
+	Passes      int  `json:"passes,omitempty"`
 }
 
 func flagsOf(r fit.Result) fitFlags {
 	f := fitFlags{Converged: r.Converged, Cycled: r.Cycled, Capped: r.Capped, InnerConverged: r.InnerConverged, Outer: r.Outer,
 		CycleSpread: jf(r.CycleSpread), Valid: r.Valid(),
-		StartSpread: jf(r.StartSpread), NLL: jf(r.NegLogLik), Boundary: []string{}, Divergent: []string{}}
+		StartSpread: jf(r.StartSpread), NLL: jf(r.NegLogLik), Boundary: []string{}, Divergent: []string{},
+		Descent: outerMode == fit.OuterDescent, Stalled: r.Stalled, Explored: r.Explored, Backtracked: r.Backtracked, Passes: r.Passes}
 	for p := range ged.NumParams {
 		if r.Free[p] && r.Boundary[p] {
 			f.Boundary = append(f.Boundary, ged.ParamNames[p])
@@ -575,7 +582,7 @@ func confirmatory(w io.Writer, o simOptions, cfg simulate.Config, trips []fit.Tr
 	for j := range names {
 		names[j] = simulate.JudgeFamily(j)
 	}
-	opts := fit.Options{Judges: len(cfg.Judges), Theta0: th0, Tie: fit.TypeTie(), MaxOuter: 20}
+	opts := withOuter(fit.Options{Judges: len(cfg.Judges), Theta0: th0, Tie: fit.TypeTie(), MaxOuter: 20})
 	co := fit.ConfirmOptions{Theta0: th0, M: o.m, B: o.boot, DReps: *simDReps, SkipD: *simDReps <= 0, Seed: cfg.Seed,
 		MinInformative: minInformative(cfg.Sources * cfg.PerSrc), JudgeNames: names, SkipLOJO: !*simLOJO, LOJOReps: o.boot,
 		SkipExclusions: !*simApplyQC, Truth: &cfg.True, TrueNeg: &cfg.TrueNeg}
@@ -720,7 +727,7 @@ func diagnosticFit(trips []fit.Triplet, js []fit.Judgment, cfg simulate.Config, 
 			excl = append(excl, f)
 		}
 	}
-	od := fit.Options{Judges: len(cfg.Judges), Theta0: ged.Current(), FitNeg: true, MaxOuter: 20, Exclude: excl}
+	od := withOuter(fit.Options{Judges: len(cfg.Judges), Theta0: ged.Current(), FitNeg: true, MaxOuter: 20, Exclude: excl})
 	res, err := fit.Fit(trips, js, od, nil)
 	if err != nil {
 		return nil, err
@@ -777,7 +784,7 @@ func diagReport(w io.Writer, d *diagRecord, m float64) {
 // detailTables are the descriptive tables of the first seed (not §3 decisions): aux parameters against the truth,
 // agreement per rule (R0, R2 full data, R2 OOF, θ*) and the judge diagnostics, on the default fit set.
 func detailTables(w io.Writer, cfg simulate.Config, trips []fit.Triplet, js []fit.Judgment, metas []simulate.Meta, indep, mixed fit.Result) error {
-	opts := fit.Options{Judges: len(cfg.Judges), Theta0: ged.Current(), FitNeg: true, MaxOuter: 20, Tie: fit.TypeTie()}
+	opts := withOuter(fit.Options{Judges: len(cfg.Judges), Theta0: ged.Current(), FitNeg: true, MaxOuter: 20, Tie: fit.TypeTie()})
 	ft, fj, kept := fit.Filter(trips, js, opts)
 	opts.IncludeAll = true
 	names := make([]string, len(cfg.Judges))

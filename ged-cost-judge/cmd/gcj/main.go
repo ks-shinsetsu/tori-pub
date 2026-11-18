@@ -15,8 +15,19 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/fit"
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/synth"
 )
+
+// outerMode is the outer loop (-outer) of the θ fits of the simulator and of the v2 pilot; the v1 pilot (kept for
+// cache replay) keeps the alternation.
+var outerMode fit.OuterMode
+
+// withOuter applies -outer to the options of a θ fit.
+func withOuter(o fit.Options) fit.Options {
+	o.Outer = outerMode
+	return o
+}
 
 // Default reasoning settings (plan §5.1: fixed per judge in P2 and not changed afterwards).
 //   - gpt-5.6-luna: reasoning_effort low (pilot 2 ran luna without an effort setting, ≈ 95 output tokens).
@@ -49,7 +60,7 @@ func main() {
 		verify    = flag.Bool("verify", false, "v1 のみ: 書き下しの検証つきの手順を使う（realize_v2 + verify_v1、T3 の割り付け）")
 		outDir    = flag.String("out", "out", "出力先")
 		budget    = flag.Float64("budget", -1, "API の費用の上限（USD）。この実行 1 回分の上限で、以前の実行の費用は数えない。超えたら実行を止めて 0 以外で終了し、バッチは投げる前に見込みを確かめる。負なら既定（-sources 750 で $260 = dataset-spec §4.5 の定価の 1.5 倍、件数に比例。-topics は $2、-audit は $5。0 は API を使わない）")
-		promptVer = flag.String("prompt-version", synth.V2, "v2: 改訂版のパイプライン（例示つきの生成、realize_v3、盲検の再注釈、2 系列）。v1: パイロット 2 の手順（luna のみ。応答のキャッシュで再現する）")
+		promptVer = flag.String("prompt-version", synth.V2, "v2: 改訂版のパイプライン（例示つきの生成、realize_v4、盲検の再注釈、2 系列）。v1: パイロット 2 の手順（luna のみ。応答のキャッシュで再現する）")
 		gens      = flag.String("generators", "gpt-5.6-luna,claude-sonnet-5-5", "v2: 生成モデル（半数ずつ）")
 		verifier  = flag.String("verifier", defaultVerifier, "v2: 検証者（G1 の再注釈・G4 の検証・-audit の再注釈。どの生成モデルの出力もこのモデルが検証する）。既定は費用のため Haiku 5.5（書き手と同じ系列の Sonnet 5.5 の出力も検証する）")
 		judges    = flag.String("judges", "gpt-5.6-luna,claude-sonnet-5-5,claude-haiku-5-5", "v2: 判定者（全三つ組 × 提示順 2。Anthropic はバッチ）")
@@ -61,8 +72,17 @@ func main() {
 		p2        = flag.Bool("p2", false, "v2: P2 パイロットとして実行する（記録に pilot=true、θ を出さず補助パラメータ・QC・破棄率・例示の組と領域の ICC を報告）")
 		withQT30  = flag.Bool("with-qt30", false, "v2: <out>/qt30_sources.json（-import-qt30）を転移セットとして加える")
 		aifdb     = flag.String("aifdb", "../aif-with-llm/data/aifdb", "-import-qt30: aif-with-llm が取得した nodeset のディレクトリ")
+		outer     = flag.String("outer", "alternate", "推定の外側のループ: alternate（事前登録の交互最適化）| descent（交互最適化で探索し、通った中で真の目的関数が最小の点から、目的関数が下がる歩みだけで仕上げる。事前登録からの逸脱として記録される）")
 	)
 	flag.Parse()
+	switch *outer {
+	case "alternate":
+		outerMode = fit.OuterAlternate
+	case "descent":
+		outerMode = fit.OuterDescent
+	default:
+		log.Fatalf("-outer %q: alternate か descent を指定する", *outer)
+	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatal(err)
 	}

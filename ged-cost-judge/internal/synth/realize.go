@@ -12,7 +12,7 @@ import (
 	"github.com/negishi-tako/tori-pub/ged-cost-judge/internal/perturb"
 )
 
-// realizeOut is the structured output of realization (prompts/realize_v3.md).
+// realizeOut is the structured output of realization (prompts/realize_v4.md).
 type realizeOut struct {
 	Infeasible bool   `json:"infeasible" jsonschema_description:"True only if a relation edit cannot be made without changing what a proposition claims; then leave changes and propositions empty"`
 	Reason     string `json:"reason" jsonschema_description:"Why the edit is infeasible (empty otherwise)"`
@@ -49,9 +49,13 @@ type RealizeInput struct {
 	// Incremental requires every base utterance outside the edited utterances and their direct
 	// neighbours to stay byte-equal (T1's B).
 	Incremental bool
-	Prefix      string
-	Attempt     int
-	Feedback    string
+	// Readable are the edges of the source that the verifier itself recovered when it re-annotated the source
+	// (G1), with kind and direction. The collateral check of the realization samples only among them
+	// (BuildVerifyQuery). nil: every edge may be sampled (a source without a G1 re-annotation).
+	Readable []ged.Edge
+	Prefix   string
+	Attempt  int
+	Feedback string
 }
 
 // RealizeResult is the outcome of Realize.
@@ -177,7 +181,7 @@ type realizePrep struct {
 	done *RealizeResult
 }
 
-// prepareRealize builds the realize_v3 request (with its schema, so the request is exactly what is sent and cached).
+// prepareRealize builds the realize_v4 request (with its schema, so the request is exactly what is sent and cached).
 func (g *Generator) prepareRealize(in RealizeInput) (realizePrep, error) {
 	var pr realizePrep
 	base := in.Base
@@ -265,7 +269,7 @@ func (g *Generator) RealizeKey(in RealizeInput) string {
 	return RequestKey(g.Writer().Client, pr.req)
 }
 
-// Realize realizes in.Edits on in.Base as text (prompts/realize_v3.md). Unchanged utterances are
+// Realize realizes in.Edits on in.Base as text (prompts/realize_v4.md). Unchanged utterances are
 // assembled here verbatim. Errors (as opposed to Infeasible) mean the output cannot be used:
 // a touched proposition without returned text, a required content change returned as "unchanged",
 // an infeasible flag for a kind that does not allow it, a surviving proposition whose utterance was
